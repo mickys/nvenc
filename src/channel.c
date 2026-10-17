@@ -9,6 +9,7 @@
 #include "class/clc561.h"
 #include "alloc/alloc_channel.h"
 #include "ctrl/ctrla06f/ctrla06fgpfifo.h"
+#include "ctrl/ctrl906f.h"
 #include "ctrl/ctrlc36f.h"
 
 #define CHK(x) do { NV_STATUS s_ = (x); if (s_) { fprintf(stderr, "chan: %s -> 0x%x\n", #x, s_); return s_; } } while (0)
@@ -92,3 +93,12 @@ NV_STATUS chan_submit(Chan *c)
 
 NvU32 chan_gpget(Chan *c) { return ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPGet; }
 NvU32 chan_error(Chan *c) { return ((volatile NvNotification *)c->notifier.cpu)[0].status; }
+
+NV_STATUS chan_fault(Chan *c, NvU64 *addr, NvU32 *type, char str[32])
+{
+    NV906F_CTRL_GET_MMU_FAULT_INFO_PARAMS p = { 0 };
+    NV_STATUS st = rm_ctrl(c->rm, c->hChannel, NV906F_CTRL_CMD_GET_MMU_FAULT_INFO, &p, sizeof p);
+    *addr = ((NvU64)p.addrHi << 32) | p.addrLo; *type = p.faultType;
+    memcpy(str, p.faultString, 32); str[31] = 0;
+    return st;
+}

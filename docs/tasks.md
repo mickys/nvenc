@@ -8,11 +8,14 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 
 | ID | Task | Done when | Status |
 |---|---|---|---|
-| T2.01 | Commit the standalone M2 helpers: `blocklinear.c` (block-linear tiling), `h264hdr.c` (SPS/PPS writer), `tools/h264check.m` (decode + PSNR), `.m` support in `build.sh` | committed | todo |
-| T2.02 | Find which method brings the MMU fault: run `encode1` with `NVENC_VAR=stop=1..4` | the first failing stage is known | todo |
-| T2.03 | Get the faulting GPU address (driver log / RM fault report) and print a buffer map (name, GPU VA, size) from `encode1` | the fault address matches a buffer, or is known to match none | todo |
-| T2.04 | Fix the fault (missing buffer, wrong size, alignment or address shift) | `EXECUTE` finishes, the semaphore is released, no error notifier | todo |
-| T2.05 | Clear the microcode errors reported in the status buffer (`ucode_error_status`) | `error_status` 0 and `ucode_error_status` 0 | todo |
+| T2.01 | Commit the standalone M2 helpers: `blocklinear.c` (block-linear tiling), `h264hdr.c` (SPS/PPS writer), `tools/h264check.m` (decode + PSNR), `.m` support in `build.sh` | committed | done |
+| T2.02 | Find which method brings the MMU fault: run `encode1` with `NVENC_VAR=stop=1..4` | the first failing stage is known | done |
+| T2.03 | Get the faulting GPU address (driver log / RM fault report) and print a buffer map (name, GPU VA, size) from `encode1` | the fault address matches a buffer, or is known to match none | done |
+| T2.04 | Fix the fault (missing buffer, wrong size, alignment or address shift) | no MMU fault during `EXECUTE` | done |
+| T2.05 | Clear the engine error: RC error 47 (`ROBUST_CHANNEL_NVENC0_ERROR`) with `error_status` 1 in the status buffer | the semaphore is released, no error notifier, `error_status` and `ucode_error_status` 0 | doing |
+| T2.05a | Tools to see engine errors: RM's RC error log (`tools/rcerr`, root) decoded with `scripts/prbdecode.py` | the RC record of our run is readable | done |
+| T2.05b | Bisect the methods: which buffer method turns a clean microcode error into RC 47 | the method is known | done |
+| T2.05c | Bisect the picture setup contents (input surface config, recon config, ME/MD/quant controls, RC) with the engine encoding | a setup that encodes without error | blocked |
 | T2.06 | Bitstream comes out: `total_bit_count` > 0, slice NAL(s) with the expected header in the bitstream buffer | `h264check` lists SPS, PPS, IDR slice | todo |
 | T2.07 | Our SPS/PPS match the slice header the engine wrote (frame_num/POC bits, entropy, deblocking flag) | Apple's decoder accepts the stream | todo |
 | T2.08 | Input layout right: block-linear NV12 as the engine reads it (flat-colour and gradient tests if the picture is scrambled) | PSNR ≥ 40 dB at QP 26 | todo |
