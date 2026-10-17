@@ -53,6 +53,8 @@ instead of nullmoth's.
 | M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | Parsec 4K encode time well under today's ~9 ms |
 | M6 | Two sessions (NVENC0/1), HEVC | Sunshine-style double sessions; HEVC decodes |
 
+Step-by-step tasks for each milestone, with status and per-task reports: [tasks.md](tasks.md).
+
 Risk notes: NVENC microcode is loaded by GSP-RM, so user space only needs the class methods; the picture-setup
 structures are large and must be complete (unset fields are a common source of engine faults: check the status
 buffer and RM's channel error notifier after every submit). A 2026 forum report of NVENC resetting a whole Linux host
