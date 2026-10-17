@@ -4,8 +4,8 @@ A hardware H.264 encoder for macOS on NVIDIA GPUs before Blackwell (Turing, Ampe
 [nullmoth's NVIDIA driver](https://github.com/nullmoth/nvidia-macos-driver) and exposed to apps through VideoToolbox.
 It drives the GPU's NVENC engine directly from user space and is written from public documentation only.
 
-**Status: early.** M0 done (RM client, capability probe). Next: M1, a channel on the NVENC engine that executes a
-semaphore release. Milestones and design: [docs/design.md](docs/design.md).
+**Status: early.** M0 (RM client, capability probe) and M1 (a channel on NVENC0/1 that runs our commands: `tools/hello`)
+work. Next: M2, one H.264 IDR frame. Milestones and design: [docs/design.md](docs/design.md).
 
 Why: the driver's own encoder library is Blackwell-only and closed. With a layout fix it runs on an RTX 4090, but a
 4K frame still costs ~9 ms in CPU copies, tiling and spin-waiting, the bitrate setting is ignored, and only one session
@@ -15,8 +15,8 @@ per process works ([measurements](https://github.com/mickys/kvm-tahoe-nvidia/blo
 
 | Path | What |
 |---|---|
-| `src/` | the encoder: `rm.c` (RM client over the driver's user client), more to come |
-| `tools/` | test programs, each built against `src/`: `probe` (engines and classes) |
+| `src/` | the encoder: `rm.c` (RM client, memory, GPU/CPU mappings), `channel.c` (GPFIFO channel on an engine, push buffer, doorbell) |
+| `tools/` | test programs, each built against `src/`: `probe` (engines and classes), `hello` (M1: semaphores from host and NVENC) |
 | `docs/design.md` | sources, design, milestones |
 | `scripts/fetch-vendor.sh` | NVIDIA's open-gpu-kernel-modules (RM API, 610.57.04) and open-gpu-doc (NVENC docs) into `vendor/` |
 

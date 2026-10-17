@@ -9,10 +9,15 @@
 #include "class/cl0080.h"
 #include "class/cl2080.h"
 #include "ctrl/ctrl0000/ctrl0000gpu.h"
+#include "class/cl003e.h"
+#include "class/cl0040.h"
+#include "class/cl50a0.h"
+#include "class/cl90f1.h"
+#include "nv-unix-nvos-params-wrappers.h"
 
 enum { SEL_ESC = 1, SEL_BINDFD = 3 };
 
-static io_connect_t open_conn(NvU32 type)
+static io_connect_t open_conn_fd(NvU32 type, int *fdOut)
 {
     // NVAccel's bridge first (0x4E56xxxx), then NVRM itself, as NVK's nvrm_xnu_open does
     io_connect_t conn = 0; kern_return_t kr = KERN_FAILURE;
@@ -27,8 +32,13 @@ static io_connect_t open_conn(NvU32 type)
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);   // the user client keys its RM file on an fd number
     uint64_t in = (uint64_t)fd;
     IOConnectCallScalarMethod(conn, SEL_BINDFD, &in, 1, NULL, NULL);
+    if (fdOut) *fdOut = fd;
     return conn;
 }
+static io_connect_t open_conn(NvU32 type) { return open_conn_fd(type, NULL); }
+
+int rm_conn_open(RmConn *c, NvU32 type) { c->fd = -1; c->conn = open_conn_fd(type, &c->fd); return c->conn ? 0 : -1; }
+void rm_conn_close(RmConn *c) { if (c->conn) IOServiceClose(c->conn); if (c->fd >= 0) close(c->fd); c->conn = 0; c->fd = -1; }
 
 int rm_esc(Rm *rm, io_connect_t conn, NvU32 cmd, void *data, size_t size)
 {
@@ -38,7 +48,9 @@ int rm_esc(Rm *rm, io_connect_t conn, NvU32 cmd, void *data, size_t size)
     return kr == KERN_SUCCESS ? 0 : -1;
 }
 
-NvHandle rm_handle(Rm *rm) { return 0xcaf00000u + rm->nextHandle++; }
+// our own handle range: RM generates handles from 0xcaf00000 for objects it creates inside our client (a channel
+// gets an internal channel group), so client-chosen handles must stay out of that range
+NvHandle rm_handle(Rm *rm) { return 0x4e560000u + rm->nextHandle++; }
 
 NV_STATUS rm_alloc(Rm *rm, NvHandle parent, NvHandle obj, NvU32 cls, void *params)
 {
@@ -86,4 +98,77 @@ void rm_close(Rm *rm)
     if (rm->client) { NVOS00_PARAMETERS p = { .hRoot = rm->client, .hObjectParent = rm->client, .hObjectOld = rm->client }; rm_esc(rm, rm->ctl, NV_ESC_RM_FREE, &p, sizeof p); }
     if (rm->dev) IOServiceClose(rm->dev);
     if (rm->ctl) IOServiceClose(rm->ctl);
+}
+
+NV_STATUS rm_va_init(Rm *rm)
+{
+    // same parameters as NVK on this driver: page tables may fall back to system memory, VA starts at 8 GB
+    NV_VASPACE_ALLOCATION_PARAMETERS p = { .flags = NV_VASPACE_ALLOCATION_FLAGS_RETRY_PTE_ALLOC_IN_SYS, .vaBase = 0x200000000ull };
+    rm->vaspace = rm_handle(rm);
+    return rm_alloc(rm, rm->device, rm->vaspace, FERMI_VASPACE_A, &p);
+}
+
+NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sysmem, RmConn *conn, void **cpu)
+{
+    // macOS: RM_MAP_MEMORY on the control connection names a second connection (by its fd number), whose memory
+    // type 0 then carries the mapping (as NVK's nvRmApiMapMemory). Video memory goes through the device node.
+    *cpu = NULL;
+    if (rm_conn_open(conn, sysmem ? 0 : 1)) return NV_ERR_GENERIC;
+    nv_ioctl_nvos33_parameters_with_fd p = { .params = { .hClient = rm->client, .hDevice = parent, .hMemory = obj,
+                                                         .offset = 0, .length = size }, .fd = conn->fd };
+    if (rm_esc(rm, rm->ctl, NV_ESC_RM_MAP_MEMORY, &p, sizeof p) || p.params.status) {
+        if (rm->verbose) fprintf(stderr, "rm: map 0x%08x -> 0x%x\n", obj, p.params.status);
+        rm_conn_close(conn); return p.params.status ? p.params.status : NV_ERR_GENERIC;
+    }
+    NvU32 caching = DRF_VAL(OS33, _FLAGS, _CACHING_TYPE, p.params.flags);
+    bool wc = !sysmem && caching == NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED;
+    mach_vm_address_t addr = 0; mach_vm_size_t len = 0;
+    kern_return_t kr = IOConnectMapMemory64(conn->conn, 0, mach_task_self(), &addr, &len, kIOMapAnywhere | (wc ? kIOMapWriteCombineCache : 0));
+    if (kr != KERN_SUCCESS) { if (rm->verbose) fprintf(stderr, "rm: IOConnectMapMemory64 -> 0x%08x\n", kr); rm_conn_close(conn); return NV_ERR_GENERIC; }
+    *cpu = (void *)addr;
+    return NV_OK;
+}
+
+NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, bool cpuMap, bool gpuMap)
+{
+    memset(m, 0, sizeof *m); m->map.fd = -1;
+    size = (size + 0xfff) & ~0xfffull; m->size = size; m->sysmem = sysmem;
+    NV_MEMORY_ALLOCATION_PARAMS p = { .owner = rm->client, .type = NVOS32_TYPE_IMAGE,
+        .flags = align ? NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE : 0, .attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB),
+        .size = size, .alignment = align };
+    if (sysmem) p.attr |= DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) | DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
+    else { p.attr |= DRF_DEF(OS32, _ATTR, _LOCATION, _VIDMEM) | DRF_DEF(OS32, _ATTR, _COHERENCY, _UNCACHED); p.flags |= NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM; }
+    m->hPhys = rm_handle(rm);
+    NV_STATUS st = rm_alloc(rm, rm->device, m->hPhys, sysmem ? NV01_MEMORY_SYSTEM : NV01_MEMORY_LOCAL_USER, &p);
+    if (st) { m->hPhys = 0; return st; }
+    if (cpuMap && (st = rm_map_cpu(rm, rm->device, m->hPhys, size, sysmem, &m->map, &m->cpu))) return st;
+    if (gpuMap) {
+        NV_MEMORY_ALLOCATION_PARAMS v = { .owner = rm->client, .type = NVOS32_TYPE_IMAGE,
+            .flags = NVOS32_ALLOC_FLAGS_VIRTUAL | (align ? NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE : 0),
+            .size = size, .alignment = align, .hVASpace = rm->vaspace };
+        m->hVirt = rm_handle(rm);
+        if ((st = rm_alloc(rm, rm->device, m->hVirt, NV50_MEMORY_VIRTUAL, &v))) { m->hVirt = 0; return st; }
+        NVOS46_PARAMETERS d = { .hClient = rm->client, .hDevice = rm->device, .hDma = m->hVirt, .hMemory = m->hPhys,
+            .offset = 0, .length = size,
+            .flags = DRF_DEF(OS46, _FLAGS, _PAGE_KIND, _VIRTUAL) |
+                     (sysmem ? DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE) : DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _DISABLE)) };
+        if (rm_esc(rm, rm->ctl, NV_ESC_RM_MAP_MEMORY_DMA, &d, sizeof d) || d.status) {
+            if (rm->verbose) fprintf(stderr, "rm: map dma -> 0x%x\n", d.status);
+            return d.status ? d.status : NV_ERR_GENERIC;
+        }
+        // hDma is a virtual memory object, so RM returns the absolute GPU address in dmaOffset (== the object's offset
+        // for a mapping at its start)
+        m->gpu = d.dmaOffset;
+        if (rm->verbose) fprintf(stderr, "rm: %s %llu KB at GPU 0x%llx (virtual object at 0x%llx)\n", sysmem ? "sysmem" : "vidmem",
+                                 (unsigned long long)(size >> 10), (unsigned long long)d.dmaOffset, (unsigned long long)v.offset);
+    }
+    return NV_OK;
+}
+
+void rm_mem_free(Rm *rm, RmMem *m)
+{
+    if (m->map.conn) rm_conn_close(&m->map);
+    if (m->hVirt) rm_free(rm, rm->device, m->hVirt);
+    if (m->hPhys) rm_free(rm, rm->device, m->hPhys);
+    memset(m, 0, sizeof *m);
 }

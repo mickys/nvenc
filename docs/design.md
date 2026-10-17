@@ -46,7 +46,7 @@ instead of nullmoth's.
 | # | Milestone | Done when |
 |---|---|---|
 | M0 | RM client + capability probe | **done**: `src/rm.c`, `tools/probe.c` lists engines and classes |
-| M1 | "Hello NVENC": VA space, GPFIFO channel on NVENC0, NVC9B7 object, push buffer with NOP + semaphore release, doorbell | the semaphore value appears in memory |
+| M1 | "Hello NVENC": VA space, GPFIFO channel on NVENC0, NVC9B7 object, push buffer with NOP + semaphore release, doorbell | **done**: `tools/hello` — host and NVENC semaphores written ~12 µs after the doorbell, on NVENC0 and NVENC1 |
 | M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | Apple's decoder decodes it, PSNR ≥ 40 dB |
 | M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | a 60-frame stream decodes at the requested bitrate |
 | M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | `vttest` and ffmpeg's `h264_videotoolbox` use it |
@@ -57,3 +57,20 @@ Risk notes: NVENC microcode is loaded by GSP-RM, so user space only needs the cl
 structures are large and must be complete (unset fields are a common source of engine faults: check the status
 buffer and RM's channel error notifier after every submit). A 2026 forum report of NVENC resetting a whole Linux host
 with an RTX 4090 has not reproduced here in hundreds of encodes.
+
+## M1 notes (what the working path needs)
+
+- **Handles:** RM generates handles from `0xcaf00000` for objects it creates inside our client (a channel gets an
+  internal channel group), so client-chosen handles must stay out of that range (`NV_ERR_INSERT_DUPLICATE_NAME`
+  otherwise). `src/rm.c` uses `0x4e560000 + n`.
+- **GPU addresses:** mapping memory into a `NV50_MEMORY_VIRTUAL` object with `NV_ESC_RM_MAP_MEMORY_DMA` returns the
+  absolute GPU address in `dmaOffset`. Adding the object's offset again pointed the GPFIFO at an unmapped address:
+  the error notifier (`NvNotification[0]`) reported `info32 0x1f` (31 = MMU fault) on engine `0x1b`.
+- **CPU mappings on macOS:** `NV_ESC_RM_MAP_MEMORY` on the control connection names a second user-client connection by
+  its bound fd number; `IOConnectMapMemory64` on that connection then maps it. Video memory via the device node,
+  write-combined when RM says so.
+- **Channel:** notifier + `NV01_CONTEXT_DMA` (error notifier), USERD 512 KB in VRAM, GPFIFO 0x8000 entries in system
+  memory, `AMPERE_CHANNEL_GPFIFO_A` with `engineType` NVENC0/1, `NVA06F_CTRL_CMD_BIND`, the `NVC9B7` object
+  (`NV_NVENC_ALLOCATION_PARAMETERS.engineInstance`), `GPFIFO_SCHEDULE`, work-submit token (also in notifier[1]).
+  Submit = GPFIFO entry, `GPPut` in USERD, token to `NVC361_NOTIFY_CHANNEL_PENDING` of the `AMPERE_USERMODE_A` page.
+- Engine object on subchannel 0 via `NVC56F_SET_OBJECT`; NVENC's own `SEMAPHORE_A..D` release works.
