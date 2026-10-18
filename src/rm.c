@@ -35,7 +35,6 @@ static io_connect_t open_conn_fd(NvU32 type, int *fdOut)
     if (fdOut) *fdOut = fd;
     return conn;
 }
-static io_connect_t open_conn(NvU32 type) { return open_conn_fd(type, NULL); }
 
 int rm_conn_open(RmConn *c, NvU32 type) { c->fd = -1; c->conn = open_conn_fd(type, &c->fd); return c->conn ? 0 : -1; }
 void rm_conn_close(RmConn *c) { if (c->conn) IOServiceClose(c->conn); if (c->fd >= 0) close(c->fd); c->conn = 0; c->fd = -1; }
@@ -78,7 +77,7 @@ NV_STATUS rm_ctrl(Rm *rm, NvHandle obj, NvU32 cmd, void *params, NvU32 size)
 int rm_open(Rm *rm)
 {
     bool v = rm->verbose; memset(rm, 0, sizeof *rm); rm->verbose = v;
-    rm->ctl = open_conn(0); rm->dev = open_conn(1);
+    rm->ctl = open_conn_fd(0, &rm->ctlFd); rm->dev = open_conn_fd(1, &rm->devFd);
     if (!rm->ctl || !rm->dev) { fprintf(stderr, "rm: no NVAccel/NVRM user client\n"); return -1; }
     if (rm_esc(rm, rm->ctl, NV_ESC_CARD_INFO, &rm->card, sizeof rm->card) || !rm->card.valid) { fprintf(stderr, "rm: card info failed\n"); return -1; }
     NVOS21_PARAMETERS p = { .hClass = NV01_ROOT_CLIENT };
@@ -98,6 +97,9 @@ void rm_close(Rm *rm)
     if (rm->client) { NVOS00_PARAMETERS p = { .hRoot = rm->client, .hObjectParent = rm->client, .hObjectOld = rm->client }; rm_esc(rm, rm->ctl, NV_ESC_RM_FREE, &p, sizeof p); }
     if (rm->dev) IOServiceClose(rm->dev);
     if (rm->ctl) IOServiceClose(rm->ctl);
+    if (rm->devFd > 0) close(rm->devFd);
+    if (rm->ctlFd > 0) close(rm->ctlFd);
+    rm->dev = rm->ctl = 0; rm->devFd = rm->ctlFd = 0; rm->client = 0;
 }
 
 NV_STATUS rm_va_init(Rm *rm)
@@ -126,7 +128,20 @@ NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sys
     kern_return_t kr = IOConnectMapMemory64(conn->conn, 0, mach_task_self(), &addr, &len, kIOMapAnywhere | (wc ? kIOMapWriteCombineCache : 0));
     if (kr != KERN_SUCCESS) { if (rm->verbose) fprintf(stderr, "rm: IOConnectMapMemory64 -> 0x%08x\n", kr); rm_conn_close(conn); return NV_ERR_GENERIC; }
     *cpu = (void *)addr;
+    conn->addr = (void *)addr; conn->len = len; conn->stub = p.params.pLinearAddress; conn->hParent = parent; conn->hMem = obj;
     return NV_OK;
+}
+
+void rm_unmap_cpu(Rm *rm, RmConn *conn)
+{
+    if (conn->addr) {
+        IOConnectUnmapMemory64(conn->conn, 0, mach_task_self(), (mach_vm_address_t)(uintptr_t)conn->addr);
+        NVOS34_PARAMETERS p = { .hClient = rm->client, .hDevice = conn->hParent, .hMemory = conn->hMem, .pLinearAddress = conn->stub };
+        if ((rm_esc(rm, rm->ctl, NV_ESC_RM_UNMAP_MEMORY, &p, sizeof p) || p.status) && rm->verbose)
+            fprintf(stderr, "rm: unmap 0x%08x -> 0x%x\n", conn->hMem, p.status);
+        conn->addr = NULL;
+    }
+    rm_conn_close(conn);
 }
 
 NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, bool cpuMap, bool gpuMap)
@@ -167,7 +182,7 @@ NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, b
 
 void rm_mem_free(Rm *rm, RmMem *m)
 {
-    if (m->map.conn) rm_conn_close(&m->map);
+    if (m->map.conn) rm_unmap_cpu(rm, &m->map);
     if (m->hVirt) rm_free(rm, rm->device, m->hVirt);
     if (m->hPhys) rm_free(rm, rm->device, m->hPhys);
     memset(m, 0, sizeof *m);

@@ -46,10 +46,10 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 | T4.01 | Collect the public interface pieces: CMBaseObject + decoder SPI from WebKit, how the patched Metal plugin registers nullmoth's encoder factory | notes in `docs/vt-encoder.md` | done |
 | T4.02 | Stub encoder: a factory that returns an object whose every vtable slot logs its index and arguments and fails cleanly | the stub registers and VideoToolbox picks it for `vttest` | done |
 | T4.03 | Black-box probe: record the slot order and arguments for session create, property queries, encode, flush, invalidate | slot map in `docs/vt-encoder.md` | done |
-| T4.04 | Session start + supported properties dictionary (bitrate, real time, profile/level, keyframe interval, allow frame reordering = no) | VideoToolbox creates a session on our encoder | todo |
-| T4.05 | Encode frame: CVPixelBuffer (NV12/BGRA) -> CPU tiling into the input surface -> `enc.c` | the engine encodes frames from VideoToolbox | todo |
-| T4.06 | Output: CMSampleBuffer with avcC format description (our SPS/PPS), AVCC length prefixes, keyframe attachments | `vttest` decodes the output | todo |
-| T4.07 | Flush/complete frames, invalidate, error paths | clean session teardown, no leaks over 1000 sessions | todo |
+| T4.04 | Session start + supported properties dictionary (bitrate, real time, profile/level, keyframe interval, allow frame reordering = no) | VideoToolbox creates a session on our encoder | done |
+| T4.05 | Encode frame: CVPixelBuffer (NV12/BGRA) -> CPU tiling into the input surface -> `enc.c` | the engine encodes frames from VideoToolbox | done |
+| T4.06 | Output: CMSampleBuffer with avcC format description (our SPS/PPS), AVCC length prefixes, keyframe attachments | `vttest` decodes the output | done |
+| T4.07 | Flush/complete frames, invalidate, error paths | clean session teardown, no leaks over 1000 sessions | done |
 | T4.08 | Register through the Metal plugin instead of nullmoth's factory, per process (existing knob) | Parsec and ffmpeg `h264_videotoolbox` use it | todo |
 | T4.09 | M4 notes, commit | committed | todo |
 

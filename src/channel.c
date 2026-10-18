@@ -60,7 +60,7 @@ void chan_destroy(Chan *c)
     if (c->hChannel) rm_free(rm, rm->device, c->hChannel);
     if (c->hCtxDma) rm_free(rm, rm->device, c->hCtxDma);
     rm_mem_free(rm, &c->push); rm_mem_free(rm, &c->gpfifo); rm_mem_free(rm, &c->userd); rm_mem_free(rm, &c->notifier);
-    if (c->usermodeMap.conn) rm_conn_close(&c->usermodeMap);
+    if (c->usermodeMap.conn) rm_unmap_cpu(rm, &c->usermodeMap);
     if (c->hUsermode) rm_free(rm, rm->subdevice, c->hUsermode);
     memset(c, 0, sizeof *c);
 }

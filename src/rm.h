@@ -12,6 +12,7 @@
 
 typedef struct {
     io_connect_t ctl, dev;            // control and device user clients
+    int ctlFd, devFd;                 // the fd numbers they are bound to (closed by rm_close)
     NvHandle client, device, subdevice;
     NvHandle vaspace;                 // our GPU address space (rm_va_init)
     nv_ioctl_card_info_t card;
@@ -28,7 +29,11 @@ NV_STATUS rm_ctrl(Rm *rm, NvHandle obj, NvU32 cmd, void *params, NvU32 size);
 int rm_esc(Rm *rm, io_connect_t conn, NvU32 cmd, void *data, size_t size);
 
 // A user-client connection bound to an fd number: RM ties memory mappings to such an fd ("memFd").
-typedef struct { io_connect_t conn; int fd; } RmConn;
+typedef struct {
+    io_connect_t conn; int fd;
+    // the CPU mapping it carries (rm_map_cpu), released by rm_unmap_cpu
+    void *addr; NvU64 len; NvP64 stub; NvHandle hParent, hMem;
+} RmConn;
 int rm_conn_open(RmConn *c, NvU32 type);                                  // type 0 = control node, 1 = device node
 void rm_conn_close(RmConn *c);
 
@@ -46,3 +51,5 @@ NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, b
 void rm_mem_free(Rm *rm, RmMem *m);
 // CPU-map any RM object that supports it (memory, usermode doorbell page) through a fresh connection
 NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sysmem, RmConn *conn, void **cpu);
+// undo rm_map_cpu: unmap from the task, RM UNMAP_MEMORY (NVK's order), close the connection
+void rm_unmap_cpu(Rm *rm, RmConn *conn);
