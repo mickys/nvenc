@@ -43,9 +43,9 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 
 | ID | Task | Done when | Status |
 |---|---|---|---|
-| T4.01 | Collect the public interface pieces: CMBaseObject + decoder SPI from WebKit, how the patched Metal plugin registers nullmoth's encoder factory | notes in `docs/vt-encoder.md` | todo |
-| T4.02 | Stub encoder: a factory that returns an object whose every vtable slot logs its index and arguments and fails cleanly | the stub registers and VideoToolbox picks it for `vttest` | todo |
-| T4.03 | Black-box probe: record the slot order and arguments for session create, property queries, encode, flush, invalidate | slot map in `docs/vt-encoder.md` | todo |
+| T4.01 | Collect the public interface pieces: CMBaseObject + decoder SPI from WebKit, how the patched Metal plugin registers nullmoth's encoder factory | notes in `docs/vt-encoder.md` | done |
+| T4.02 | Stub encoder: a factory that returns an object whose every vtable slot logs its index and arguments and fails cleanly | the stub registers and VideoToolbox picks it for `vttest` | done |
+| T4.03 | Black-box probe: record the slot order and arguments for session create, property queries, encode, flush, invalidate | slot map in `docs/vt-encoder.md` | done |
 | T4.04 | Session start + supported properties dictionary (bitrate, real time, profile/level, keyframe interval, allow frame reordering = no) | VideoToolbox creates a session on our encoder | todo |
 | T4.05 | Encode frame: CVPixelBuffer (NV12/BGRA) -> CPU tiling into the input surface -> `enc.c` | the engine encodes frames from VideoToolbox | todo |
 | T4.06 | Output: CMSampleBuffer with avcC format description (our SPS/PPS), AVCC length prefixes, keyframe attachments | `vttest` decodes the output | todo |

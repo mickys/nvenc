@@ -12,12 +12,14 @@ tools=${*:-$(ls tools/*.c tools/*.m trace/*.c | xargs -n1 basename | sed 's/\.[c
 tar -C vendor/open-gpu-kernel-modules -chf - src/common/sdk/nvidia/inc src/nvidia/arch/nvalloc/unix/include \
   | ssh "$G" 'rm -rf ~/nvenc-dev/inc && mkdir -p ~/nvenc-dev/inc/ogkm && tar -xf - -C ~/nvenc-dev/inc/ogkm'
 tar -C vendor/open-gpu-doc -chf - classes/video | ssh "$G" 'mkdir -p ~/nvenc-dev/inc/ogd && tar -xf - -C ~/nvenc-dev/inc/ogd'
+tar -C vendor -chf - webkit-spi | ssh "$G" 'tar -xf - -C ~/nvenc-dev/inc'
 tar -cf - src tools trace | ssh "$G" "cd ~/nvenc-dev && rm -rf src tools trace && tar -xf - && for t in $tools; do
   if [ -f trace/\$t.c ]; then
     clang -O2 -Wall -dynamiclib -o \$t.dylib trace/\$t.c \
-      -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -framework IOKit -framework CoreFoundation 2>&1 | grep -E 'error|warning'
+      -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -framework IOKit -framework CoreFoundation \
+      -framework VideoToolbox -framework CoreMedia 2>&1 | grep -E 'error|warning'
   elif [ -f tools/\$t.m ]; then
-    clang -O2 -fobjc-arc -Wall -o \$t tools/\$t.m -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Metal 2>&1 | grep -E 'error|warning'
+    clang -O2 -fobjc-arc -Wall -I inc/webkit-spi -o \$t tools/\$t.m -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Metal 2>&1 | grep -E 'error|warning'
   else
     clang -O2 -Wall -Wno-unused-function -o \$t tools/\$t.c src/*.c -I src \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video \

@@ -357,6 +357,50 @@ static kern_return_t my_IOConnectMapMemory64(io_connect_t c, uint32_t type, task
     return kr;
 }
 
+// ---- VideoToolbox encoder registration: wrap the factory and dump the encoder object's vtable (M4, T4.03) ----
+typedef int32_t (*VtFactory)(uint32_t, const void *, void **);
+extern int32_t VTRegisterVideoEncoderWithInfo(uint32_t, const void *, void *) __attribute__((weak_import));
+extern const void *CMBaseObjectGetVTable(const void *) __attribute__((weak_import));
+static VtFactory gRealFactory;
+
+static void dump_ptrs(const char *name, const void *p, int n)
+{
+    L("  %s @ %p:\n", name, p);
+    if (!p) return;
+    const uint64_t *w = p;
+    for (int i = 0; i < n; i++) {
+        Dl_info di; const char *sym = "";
+        if (w[i] > 0x100000 && dladdr((void *)w[i], &di) && di.dli_sname && di.dli_saddr == (void *)w[i]) sym = di.dli_sname;
+        else if (w[i] > 0x100000 && dladdr((void *)w[i], &di) && di.dli_fname) sym = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+        L("    [%2d] +0x%02x %#018llx %s\n", i, i * 8, (unsigned long long)w[i], sym);
+    }
+}
+
+static int32_t wrap_factory(uint32_t codec, const void *alloc, void **out)
+{
+    int32_t st = gRealFactory(codec, alloc, out);
+    pthread_mutex_lock(&gLock);
+    L("VTFACTORY codec 0x%08x -> %d, object %p\n", codec, st, out ? *out : NULL);
+    if (!st && out && *out && CMBaseObjectGetVTable) {
+        const uint64_t *vt = CMBaseObjectGetVTable(*out);
+        dump_ptrs("vtable", vt, 6);
+        if (vt) { dump_ptrs("vtable[0] (reserved)", (void *)vt[0], 12); dump_ptrs("vtable[1] (base class)", (void *)vt[1], 12);
+                  dump_ptrs("vtable[2] (encoder class)", (void *)vt[2], 28); dump_ptrs("vtable[3]", (void *)vt[3], 12); }
+    }
+    pthread_mutex_unlock(&gLock);
+    return st;
+}
+
+static int32_t my_VTRegisterVideoEncoderWithInfo(uint32_t codec, const void *info, void *factory)
+{
+    pthread_mutex_lock(&gLock);
+    Dl_info di; const char *sym = dladdr(factory, &di) && di.dli_sname ? di.dli_sname : "?";
+    L("VTREGISTER codec 0x%08x factory %p (%s)\n", codec, factory, sym);
+    pthread_mutex_unlock(&gLock);
+    if (getenv("NVTRACE_VT") && !gRealFactory) { gRealFactory = (VtFactory)factory; factory = (void *)wrap_factory; }
+    return VTRegisterVideoEncoderWithInfo(codec, info, factory);
+}
+
 __attribute__((constructor)) static void init(void)
 {
     char path[512]; const char *o = getenv("NVTRACE_OUT");
@@ -371,3 +415,4 @@ INTERPOSE(my_IOConnectCallScalarMethod, IOConnectCallScalarMethod);
 INTERPOSE(my_IOConnectCallMethod, IOConnectCallMethod);
 INTERPOSE(my_IOConnectCallStructMethod, IOConnectCallStructMethod);
 INTERPOSE(my_IOConnectMapMemory64, IOConnectMapMemory64);
+INTERPOSE(my_VTRegisterVideoEncoderWithInfo, VTRegisterVideoEncoderWithInfo);
