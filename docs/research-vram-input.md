@@ -172,7 +172,7 @@ it's on).
 | configuration | word loop | memcpy |
 |---|---|---|
 | stock guest, any `RM_MAP_CACHE` mode (1080p: 21.3-21.8 ms / 5.5-5.8 ms, all the same) | 86 ms | 23 ms |
-| + host MTRR write-combining over BAR1 on edi (`/proc/mtrr`) | 86 ms | 23 ms |
+| + host MTRR write-combining over BAR1 on the host (`/proc/mtrr`) | 86 ms | 23 ms |
 | **guest PAT fixed (PA6 = WC)**, BAR1 32 GB, with or without the host MTRR | **3.1 ms** | **4.9 ms** |
 | guest PAT fixed, BAR1 4 GB | 5.5 ms | 6.2 ms |
 
@@ -183,7 +183,7 @@ and KVM copies the guest's IA32_PAT into the VMCB (`svm.c`, `save.g_pat`).
 
 ### Cause
 
-Tracing the guest's IA32_PAT writes on edi (`kvm:kvm_msr` with filter `ecx == 0x277`, during boot) showed 16 writes
+Tracing the guest's IA32_PAT writes on the host (`kvm:kvm_msr` with filter `ecx == 0x277`, during boot) showed 16 writes
 (one per vCPU), all `0x0007010600070106`: PA0 WB, PA1 WC, PA2 UC-, PA3 UC, PA4 WB, PA5 WC, **PA6 UC-**, PA7 UC.
 
 - XNU (`osfmk/i386/mtrr.c`, `mtrr_update_action`) normally sets **PA6 = WC**. Its pmap encodes write-combined pages as
@@ -192,7 +192,7 @@ Tracing the guest's IA32_PAT writes on edi (`kvm:kvm_msr` with filter `ecx == 0x
   with `mov eax, 0x00070106; mov edx, 0x00070106; wrmsr`, a fixed PAT whose entry 6 is UC-. The 10.13+ version does
   the same; the "Shaneee" variants (disabled) make every entry write-back.
 - So in this guest every write-combined mapping (RM's BAR1 mappings, kIOMapWriteCombineCache) ran uncached-minus.
-  The earlier explanation (edi's PAT maps BAR1 uncached-minus for VFIO) was wrong: that is QEMU's host mapping, which
+  The earlier explanation (the host's PAT maps BAR1 uncached-minus for VFIO) was wrong: that is QEMU's host mapping, which
   the guest's accesses don't use.
 
 ### Fix
