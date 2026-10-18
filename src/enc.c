@@ -257,6 +257,16 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
     for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
     r->framerate = e->cfg.fps; r->gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
+    if (e->cfg.rc_mode) {   // as the H.264 path (M3, T3.06-T3.08): NAL HRD, fixed-point rate per pixel and frame
+        double pixels = (double)W * H, perFrame = (double)e->cfg.bitrate / e->cfg.fps;
+        r->hrd_type = 2; r->maxQPD = 6; r->baseQPD = 3;
+        r->framerate = e->cfg.fps << 8;
+        r->buffersize = (unsigned)e->cfg.vbv_bits; r->nal_cpb_size = r->vcl_cpb_size = e->cfg.vbv_bits;
+        r->nal_bitrate = r->vcl_bitrate = e->cfg.max_bitrate;
+        r->Np = e->cfg.idr_period > 0 ? (e->cfg.idr_period - 1) << 4 : 0x7fffffff;
+        r->Ravg = r->R = (int)(perFrame / pixels * 256);
+        r->Bmin = 0; r->i_size_ratio_x = 1; r->i_size_ratio_y = 1;   // single_frame_vbv stays 0 (T3.08)
+    }
 
     int ctbW = (W + 31) / 32, ctbH = (H + 31) / 32, ctbs = ctbW * ctbH, lg = 0;
     while ((1 << lg) < ctbs) lg++;
