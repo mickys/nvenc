@@ -3,7 +3,9 @@
 #include "blocklinear.h"
 #include <string.h>
 #include <dispatch/dispatch.h>
+#include <stdlib.h>
 #include <emmintrin.h>
+#include <Accelerate/Accelerate.h>
 
 size_t bl_offset(size_t x, size_t y, size_t pitch, unsigned bh)
 {
@@ -81,5 +83,40 @@ void nvenc_in_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, si
             for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) tile_band(dst, src, src_stride, width, b, rows, pitch); });
     } else
         for (size_t b = 0; b < bands; b++) tile_band(dst, src, src_stride, width, b, rows, pitch);
+    _mm_sfence();
+}
+
+// BGRA -> NV12 (BT.709 video range) with Accelerate's vImage, one band at a time into a cache-sized buffer
+static vImage_ARGBToYpCbCr gBgraInfo;
+static void bgra_info_init(void)
+{
+    vImage_YpCbCrPixelRange range = { 16, 128, 235, 240, 235, 16, 240, 16 };   // video range
+    vImageConvert_ARGBToYpCbCr_GenerateConversion(kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2, &range, &gBgraInfo,
+                                                  kvImageARGB8888, kvImage420Yp8_CbCr8, kvImageNoFlags);
+}
+
+void nvenc_in_tile_bgra(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch)
+{
+    static dispatch_once_t once; dispatch_once(&once, ^{ bgra_info_init(); });
+    // super-bands of 32 luma rows = 2 luma tile rows + 1 chroma tile row: convert into a buffer (in cache), then tile
+    size_t sbands = (rows + 31) / 32, bw = (((width + 1) & ~(size_t)1) + 63) & ~(size_t)63, crows = (rows + 1) / 2;
+    size_t chunks = sbands >= 16 ? 2 : 1, per = (sbands + chunks - 1) / chunks;
+    dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+        uint8_t *buf = aligned_alloc(64, bw * 48);   // 32 luma rows + 16 chroma rows (bw is a multiple of 64)
+        if (!buf) return;
+        uint8_t *uvb = buf + bw * 32;
+        const uint8_t permute[4] = { 3, 2, 1, 0 };   // BGRA in memory -> ARGB order for vImage
+        for (size_t sb = k * per; sb < (k + 1) * per && sb < sbands; sb++) {
+            size_t r0 = sb * 32, n = (r0 + 32 < rows ? 32 : rows - r0) & ~(size_t)1;
+            if (!n) n = 2;   // a last single row: convert it twice (vImage needs even sizes)
+            vImage_Buffer in = { (void *)(src + r0 * src_stride), n, width & ~(size_t)1, src_stride };
+            vImage_Buffer y = { buf, n, width & ~(size_t)1, bw }, uv = { uvb, n / 2, (width & ~(size_t)1) / 2, bw };
+            vImageConvert_ARGB8888To420Yp8_CbCr8(&in, &y, &uv, &gBgraInfo, permute, kvImageDoNotTile);
+            // tile_band reads rows band*16.. of its source: point the source so that row r0 is the buffer's first row
+            for (size_t b = 2 * sb; b < 2 * sb + 2 && b * 16 < rows; b++) tile_band(dst_luma, buf - r0 * bw, bw, width, b, rows, pitch);
+            tile_band(dst_chroma, uvb - (r0 / 2) * bw, bw, width, sb, crows, pitch);
+        }
+        free(buf);
+    });
     _mm_sfence();
 }

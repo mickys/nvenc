@@ -3,7 +3,8 @@
 //   DYLD_INSERT_LIBRARIES=~/nvenc-dev/libnvencvt.dylib ./vttest hw avc1 1920 1080 60
 // Loaded otherwise (the Metal plugin with NVMTL_NVENC_IMPL=nvenc), call NVEncVT_Register(rating), or register
 // NVEncVT_CreateInstance as the factory yourself. Environment: NVENCVT_RATING (default 1100,
-// above nullmoth's 1000), NVENCVT_NO_REGISTER, NVENCVT_LOG.
+// above nullmoth's 1000), NVENCVT_NO_REGISTER, NVENCVT_LOG, NVENCVT_DEPTH, NVENCVT_ENGINE, NVENCVT_STATS=<file> (or touch
+// /tmp/nvencvt.stats: statistics every 2 s to /tmp/nvencvt-stats.log, also in apps that get no environment).
 #include "enc.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -13,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 // ---- CMBaseObject / encoder class declarations (WebKit's CMBaseObjectSPI.h, written for C++) ----
 typedef struct CMBaseProtocolVTable CMBaseProtocolVTable;
@@ -55,11 +58,43 @@ typedef struct {
     bool realTime;
     unsigned frames;
     // frames in flight: encodeFrame submits, the completion thread waits (in order) and emits
-    struct { VTEncoderFrameRef frame; CMTime pts, dur; NvU32 ticket; bool ok; } q[ENC_MAX_DEPTH];
+    struct { VTEncoderFrameRef frame; CMTime pts, dur; NvU32 ticket; bool ok; double tEntry, tCall, tTile; } q[ENC_MAX_DEPTH];
+    // statistics (NVENCVT_STATS=<file> or the flag file /tmp/nvencvt.stats: a line every 2 s to that file /
+    // /tmp/nvencvt-stats.log)
+    FILE *statsFile; double statsT0; unsigned sN, sIdr, sFail; double sCall, sCallMax, sTile, sEng, sEngMax, sTotal, sTotalMax, sBytes;
+    OSType lastPf;
     unsigned qh, qt, depth;
     pthread_t thread; bool threadOn, stop;
     pthread_cond_t cv;
 } State;
+
+static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+
+static void stats_print(State *s);
+static void stats_frame(State *s, double call, double tile, double eng, double total, size_t bytes, bool idr, bool fail)
+{
+    if (!s->statsFile) return;
+    s->sN++; s->sIdr += idr; s->sFail += fail; s->sBytes += bytes;
+    s->sCall += call; if (call > s->sCallMax) s->sCallMax = call;
+    s->sTile += tile; s->sEng += eng; if (eng > s->sEngMax) s->sEngMax = eng;
+    s->sTotal += total; if (total > s->sTotalMax) s->sTotalMax = total;
+    if (now_ms() - s->statsT0 >= 2000) stats_print(s);
+}
+
+static void stats_print(State *s)
+{
+    if (!s->statsFile || !s->sN) return;
+    double t = now_ms();
+    double sec = (t - s->statsT0) / 1000, n = s->sN;
+    char pf[5] = { (char)(s->lastPf >> 24), (char)(s->lastPf >> 16), (char)(s->lastPf >> 8), (char)s->lastPf, 0 };
+    time_t now = time(NULL); char ts[32]; strftime(ts, sizeof ts, "%H:%M:%S", localtime(&now));
+    fprintf(s->statsFile, "%s %s pid %d %dx%d %s NVENC%d: %.1f fps, call %.3f ms (max %.3f; tiling %.3f), engine %.3f ms (max %.3f), "
+            "entry->emit %.3f ms (max %.3f), %.1f KB/frame, %u IDR, %u failed, rate %d bit/s rt %d\n", ts, getprogname(), getpid(),
+            s->width, s->height, pf, s->engine, n / sec, s->sCall / n, s->sCallMax, s->sTile / n, s->sEng / n, s->sEngMax,
+            s->sTotal / n, s->sTotalMax, s->sBytes / n / 1024, s->sIdr, s->sFail, s->bitrate, s->realTime);
+    fflush(s->statsFile);
+    s->statsT0 = t; s->sN = s->sIdr = s->sFail = 0; s->sCall = s->sCallMax = s->sTile = s->sEng = s->sEngMax = s->sTotal = s->sTotalMax = s->sBytes = 0;
+}
 
 static int gEngineUse[2];   // active sessions per NVENC engine in this process (guarded by gEngineLock)
 static pthread_mutex_t gEngineLock = PTHREAD_MUTEX_INITIALIZER;
@@ -153,17 +188,17 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 {
     State *s = state(e);
     s->session = session; s->width = dims.width; s->height = dims.height;
-    // NV12 in; VideoToolbox converts anything else (BGRA from screen capture, ...) before encodeFrame
-    int f1 = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, f2 = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-    CFNumberRef n1 = CFNumberCreate(NULL, kCFNumberIntType, &f1), n2 = CFNumberCreate(NULL, kCFNumberIntType, &f2);
-    const void *fv[] = { n1, n2 }; CFArrayRef fmts = CFArrayCreate(NULL, fv, 2, &kCFTypeArrayCallBacks);
+    // NV12 or BGRA in (BGRA is converted by us, in the tiling pass, much faster than VideoToolbox's conversion: T5.05)
+    int f1 = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, f2 = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, f3 = kCVPixelFormatType_32BGRA;
+    CFNumberRef n1 = CFNumberCreate(NULL, kCFNumberIntType, &f1), n2 = CFNumberCreate(NULL, kCFNumberIntType, &f2), n3 = CFNumberCreate(NULL, kCFNumberIntType, &f3);
+    const void *fv[] = { n1, n2, n3 }; CFArrayRef fmts = CFArrayCreate(NULL, fv, 3, &kCFTypeArrayCallBacks);
     CFNumberRef w = CFNumberCreate(NULL, kCFNumberIntType, &s->width), h = CFNumberCreate(NULL, kCFNumberIntType, &s->height);
     CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     const void *k[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey };
     const void *v[] = { fmts, w, h, ios };
     CFDictionaryRef attrs = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     OSStatus st = VTEncoderSessionSetPixelBufferAttributes(session, attrs);
-    CFRelease(attrs); CFRelease(ios); CFRelease(w); CFRelease(h); CFRelease(fmts); CFRelease(n1); CFRelease(n2);
+    CFRelease(attrs); CFRelease(ios); CFRelease(w); CFRelease(h); CFRelease(fmts); CFRelease(n1); CFRelease(n2); CFRelease(n3);
     LOG("startSession %dx%d (pixel buffer attributes -> %d)", s->width, s->height, (int)st);
     return noErr;
 }
@@ -205,6 +240,8 @@ static OSStatus open_encoder(State *s)
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
     s->stop = false;
+    const char *sf = getenv("NVENCVT_STATS");
+    if (sf || access("/tmp/nvencvt.stats", F_OK) == 0) { s->statsFile = fopen(sf ? sf : "/tmp/nvencvt-stats.log", "a"); s->statsT0 = now_ms(); }
     s->threadOn = pthread_create(&s->thread, NULL, completion, s) == 0;
     if (!s->threadOn) { enc_close(&s->enc); s->opened = false; return kVTVideoEncoderMalfunctionErr; }
     return noErr;
@@ -249,6 +286,7 @@ static void *completion(void *arg)
         if (s->qh == s->qt) break;
         unsigned i = s->qh % s->depth;
         VTEncoderFrameRef frame = s->q[i].frame; CMTime pts = s->q[i].pts, dur = s->q[i].dur; NvU32 t = s->q[i].ticket; bool ok = s->q[i].ok;
+        double tEntry = s->q[i].tEntry, tCall = s->q[i].tCall, tTile = s->q[i].tTile;
         pthread_mutex_unlock(&s->lock);
         EncFrame fr; memset(&fr, 0, sizeof fr);
         int rc = ok ? enc_wait(&s->enc, t, &fr) : -1;
@@ -256,6 +294,7 @@ static void *completion(void *arg)
         else if (gLog && (t <= 3 || fr.idr)) LOG("frame %u %s: %zu bytes, %.3f ms, avgQP %u", t, fr.idr ? "IDR" : "P", fr.size, fr.ms, fr.avg_qp);
         emit(s, frame, pts, dur, &fr, rc ? kVTVideoEncoderMalfunctionErr : noErr);   // fr.data stays valid until qh moves on
         pthread_mutex_lock(&s->lock);
+        stats_frame(s, tCall, tTile, fr.ms, now_ms() - tEntry, rc ? 0 : fr.size, fr.idr, rc != 0);
         s->qh++;
         pthread_cond_broadcast(&s->cv);
     }
@@ -269,12 +308,14 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
                               CFDictionaryRef props, VTEncodeInfoFlags *infoOut)
 {
     State *s = state(e);
+    double tEntry = now_ms();
     pthread_mutex_lock(&s->lock);
     OSStatus st = noErr;
     if (!s->opened && !s->failed && (st = open_encoder(s))) s->failed = true;
     if (s->failed) { pthread_mutex_unlock(&s->lock); VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL); return kVTVideoEncoderMalfunctionErr; }
     OSType pf = CVPixelBufferGetPixelFormatType(img);
-    if ((pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ||
+    bool bgra = pf == kCVPixelFormatType_32BGRA;
+    if ((pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && !bgra) ||
         (int)CVPixelBufferGetWidth(img) < s->width || (int)CVPixelBufferGetHeight(img) < s->height) {
         LOG("unexpected pixel buffer %.4s %zux%zu", (char *)&pf, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img));
         pthread_mutex_unlock(&s->lock);
@@ -282,19 +323,28 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         return noErr;
     }
     while (s->qt - s->qh >= s->depth) pthread_cond_wait(&s->cv, &s->lock);   // a free input slot
+    double tTile0 = now_ms();
+    s->lastPf = pf;
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
-    enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
-                  CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
+    else enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                       CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
     CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     bool forceIdr = false;
     if (props) { CFTypeRef k = CFDictionaryGetValue(props, kVTEncodeFrameOptionKey_ForceKeyFrame); forceIdr = k && CFGetTypeID(k) == CFBooleanGetTypeID() && CFBooleanGetValue(k); }
     unsigned i = s->qt % s->depth;
     s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur;
+    s->q[i].tEntry = tEntry; s->q[i].tTile = now_ms() - tTile0;
     s->q[i].ok = enc_submit(&s->enc, forceIdr, &s->q[i].ticket) == 0;
+    s->q[i].tCall = now_ms() - tEntry;
     s->qt++; s->frames++;
     pthread_cond_broadcast(&s->cv);
+    // RealTime (streaming): return only once this frame is emitted, so the output reaches the app inside its encode call.
+    // Parsec picks up output when it encodes the next frame otherwise: one frame period of extra latency (T5.05).
+    bool sync = s->realTime || getenv("NVENCVT_SYNC");
+    if (sync) { unsigned mine = s->qt; while (s->qh < mine && s->threadOn) pthread_cond_wait(&s->cv, &s->lock); }
     pthread_mutex_unlock(&s->lock);
-    if (infoOut) *infoOut = kVTEncodeInfo_Asynchronous;
+    if (infoOut) *infoOut = sync ? 0 : kVTEncodeInfo_Asynchronous;
     return noErr;
 }
 
@@ -316,6 +366,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
         pthread_mutex_unlock(&s->lock); pthread_join(s->thread, NULL); pthread_mutex_lock(&s->lock);
         s->threadOn = false;
     }
+    if (s->statsFile) { stats_print(s); fclose(s->statsFile); s->statsFile = NULL; }
     if (s->opened) {
         enc_close(&s->enc); s->opened = false;
         pthread_mutex_lock(&gEngineLock); gEngineUse[s->engine]--; pthread_mutex_unlock(&gEngineLock);

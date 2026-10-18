@@ -18,7 +18,7 @@ tar -cf - src tools trace vt | ssh "$G" "cd ~/nvenc-dev && rm -rf src tools trac
   if [ -f vt/\$t.c ]; then
     clang -O2 -Wall -dynamiclib -o lib\$t.dylib vt/\$t.c src/*.c -I src -I inc/webkit-spi \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video \
-      -framework IOKit -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox 2>&1 | grep -E 'error|warning'
+      -framework IOKit -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework Accelerate 2>&1 | grep -E 'error|warning'
   elif [ -f trace/\$t.c ]; then
     clang -O2 -Wall -dynamiclib -o \$t.dylib trace/\$t.c \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -framework IOKit -framework CoreFoundation \
@@ -28,5 +28,5 @@ tar -cf - src tools trace vt | ssh "$G" "cd ~/nvenc-dev && rm -rf src tools trac
   else
     clang -O2 -Wall -Wno-unused-function -o \$t tools/\$t.c src/*.c -I src \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video \
-      -framework IOKit -framework CoreFoundation 2>&1 | grep -E 'error|warning'
+      -framework IOKit -framework CoreFoundation -framework Accelerate 2>&1 | grep -E 'error|warning'
   fi; echo \"built ~/nvenc-dev/\$t\"; done"

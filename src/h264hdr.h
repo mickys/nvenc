@@ -14,6 +14,8 @@ typedef struct {
     int entropy_cabac;              // 0 CAVLC, 1 CABAC
     int pic_init_qp;                // 26 + pic_init_qp_minus26
     int transform_8x8;              // high profile only
+    int vui;                        // write VUI: BT.709 colour description, no frame reordering (max_num_reorder_frames 0)
+    int full_range;                 // VUI video_full_range_flag
 } H264Params;
 
 // Annex B (start code 00 00 00 01) SPS and PPS; returns bytes written into out (needs ~64 bytes)

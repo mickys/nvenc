@@ -50,6 +50,22 @@ int main(int argc, char **argv) { @autoreleasepool {
     VTDecompressionSessionRef dec = NULL;
     st = VTDecompressionSessionCreate(NULL, fmt, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attr, NULL, &dec);
     if (st) { printf("decoder create -> %d\n", (int)st); return 1; }
+    if (getenv("LAG")) {   // output lag: feed pictures one by one without draining, count how many the decoder holds back
+        __block int outs = 0; int maxLag = 0;
+        for (NSUInteger k = 0; k < samples.count; k++) {
+            NSData *sample = samples[k]; CMBlockBufferRef bb = NULL;
+            CMBlockBufferCreateWithMemoryBlock(NULL, (void *)sample.bytes, sample.length, kCFAllocatorNull, NULL, 0, sample.length, 0, &bb);
+            CMSampleBufferRef sb = NULL; size_t ss = sample.length;
+            CMSampleTimingInfo ti = { .duration = CMTimeMake(1, 60), .presentationTimeStamp = CMTimeMake((int64_t)k, 60), .decodeTimeStamp = kCMTimeInvalid };
+            CMSampleBufferCreateReady(NULL, bb, fmt, 1, 1, &ti, 1, &ss, &sb);
+            VTDecompressionSessionDecodeFrameWithOutputHandler(dec, sb, 0, NULL, ^(OSStatus s, VTDecodeInfoFlags fl, CVImageBufferRef img, CMTime pts, CMTime dur) { if (img) outs++; });
+            CFRelease(sb); CFRelease(bb);
+            int lag = (int)k + 1 - outs; if (lag > maxLag) maxLag = lag;
+        }
+        VTDecompressionSessionWaitForAsynchronousFrames(dec);
+        printf("RESULT output lag: up to %d picture(s) held back by the decoder (%d of %lu output in the end)\n", maxLag, outs, (unsigned long)samples.count);
+        return 0;
+    }
     double sumY = 0, sumC = 0, minY = 1e9, minC = 1e9; int decoded = 0, errors = 0;
     for (NSUInteger k = 0; k < samples.count; k++) {
         NSData *sample = samples[k];

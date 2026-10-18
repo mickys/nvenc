@@ -93,7 +93,7 @@ static H264Params hdr_params(const Enc *e)
 {
     return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = 77, .level_idc = 51,
         .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = 2, .num_ref_frames = e->cfg.num_refs,
-        .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = 0, .pic_init_qp = 26 };
+        .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = 0, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
 }
 
 size_t enc_headers(Enc *e, uint8_t *out)
@@ -108,6 +108,12 @@ void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, 
     RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
     nvenc_in_tile_plane(in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
     nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)e->cfg.width, (size_t)(e->cfg.height + 1) / 2, e->pitch);
+}
+
+void enc_load_bgra(Enc *e, const uint8_t *bgra, size_t stride)
+{
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    nvenc_in_tile_bgra(in->cpu, (uint8_t *)in->cpu + e->lumaSz, bgra, stride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
 }
 
 // ME control: predictor sources, search stamps and FBM settings as the reference client sets them (docs/traces,

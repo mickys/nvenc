@@ -22,6 +22,7 @@ typedef struct {
     int slices;                     // slices per picture, whole MB rows (1..ENC_MAX_SLICES)
     bool spin;                      // wait for the engine by spinning only (default: spin 50 us, then sleep on the NVENC event)
     int depth;                      // frames in flight with enc_submit (1..ENC_MAX_DEPTH, default 1)
+    bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;
 
@@ -60,6 +61,8 @@ void enc_close(Enc *e);
 size_t enc_headers(Enc *e, uint8_t *out);                       // SPS + PPS, Annex B (~64 bytes)
 // copy an NV12 frame (pitch-linear planes) into the next frame's input surface (needs enc_inflight() < depth)
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride);
+// convert a BGRA frame (BT.709 video range) into the next frame's input surface
+void enc_load_bgra(Enc *e, const uint8_t *bgra, size_t stride);
 int  enc_encode(Enc *e, bool force_idr, EncFrame *out);         // encode the loaded frame and wait; 0 = ok
 int  enc_submit(Enc *e, bool force_idr, NvU32 *ticket);         // start encoding the loaded frame; 0 = ok
 int  enc_wait(Enc *e, NvU32 ticket, EncFrame *out);             // wait for a submitted frame (in submission order); 0 = ok

@@ -45,7 +45,24 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
     int cr = (wmb * 16 - p->width) / 2, cb = (hmb * 16 - p->height) / 2;   // 4:2:0 crop units are 2 pixels
     put(&b, cr || cb ? 1 : 0, 1);
     if (cr || cb) { ue(&b, 0); ue(&b, (unsigned)cr); ue(&b, 0); ue(&b, (unsigned)cb); }
-    put(&b, 0, 1);                                     // vui_parameters_present
+    put(&b, p->vui ? 1 : 0, 1);                        // vui_parameters_present
+    if (p->vui) {                                      // E.1.1
+        put(&b, 0, 1);                                 // aspect_ratio_info_present
+        put(&b, 0, 1);                                 // overscan_info_present
+        put(&b, 1, 1);                                 // video_signal_type_present
+        put(&b, 5, 3); put(&b, (unsigned)p->full_range, 1);   // video_format unspecified, video_full_range_flag
+        put(&b, 1, 1); put(&b, 1, 8); put(&b, 1, 8); put(&b, 1, 8);   // colour primaries / transfer / matrix: BT.709
+        put(&b, 0, 1);                                 // chroma_loc_info_present
+        put(&b, 0, 1);                                 // timing_info_present
+        put(&b, 0, 1); put(&b, 0, 1);                  // nal / vcl hrd_parameters_present
+        put(&b, 0, 1);                                 // pic_struct_present
+        put(&b, 1, 1);                                 // bitstream_restriction_flag
+        put(&b, 1, 1);                                 // motion_vectors_over_pic_boundaries
+        ue(&b, 2); ue(&b, 1);                          // max_bytes_per_pic_denom, max_bits_per_mb_denom (defaults)
+        ue(&b, 16); ue(&b, 16);                        // log2_max_mv_length_horizontal / vertical
+        ue(&b, 0);                                     // max_num_reorder_frames: output in decode order, at once
+        ue(&b, (unsigned)p->num_ref_frames);           // max_dec_frame_buffering
+    }
     trailing(&b);
     return emit(&b, 0x67, out);                        // nal_ref_idc 3, type 7
 }
