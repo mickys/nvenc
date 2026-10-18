@@ -34,8 +34,8 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
         put(&b, 0, 1);                                 // seq_scaling_matrix_present
     }
     ue(&b, (unsigned)p->log2_max_frame_num_minus4);
-    ue(&b, 0);                                         // pic_order_cnt_type 0
-    ue(&b, (unsigned)p->log2_max_poc_lsb_minus4);
+    ue(&b, (unsigned)p->poc_type);                     // pic_order_cnt_type 0 or 2
+    if (p->poc_type == 0) ue(&b, (unsigned)p->log2_max_poc_lsb_minus4);
     ue(&b, (unsigned)p->num_ref_frames);
     put(&b, 0, 1);                                     // gaps_in_frame_num_value_allowed
     ue(&b, (unsigned)wmb - 1);
@@ -57,7 +57,7 @@ size_t h264_write_pps(const H264Params *p, uint8_t *out)
     put(&b, (unsigned)p->entropy_cabac, 1);
     put(&b, 0, 1);                                     // bottom_field_pic_order_in_frame_present
     ue(&b, 0);                                         // num_slice_groups_minus1
-    ue(&b, 0); ue(&b, 0);                              // num_ref_idx_l0/l1_default_active_minus1
+    ue(&b, (unsigned)p->num_ref_idx_l0_minus1); ue(&b, 0);   // num_ref_idx_l0/l1_default_active_minus1
     put(&b, 0, 1); put(&b, 0, 2);                      // weighted_pred, weighted_bipred_idc
     se(&b, p->pic_init_qp - 26);
     se(&b, 0);                                         // pic_init_qs_minus26

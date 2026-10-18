@@ -8,6 +8,8 @@ typedef struct {
     int width, height;              // display size; coded size is rounded up to whole macroblocks (cropping signalled)
     int profile_idc, level_idc;     // e.g. 77 main / 100 high, 51 = level 5.1
     int log2_max_frame_num_minus4, log2_max_poc_lsb_minus4;
+    int poc_type;                   // 0 or 2
+    int num_ref_idx_l0_minus1;      // PPS default
     int num_ref_frames;
     int entropy_cabac;              // 0 CAVLC, 1 CABAC
     int pic_init_qp;                // 26 + pic_init_qp_minus26

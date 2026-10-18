@@ -10,3 +10,10 @@ size_t bl_offset(size_t x, size_t y, size_t pitch, unsigned block_height_log2);
 size_t bl_plane_size(size_t pitch, size_t rows, unsigned block_height_log2);
 // copy a pitch-linear plane (src_stride) of width x rows bytes into block-linear dst
 void bl_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch, unsigned bh);
+
+// The layout NVENC on Ada reads for input_cfg block_height 2 / input_bl_mode 0, measured from a working client's input
+// surface (T2.05d): 64-byte x 16-row tiles of 1 KB, row-major; inside a tile, 16-byte x 4-row sub-blocks ordered
+// x16, y4, x32, y8. Planes are rounded up to 16 rows.
+size_t nvenc_in_offset(size_t x, size_t y, size_t pitch);
+size_t nvenc_in_plane_size(size_t pitch, size_t rows);
+void nvenc_in_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);

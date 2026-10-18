@@ -19,7 +19,9 @@ Why: with nullmoth's closed `libnvenc_h264` (plus our layout fix) a 4K Parsec fr
 | VideoToolbox plugin interface | decoder side: Apple's SPI headers in WebKit (`VTVideoDecoderSPI.h`, `CMBaseObjectSPI.h`); encoder side: black-box probing (a stub encoder that logs which slots VideoToolbox calls) | |
 | H.264 headers (SPS/PPS) | ITU-T H.264 | |
 
-Not used: nullmoth's closed codec libraries (no disassembly, no patching; only their observable behaviour).
+Not used: nullmoth's closed codec libraries (no disassembly, no patching; only their observable behaviour). Since
+2026-10-18 (user's decision) that includes observing `libnvenc_h264` at runtime: its RM escapes, the commands it pushes
+to the NVENC channel, and the buffers it hands the engine (`trace/nvtrace.c`, captures in `docs/traces/`).
 
 ## What the GPU offers (`tools/probe.c`, RTX 4090)
 
