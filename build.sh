@@ -24,7 +24,7 @@ tar -cf - src tools trace vt | ssh "$G" "cd ~/nvenc-dev && rm -rf src tools trac
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -framework IOKit -framework CoreFoundation \
       -framework VideoToolbox -framework CoreMedia 2>&1 | grep -E 'error|warning'
   elif [ -f tools/\$t.m ]; then
-    clang -O2 -fobjc-arc -Wall -I inc/webkit-spi -I src -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video -o \$t tools/\$t.m \$(grep -q '"rm.h"' tools/\$t.m && echo src/*.c || (grep -q blocklinear.h tools/\$t.m && echo src/blocklinear.c; grep -q hevchdr.h tools/\$t.m && echo src/hevchdr.c)) -framework IOKit -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Metal -framework IOSurface -framework Accelerate 2>&1 | grep -E 'error|warning'
+    clang -O2 -fobjc-arc -Wall -I inc/webkit-spi -I src -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video -o \$t tools/\$t.m \$(grep -q '"rm.h"' tools/\$t.m && echo src/*.c || (grep -q blocklinear.h tools/\$t.m && echo src/blocklinear.c; grep -q hevchdr.h tools/\$t.m && echo src/hevchdr.c)) -framework IOKit -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Metal -framework IOSurface -framework Accelerate -framework AVFoundation 2>&1 | grep -E 'error|warning'
   else
     clang -O2 -Wall -Wno-unused-function -o \$t tools/\$t.c src/*.c -I src \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video \

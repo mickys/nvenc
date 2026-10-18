@@ -10,6 +10,7 @@
 #include "ctrl/ctrl0080/ctrl0080gpu.h"
 #include "clc9b7.h"
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
@@ -153,6 +154,31 @@ static int num(CFTypeRef v, int dflt)
     return x;
 }
 
+// Profiles our 8-bit 4:2:0 stream satisfies: H.264 Baseline/Main/High (a P-only CAVLC Main stream decodes on all
+// three) at every level, HEVC Main. Registered as SupportedSelectionProperties, so VideoToolbox picks another encoder
+// (Apple's) when an app asks for a profile not listed (HEVC Main10, H.264 High 4:2:2 ...), as Apple's encoders declare.
+static CFArrayRef profiles(bool hevc)
+{
+    static CFArrayRef list[2]; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CFMutableArrayRef h = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks), v = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+        static const char *prof[] = { "Baseline", "Main", "High" };
+        static const char *lev[] = { "1_3", "3_0", "3_1", "3_2", "4_0", "4_1", "4_2", "5_0", "5_1", "5_2", "AutoLevel" };
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 11; j++) {
+            CFStringRef x = CFStringCreateWithFormat(NULL, NULL, CFSTR("H264_%s_%s"), prof[i], lev[j]); CFArrayAppendValue(h, x); CFRelease(x);
+        }
+        CFArrayAppendValue(h, CFSTR("H264_ConstrainedBaseline_AutoLevel")); CFArrayAppendValue(h, CFSTR("H264_ConstrainedHigh_AutoLevel"));
+        CFArrayAppendValue(v, kVTProfileLevel_HEVC_Main_AutoLevel);
+        list[0] = h; list[1] = v;
+    });
+    return list[hevc];
+}
+static bool profile_ok(const State *s, CFTypeRef v)
+{
+    CFArrayRef l = profiles(s->hevc);
+    return v && CFGetTypeID(v) == CFStringGetTypeID() && CFArrayContainsValue(l, CFRangeMake(0, CFArrayGetCount(l)), v);
+}
+
 static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
 {
     State *s = state(o);
@@ -166,6 +192,7 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     else if (CFEqual(key, kVTCompressionPropertyKey_Quality)) { double q = 0; if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(v, kCFNumberDoubleType, &q); s->quality = (int)(q * 100); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) { if (v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) LOG("frame reordering requested: not supported, no B-frames"); }
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !profile_ok(s, v)) st = kVTPropertyNotSupportedErr;
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) || CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) ||
              CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)) { /* accepted: Main profile, CAVLC, rate limits from AverageBitRate */ }
     else st = kVTPropertyNotSupportedErr;
@@ -469,19 +496,45 @@ static bool gpu_has_ada_nvenc(void)
 static OSStatus register_one(FourCharCode codec, CFStringRef id, CFStringRef name, int rating)
 {
     CFNumberRef r = CFNumberCreate(NULL, kCFNumberIntType, &rating);
-    const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("CMClassImplementationName"), CFSTR("VTRating"), CFSTR("VTIsHardwareAccelerated") };
-    const void *v[] = { id, name, r, kCFBooleanTrue };
-    CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void *sk[] = { kVTCompressionPropertyKey_ProfileLevel }, *sv[] = { profiles(codec == kCMVideoCodecType_HEVC) };
+    CFDictionaryRef sel = CFDictionaryCreate(NULL, sk, sv, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("CMClassImplementationName"), CFSTR("VTRating"), CFSTR("VTIsHardwareAccelerated"),
+                        kVTVideoEncoderList_SupportedSelectionProperties };
+    const void *v[] = { id, name, r, kCFBooleanTrue, sel };
+    CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     OSStatus st = VTRegisterVideoEncoderWithInfo(codec, info, (void *)NVEncVT_CreateInstance);
-    CFRelease(info); CFRelease(r);
+    CFRelease(info); CFRelease(sel); CFRelease(r);
     return st;
+}
+
+// The plugin calls NVEncVT_Register in every process it is enabled for, while the Metal device is created, so the
+// check must be cheap: the GPU's PCI device ID from the IORegistry (~0.1 ms) instead of an RM client and the class list
+// (6-9 ms). Ada (AD102-AD107: RTX 40, RTX Ada, L4/L40) is device IDs 0x2600-0x28ff. -1: no NVIDIA GPU in the registry.
+static int pci_has_ada(void)
+{
+    io_iterator_t it = 0; io_object_t d; int found = -1;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &it) != KERN_SUCCESS) return -1;
+    while ((d = IOIteratorNext(it))) {
+        CFTypeRef ven = IORegistryEntryCreateCFProperty(d, CFSTR("vendor-id"), NULL, 0), dev = IORegistryEntryCreateCFProperty(d, CFSTR("device-id"), NULL, 0);
+        unsigned v = 0, id = 0;
+        if (ven && CFGetTypeID(ven) == CFDataGetTypeID() && CFDataGetLength(ven) >= 2) CFDataGetBytes(ven, CFRangeMake(0, 2), (UInt8 *)&v);
+        if (dev && CFGetTypeID(dev) == CFDataGetTypeID() && CFDataGetLength(dev) >= 2) CFDataGetBytes(dev, CFRangeMake(0, 2), (UInt8 *)&id);
+        if (ven) CFRelease(ven);
+        if (dev) CFRelease(dev);
+        IOObjectRelease(d);
+        if (v == 0x10de && found < 1) found = id >= 0x2600 && id <= 0x28ff;
+    }
+    IOObjectRelease(it);
+    return found;
 }
 
 // registers the H.264 (avc1) and HEVC (hvc1) encoders; returns the H.264 registration's status
 __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
 {
-    if (!getenv("NVENCVT_ANY_GPU") && !gpu_has_ada_nvenc()) {
-        LOG("GPU has no Ada NVENC (class c9b7): not registering");
+    int ada = getenv("NVENCVT_ANY_GPU") ? 1 : pci_has_ada();
+    if (ada < 0) ada = gpu_has_ada_nvenc();   // no PCI match (unusual): ask RM for the class list
+    if (!ada) {
+        LOG("GPU is not Ada (no NVENC class c9b7): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
     OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), CFSTR("nvenc H.264 (NVIDIA pre-Blackwell)"), rating);
