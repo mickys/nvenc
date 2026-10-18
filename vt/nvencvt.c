@@ -47,6 +47,7 @@ typedef struct {
     VTEncoderSessionRef session;
     int width, height;
     bool opened, failed;
+    int engine;
     Enc enc;
     CMVideoFormatDescriptionRef fmt;
     // properties
@@ -59,6 +60,9 @@ typedef struct {
     pthread_t thread; bool threadOn, stop;
     pthread_cond_t cv;
 } State;
+
+static int gEngineUse[2];   // active sessions per NVENC engine in this process (guarded by gEngineLock)
+static pthread_mutex_t gEngineLock = PTHREAD_MUTEX_INITIALIZER;
 
 static State *state(VTVideoEncoderRef e) { return *(State **)CMBaseObjectGetDerivedStorage(e); }
 
@@ -177,7 +181,17 @@ static OSStatus open_encoder(State *s)
         c.vbv_bits = s->realTime ? s->bitrate / c.fps * 2 : s->bitrate;
     }
     c.depth = getenv("NVENCVT_DEPTH") ? atoi(getenv("NVENCVT_DEPTH")) : 2;   // frames in flight
-    if (enc_open(&s->enc, &c)) { enc_close(&s->enc); return kVTVideoEncoderMalfunctionErr; }
+    // the engine with fewer sessions in this process (a second session runs on NVENC1, in parallel)
+    pthread_mutex_lock(&gEngineLock);
+    c.engine = gEngineUse[1] < gEngineUse[0] ? 1 : 0;
+    if (getenv("NVENCVT_ENGINE")) c.engine = atoi(getenv("NVENCVT_ENGINE")) & 1;
+    gEngineUse[c.engine]++; s->engine = c.engine;
+    pthread_mutex_unlock(&gEngineLock);
+    if (enc_open(&s->enc, &c)) {
+        enc_close(&s->enc);
+        pthread_mutex_lock(&gEngineLock); gEngineUse[s->engine]--; pthread_mutex_unlock(&gEngineLock);
+        return kVTVideoEncoderMalfunctionErr;
+    }
     s->depth = (unsigned)s->enc.cfg.depth;
     uint8_t hdr[256]; size_t n = enc_headers(&s->enc, hdr);
     // SPS and PPS from the Annex B header block
@@ -186,7 +200,7 @@ static OSStatus open_encoder(State *s)
         if (!hdr[i] && !hdr[i + 1] && !hdr[i + 2] && hdr[i + 3] == 1) { ps[cnt++] = hdr + i + 4; }
     pl[0] = (size_t)(ps[1] - 4 - ps[0]); pl[1] = (size_t)(hdr + n - ps[1]);
     OSStatus st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("encoder open %dx%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", c.width, c.height, c.rc_mode, c.bitrate,
+    LOG("encoder open on NVENC%d: %dx%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", c.engine, c.width, c.height, c.rc_mode, c.bitrate,
         c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
@@ -302,7 +316,10 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
         pthread_mutex_unlock(&s->lock); pthread_join(s->thread, NULL); pthread_mutex_lock(&s->lock);
         s->threadOn = false;
     }
-    if (s->opened) { enc_close(&s->enc); s->opened = false; }
+    if (s->opened) {
+        enc_close(&s->enc); s->opened = false;
+        pthread_mutex_lock(&gEngineLock); gEngineUse[s->engine]--; pthread_mutex_unlock(&gEngineLock);
+    }
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }
     LOG("invalidate after %u frames", s->frames);
     pthread_mutex_unlock(&s->lock);

@@ -52,7 +52,7 @@ instead of nullmoth's.
 | M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | **done** (2026-10-18): `tools/encode1`, 256x128 to 3840x2160 (and 3840x2025) decode at ≥ 45.8 dB luma, QP 26 |
 | M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | **done** (2026-10-18): `src/enc.c` + `tools/encodeN`; 60-120 frame streams with 1-3 refs, CBR within ±5 %, one-frame-VBV low latency, 1-16 slices |
 | M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | **done** (2026-10-18): `vt/nvencvt.c` → `libnvencvt.dylib`, registered by the Metal plugin (`NVMTL_NVENC_IMPL=nvenc`); `vttest` uses it (Parsec: pending a restart) |
-| M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | Parsec 4K encode time well under today's ~9 ms |
+| M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | **mostly done** (2026-10-18): fast CPU tiling (4K 0.65 ms), event-driven completion, async encoding; 4K ~4.0 ms/frame in tests. Parsec measurement and a GPU swizzle still open (tasks.md) |
 | M6 | Two sessions (NVENC0/1), HEVC | Sunshine-style double sessions; HEVC decodes |
 
 Step-by-step tasks for each milestone, with status and per-task reports: [tasks.md](tasks.md).
@@ -129,3 +129,15 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
 - In the plugin bundle the dylib needs a real ad-hoc signature (`codesign -f -s -`) before the bundle is re-signed.
 - Remaining CPU cost per frame: VideoToolbox's BGRA→NV12 conversion (when the app hands BGRA), our CPU tiling, and
   the spin-wait. M5 removes the last two.
+
+## M5 notes (details in docs/reports/T5.*)
+
+- NVENC reads only its own input layout; `input_bl_mode` is ignored, and classic GOB or pitch-linear input doesn't
+  work. A copy engine can't do the conversion, so the input path stays on the CPU for now.
+- Tiling: SSE loads, non-temporal stores in destination order, two threads: 4K 0.65 ms, 1080p 0.19 ms.
+- Completion: RM OS event on `NV2080_NOTIFIERS_NVENC<n>`, waited with the user client's selector 6. NVENC's own
+  `AWAKEN` bit raises nothing; the host must acquire the semaphore and then run `NON_STALL_INTERRUPT`. Same latency,
+  CPU during the wait ~0.1 ms instead of the whole encode time.
+- Async: `enc_submit` / `enc_wait`, up to 3 frames in flight (per-frame input/setup/bitstream/status); libnvencvt
+  emits from a completion thread. Throughput is then bound by the engine: 4K 4.0 ms, 1080p 1.0 ms per frame.
+- Two engines: sessions on NVENC0 and NVENC1 run in parallel without slowing each other (M6/T6.01).

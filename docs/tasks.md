@@ -75,7 +75,7 @@ first.
 
 | ID | Task | Done when | Status |
 |---|---|---|---|
-| T6.01 | Session placement: NVENC0 and NVENC1, two sessions in one process | two streams encode at the same time | todo |
+| T6.01 | Session placement: NVENC0 and NVENC1, two sessions in one process | two streams encode at the same time | done |
 | T6.02 | HEVC VPS/SPS/PPS writer (`src/hevchdr.c`) | parsed by Apple's decoder | todo |
 | T6.03 | HEVC picture setup from `nvenc_drv.h` (IDR only) | one HEVC IDR frame decodes ≥ 40 dB | todo |
 | T6.04 | HEVC P-frames and RC (reuse M3) | 60-frame HEVC stream decodes | todo |
