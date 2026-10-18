@@ -60,6 +60,7 @@ typedef struct {
     CMVideoFormatDescriptionRef fmt;
     // properties
     int bitrate, maxKeyInterval, fps, quality;
+    int refs;                       // reference frames (ReferenceBufferCount; 0 = default)
     bool realTime;
     unsigned frames;
     // frames in flight: encodeFrame submits, the completion thread waits (in order) and emits
@@ -132,6 +133,7 @@ void build(void)
     CFDictionarySetValue(d, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, num);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_ExpectedFrameRate, num);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_Quality, num);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_ReferenceBufferCount, num);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_RealTime, bol);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_AllowFrameReordering, bol);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_ProfileLevel, enm);
@@ -158,6 +160,7 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameInterval)) s->maxKeyInterval = num(v, 0);
     else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration)) { if (!s->maxKeyInterval && num(v, 0) > 0) s->maxKeyInterval = num(v, 0) * (s->fps ? s->fps : 60); }
     else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) s->fps = num(v, 0);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) s->refs = num(v, 0);
     else if (CFEqual(key, kVTCompressionPropertyKey_Quality)) { double q = 0; if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(v, kCFNumberDoubleType, &q); s->quality = (int)(q * 100); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) { if (v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) LOG("frame reordering requested: not supported, no B-frames"); }
@@ -177,6 +180,7 @@ static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRe
     if (CFEqual(key, kVTCompressionPropertyKey_AverageBitRate)) { n = s->bitrate; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameInterval)) { n = s->maxKeyInterval; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) { n = s->fps; v = CFNumberCreate(al, kCFNumberIntType, &n); }
+    else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) { n = s->enc.cfg.num_refs ? s->enc.cfg.num_refs : (s->refs ? s->refs : ENC_MAX_REFS); v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) v = CFRetain(s->realTime ? kCFBooleanTrue : kCFBooleanFalse);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) v = CFRetain(kCFBooleanFalse);
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)) v = CFRetain(s->hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel);
@@ -211,7 +215,12 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 static void *completion(void *arg);
 static OSStatus open_encoder(State *s)
 {
-    EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = 1, .fps = s->fps > 0 ? s->fps : 60,
+    // reference frames: ReferenceBufferCount if the client set it, else NVENCVT_REFS, else ENC_MAX_REFS (3). Pictures that come
+    // back (window switching, blinking content) cost far less with more references: 1080p, three pictures cycling, HEVC:
+    // 27.8 Mbit/s with one, 1.7 with three (T6.11); steady motion about -2 %, +0.1 ms per frame. No reordering, no added latency.
+    int refs = s->refs > 0 ? s->refs : getenv("NVENCVT_REFS") ? atoi(getenv("NVENCVT_REFS")) : ENC_MAX_REFS;
+    refs = refs < 1 ? 1 : refs > ENC_MAX_REFS ? ENC_MAX_REFS : refs;
+    EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0 };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
@@ -242,8 +251,8 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s encoder open on NVENC%d: %dx%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", c.engine, c.width, c.height, c.rc_mode, c.bitrate,
-        c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
+    LOG("%s encoder open on NVENC%d: %dx%d refs %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", c.engine, c.width, c.height, c.num_refs,
+        c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
     s->stop = false;
