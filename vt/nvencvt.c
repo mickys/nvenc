@@ -14,6 +14,11 @@
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
+#include <dlfcn.h>
+#include <objc/runtime.h>
+#include <malloc/malloc.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -585,6 +590,91 @@ static int pci_has_ada(void)
     return found;
 }
 
+// ---- encoder names ----
+// VTRegisterVideoEncoderWithInfo always names an encoder "Dynamically Registered <codec> Video Encoder": it passes that
+// name, not ours, to the registry entry it creates (VideoToolbox's vtRegisterVideoEncoderInternal), and plug-in bundles,
+// which can carry a VTEncoderName, are only accepted when Apple signed them (CoreMedia's figRegistryAddResultItem checks
+// kFigRegistryAppleCodeSignRequirement for every folder VideoToolbox scans; T7.00). The entry's description is a
+// mutable dictionary that VideoToolbox reads VTEncoderName / VTCodecName from when it lists encoders, so we rename our
+// entries there: find VideoToolbox's encoder FigRegistry (a pointer in VideoToolbox's data sections to a FigRegistry of
+// class com.apple.videotoolbox.videoencoder), our items by ID, and set the two names if the dictionary is mutable and
+// still holds VideoToolbox's default name. Anything unexpected: leave the default name. NVENCVT_NO_RENAME=1 skips it.
+typedef OSStatus (*FigRegistryCreateFn)(CFAllocatorRef, CFStringRef, void **);
+typedef OSStatus (*FigRegistryCopyFilteredItemListFn)(void *, void *, void *, CFArrayRef *, int *);
+typedef OSStatus (*FigRegistryItemCopyDescriptionFn)(const void *, CFDictionaryRef *);
+// mutable: Foundation's mutable dictionary class (CFDictionaryCreateMutable makes one); _CFDictionaryIsMutable only knows
+// the old CF-native type and says 0 for every dictionary on macOS 26, frozen copies are __NSFrozenDictionaryM
+static bool dict_is_mutable(CFDictionaryRef d) { const char *c = object_getClassName((id)d); return c && !strcmp(c, "__NSDictionaryM"); }
+
+static void *find_vt_encoder_registry(void)
+{
+    FigRegistryCreateFn create = (FigRegistryCreateFn)dlsym(RTLD_DEFAULT, "FigRegistryCreate");
+    if (!create) return NULL;
+    void *mine = NULL;   // a registry of our own: its isa and type ID identify FigRegistry objects
+    if (create(NULL, CFSTR("org.nvenc.registry-probe"), &mine) || !mine) return NULL;
+    uintptr_t isa = ((const uintptr_t *)mine)[0]; CFTypeID tid = CFGetTypeID(mine);
+    CFRelease(mine);
+    CFStringRef cls = CFSTR("com.apple.videotoolbox.videoencoder");
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (!n || !strstr(n, "/VideoToolbox.framework/")) continue;
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        const struct load_command *lc = (const struct load_command *)(h + 1);
+        for (uint32_t k = 0; k < h->ncmds; k++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+            if (lc->cmd != LC_SEGMENT_64) continue;
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            // the registry pointer is written at run time: writable __DATA / __DATA_DIRTY only, not __DATA_CONST
+            if (strncmp(sg->segname, "__DATA", 6) || !strcmp(sg->segname, "__DATA_CONST") || !(sg->initprot & VM_PROT_WRITE)) continue;
+            const struct section_64 *sc = (const struct section_64 *)(sg + 1);
+            for (uint32_t j = 0; j < sg->nsects; j++) {
+                unsigned long size = 0;
+                const uintptr_t *w = (const uintptr_t *)getsectiondata(h, sc[j].segname, sc[j].sectname, &size);
+                for (unsigned long q = 0; w && q < size / sizeof *w; q++) {
+                    const uintptr_t *o = (const uintptr_t *)w[q];
+                    if ((uintptr_t)o < 0x100000000ull || ((uintptr_t)o & 7) || !malloc_zone_from_ptr(o) || malloc_size(o) < 64) continue;
+                    if (o[0] != isa || CFGetTypeID((CFTypeRef)o) != tid) continue;   // a FigRegistry
+                    CFTypeRef c = ((CFTypeRef const *)o)[2];
+                    if (c && CFGetTypeID(c) == CFStringGetTypeID() && CFEqual(c, cls)) return (void *)o;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void rename_encoders(const char *const ids[], const char *const names[], const char *const codecs[], int n)
+{
+    if (getenv("NVENCVT_NO_RENAME")) return;
+    FigRegistryCopyFilteredItemListFn list = (FigRegistryCopyFilteredItemListFn)dlsym(RTLD_DEFAULT, "FigRegistryCopyFilteredItemList");
+    FigRegistryItemCopyDescriptionFn desc = (FigRegistryItemCopyDescriptionFn)dlsym(RTLD_DEFAULT, "FigRegistryItemCopyDescription");
+    if (!list || !desc) { LOG("rename: registry functions missing"); return; }
+    void *reg = find_vt_encoder_registry();
+    if (!reg) { LOG("rename: VideoToolbox's encoder registry not found"); return; }
+    CFArrayRef items = NULL; int cnt = 0;
+    if (list(reg, NULL, NULL, &items, &cnt) || !items) { LOG("rename: no item list"); return; }
+    int done = 0;
+    for (CFIndex i = 0; i < CFArrayGetCount(items); i++) {
+        CFDictionaryRef d = NULL;
+        if (desc(CFArrayGetValueAtIndex(items, i), &d) || !d) continue;
+        CFTypeRef iid = CFDictionaryGetValue(d, CFSTR("CMClassImplementationID")), cur = CFDictionaryGetValue(d, CFSTR("VTEncoderName"));
+        for (int k = 0; k < n && iid && CFGetTypeID(iid) == CFStringGetTypeID(); k++) {
+            CFStringRef want = CFStringCreateWithCString(NULL, ids[k], kCFStringEncodingUTF8);
+            if (CFEqual(iid, want)) LOG("rename: %s: name %s, class %s", ids[k], cur && CFGetTypeID(cur) == CFStringGetTypeID() && CFStringHasPrefix(cur, CFSTR("Dynamically Registered")) ? "default" : "other", object_getClassName((id)d));
+            if (CFEqual(iid, want) && cur && CFGetTypeID(cur) == CFStringGetTypeID() &&
+                CFStringHasPrefix(cur, CFSTR("Dynamically Registered")) && dict_is_mutable(d)) {
+                CFStringRef nm = CFStringCreateWithCString(NULL, names[k], kCFStringEncodingUTF8), cn = CFStringCreateWithCString(NULL, codecs[k], kCFStringEncodingUTF8);
+                CFDictionarySetValue((CFMutableDictionaryRef)d, CFSTR("VTEncoderName"), nm);
+                CFDictionarySetValue((CFMutableDictionaryRef)d, CFSTR("VTCodecName"), cn);
+                CFRelease(nm); CFRelease(cn); done++;
+            }
+            CFRelease(want);
+        }
+        CFRelease(d);
+    }
+    CFRelease(items);
+    LOG("rename: %d of %d encoder names set", done, n);
+}
+
 // registers the H.264 (avc1) and HEVC (hvc1) encoders; returns the H.264 registration's status
 __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
 {
@@ -594,10 +684,14 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
         LOG("GPU is not Ada (no NVENC class c9b7): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
-    OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), CFSTR("nvenc H.264 (NVIDIA pre-Blackwell)"), rating);
+    OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), CFSTR("nvenc H.264 (NVIDIA RTX 40)"), rating);
     OSStatus sh = getenv("NVENCVT_NO_HEVC") ? kVTCouldNotFindVideoEncoderErr
-                : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), CFSTR("nvenc HEVC (NVIDIA pre-Blackwell)"), rating);
+                : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), CFSTR("nvenc HEVC (NVIDIA RTX 40)"), rating);
     LOG("registered %s -> %d, %s -> %d (rating %d)", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, rating);
+    static const char *const ids[] = { ENCODER_ID, ENCODER_ID_HEVC };
+    static const char *const names[] = { "nvenc H.264 (NVIDIA RTX 40)", "nvenc HEVC (NVIDIA RTX 40)" };
+    static const char *const codecs[] = { "H.264", "HEVC" };
+    rename_encoders(ids, names, codecs, sh ? 1 : 2);
     return st;
 }
 
