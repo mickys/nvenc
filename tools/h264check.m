@@ -55,7 +55,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     double se[2] = { 0, 0 }; size_t cnt[2] = { 0, 0 };
     for (int pl2 = 0; pl2 < 2; pl2++) {
         const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, pl2); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, pl2);
-        const uint8_t *s = pl2 ? suv : sy; int rows = pl2 ? H / 2 : H;
+        const uint8_t *s = pl2 ? suv : sy; int rows = pl2 ? (H + 1) / 2 : H;
         for (int r = 0; r < rows; r++) for (int c = 0; c < W; c++) { double df = (double)o[r * os + c] - s[r * W + c]; se[pl2] += df * df; cnt[pl2]++; }
     }
     if (argc > 5) {

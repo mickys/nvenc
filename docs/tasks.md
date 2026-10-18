@@ -12,16 +12,16 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 | T2.02 | Find which method brings the MMU fault: run `encode1` with `NVENC_VAR=stop=1..4` | the first failing stage is known | done |
 | T2.03 | Get the faulting GPU address (driver log / RM fault report) and print a buffer map (name, GPU VA, size) from `encode1` | the fault address matches a buffer, or is known to match none | done |
 | T2.04 | Fix the fault (missing buffer, wrong size, alignment or address shift) | no MMU fault during `EXECUTE` | done |
-| T2.05 | Clear the engine error: RC error 47 (`ROBUST_CHANNEL_NVENC0_ERROR`) with `error_status` 1 in the status buffer | the semaphore is released, no error notifier, `error_status` and `ucode_error_status` 0 | doing |
+| T2.05 | Clear the engine error: RC error 47 (`ROBUST_CHANNEL_NVENC0_ERROR`) with `error_status` 1 in the status buffer | the semaphore is released, no error notifier, `error_status` and `ucode_error_status` 0 | done |
 | T2.05a | Tools to see engine errors: RM's RC error log (`tools/rcerr`, root) decoded with `scripts/prbdecode.py` | the RC record of our run is readable | done |
 | T2.05b | Bisect the methods: which buffer method turns a clean microcode error into RC 47 | the method is known | done |
 | T2.05c | Bisect the picture setup contents (input surface config, recon config, ME/MD/quant controls, RC) with the engine encoding | a setup that encodes without error | done (via T2.05d) |
 | T2.05d | Observe a working client (nullmoth's library) with an RM/IOKit interposer (`trace/nvtrace.c`), replay its picture setup with our buffers, measure the input layout | the replayed setup encodes and decodes ≥ 40 dB | done |
-| T2.05e | Bisect our setup against the reference: which fields/methods are needed for our own setup to encode | `encode1` without `NVENC_REPLAY` encodes ≥ 40 dB | todo |
-| T2.06 | Bitstream comes out: `total_bit_count` > 0, slice NAL(s) with the expected header in the bitstream buffer | `h264check` lists SPS, PPS, IDR slice | todo |
-| T2.07 | Our SPS/PPS match the slice header the engine wrote (frame_num/POC bits, entropy, deblocking flag) | Apple's decoder accepts the stream | todo |
+| T2.05e | Bisect our setup against the reference: which fields/methods are needed for our own setup to encode | `encode1` without `NVENC_REPLAY` encodes ≥ 40 dB | done |
+| T2.06 | Bitstream comes out: `total_bit_count` > 0, slice NAL(s) with the expected header in the bitstream buffer | `h264check` lists SPS, PPS, IDR slice | done (T2.05d/e: SPS, PPS, IDR slice) |
+| T2.07 | Our SPS/PPS match the slice header the engine wrote (frame_num/POC bits, entropy, deblocking flag) | Apple's decoder accepts the stream | done (Apple decodes; POC type 2 added) |
 | T2.08 | Input layout right: block-linear NV12 as the engine reads it (flat-colour and gradient tests if the picture is scrambled) | PSNR ≥ 40 dB at QP 26 | done (layout measured in T2.05d; other sizes in T2.09) |
-| T2.09 | Sizes: 256x128, 1920x1080 (cropped MB row), 3840x2160, 3840x2025 (odd height) | all decode at ≥ 40 dB | todo |
+| T2.09 | Sizes: 256x128, 1920x1080 (cropped MB row), 3840x2160, 3840x2025 (odd height) | all decode at ≥ 40 dB | done |
 | T2.10 | Clean up `encode1` (keep only knobs that still matter), M2 notes in `design.md`, commit | committed, README status updated | todo |
 
 ## M3: P-frames, rate control, slices
