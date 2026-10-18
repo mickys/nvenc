@@ -292,3 +292,29 @@ surface's system pages into its shared VRAM, the reverse of the kernel's existin
 (`nvrm_surfshare_pageoff` → `nvrm_ce_copy_to_pages`). No "page-on" exists in the kexts today; it would be new code in
 NVRM/NVAccel plus a plugin change. Separately, a plugin installed where WebKit's GPU process may map code would let
 Safari render with Metal, but `/System/Library/Extensions` is on the sealed system volume.
+
+### Fix: surface-in through the GPU (fork branch `surface-upload` → `dev`, 2026-10-18)
+
+A kernel "page-on" can't be built from the published sources (NVRM needs nullmoth's unpublished RM build; its copy
+helper `nvrm_ce_copy_to_pages` only copies VRAM → pages). The plugin does it instead, in user space:
+
+- **GPU upload:** `nvmtl_vk_image_write_host` imports the locked surface pages as host memory
+  (`VK_EXT_external_memory_host`, which this driver supports) and lets the GPU copy them into the image. No CPU copy,
+  and the CPU never touches the pages. Default in every process; `NVMTL_SURFIN_UPLOAD=cpu` turns it off.
+- **Keep surfaces mapped:** WindowServer releases a client's surface every frame, and the pages were faulted in again
+  at the next upload (same address every time; "mapped at a new address 0 x" in the statistics). Retaining the last 32
+  uploaded surfaces (at most 384 MB) keeps them mapped. Default in WindowServer only; `NVMTL_SURFIN_KEEP=1/0`.
+
+Same WindowServer session, Safari motion test, 3158x1816 layer, switched with `/tmp/nvmtl-surfin-mode`:
+
+| surface-in | per upload | display transactions/s | WindowServer user / system |
+|---|---|---|---|
+| CPU copy (before) | 15.0 ms | 23.7 | 128 % / 36 % |
+| keep mapped | 5.8 ms (CPU copy ~2.7 ms) | 31.9 | 133 % / 19 % |
+| GPU upload | 5.7 ms | 29.5 | 45 % / 22 % |
+| **both (the default now)** | **5.3 ms** | **30.1** | **30 % / 21 %** |
+
+`tools/surfincheck.m` (CPU-written pattern → IOSurface texture → GPU blit → compare): pixel-exact in every mode, at
+3158x1740, 1920x1080 and 333x211, over 100 rounds. With the defaults installed, the limit in this test is now the
+producer: WebKit paints the animation on the CPU at ~180 % CPU, because its GPU process can't load the plugin
+(see above).
