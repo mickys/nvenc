@@ -78,8 +78,8 @@ first.
 | T6.01 | Session placement: NVENC0 and NVENC1, two sessions in one process | two streams encode at the same time | done |
 | T6.02 | HEVC structures: `nvenc_h265_drv_pic_setup_s` (1024 B) and the H.265 ME/MD controls in `nvenc_drv.h`, compared with the H.264 ones we use | field map in the report | done |
 | T6.03 | Observe nullmoth's `libnvenc_hevc` at runtime (option B: RM escapes, pushed methods, buffers): `tools/hevcref.m` registers its `NVEncHEVC_CreateInstance` in-process, one 256x128 IDR under `trace/nvtrace` | picture setup + method trace in `docs/traces/` | done |
-| T6.04 | HEVC VPS/SPS/PPS writer (`src/hevchdr.c`) | Apple's `CMVideoFormatDescriptionCreateFromHEVCParameterSets` accepts them | doing |
-| T6.05 | One HEVC IDR from our own picture setup: codec switch in `enc.c` (application ID, codec type, H.265 setup), `encode1` HEVC mode at 256x128 | decodes ≥ 40 dB | todo |
+| T6.04 | HEVC VPS/SPS/PPS writer (`src/hevchdr.c`) | Apple's `CMVideoFormatDescriptionCreateFromHEVCParameterSets` accepts them | done |
+| T6.05 | One HEVC IDR from our own picture setup: codec switch in `enc.c` (application ID, codec type, H.265 setup), `encode1` HEVC mode at 256x128 | decodes ≥ 40 dB | doing |
 | T6.06 | HEVC IDR at 720p, 1080p, 3840x2160 (CTB alignment, recon layout) | all decode ≥ 40 dB | todo |
 | T6.07 | HEVC P-frames (1 reference, short-term RPS) | 60-frame stream decodes, no errors | todo |
 | T6.08 | HEVC rate control (CBR/VBR/low-latency, reuse M3) | bitrate within 10 % of target | todo |

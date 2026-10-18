@@ -1,0 +1,27 @@
+// hevchdr.h: HEVC VPS/SPS/PPS NAL units (ITU-T H.265 7.3.2.1-7.3.2.3), matching what we tell NVENC in
+// nvenc_h265_sps_data_s / nvenc_h265_pps_data_s, so the slice segments the engine writes decode against them.
+// Values follow what nullmoth's libnvenc_hevc writes (docs/reports/T6.03.md): Main profile, CTB 32, CB 16..32,
+// TB 4..32, AMP + SAO, one short-term RPS in the SPS (slices send their own), no temporal MVP.
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    int width, height;              // display size; coded size is rounded up to the 16-pixel min CB (conformance window)
+    int level_idc;                  // 30 x level (93 = 3.1, 123 = 4.1, 153 = 5.1); 0 = from the picture size at 60 fps
+    int log2_max_poc_lsb_minus4;    // 4 (as nullmoth's)
+    int max_dec_pic_buffering;      // DPB size in pictures (references + current)
+    int sps_rps_negative;           // pictures in the SPS's one short-term RPS (deltas 1, none used by the current picture)
+    int num_ref_idx_l0_default;     // PPS default active references in list 0
+    int pic_init_qp;                // 26 + init_qp_minus26
+    int vui;                        // write VUI: square pixels, BT.709 colour description
+    int full_range;                 // VUI video_full_range_flag
+} HevcParams;
+
+int hevc_level_for(int width, int height);   // smallest Main-tier level for this size at 60 fps
+size_t hevc_coded_width(const HevcParams *p);
+size_t hevc_coded_height(const HevcParams *p);
+// Annex B (start code 00 00 00 01) NAL units; return bytes written into out (needs ~128 bytes)
+size_t hevc_write_vps(const HevcParams *p, uint8_t *out);
+size_t hevc_write_sps(const HevcParams *p, uint8_t *out);
+size_t hevc_write_pps(const HevcParams *p, uint8_t *out);
