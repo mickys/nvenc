@@ -61,6 +61,8 @@ typedef struct {
     // properties
     int bitrate, maxKeyInterval, fps, quality;
     int refs;                       // reference frames (ReferenceBufferCount; 0 = default)
+    // diagnostic dump (flag file /tmp/nvencvt.dump): encoded stream from a forced IDR on, and the first 30 input frames
+    FILE *dumpEs, *dumpYuv; int dumpYuvLeft; bool dumpIdr;
     bool realTime;
     unsigned frames;
     // frames in flight: encodeFrame submits, the completion thread waits (in order) and emits
@@ -215,10 +217,13 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 static void *completion(void *arg);
 static OSStatus open_encoder(State *s)
 {
-    // reference frames: ReferenceBufferCount if the client set it, else NVENCVT_REFS, else ENC_MAX_REFS (3). Pictures that come
+    // reference frames: ReferenceBufferCount if the client set it, else NVENCVT_REFS, else 1 (3 gave a Parsec client ghosting
+    // on moving windows, 2026-10-18, under investigation). Pictures that come
     // back (window switching, blinking content) cost far less with more references: 1080p, three pictures cycling, HEVC:
     // 27.8 Mbit/s with one, 1.7 with three (T6.11); steady motion about -2 %, +0.1 ms per frame. No reordering, no added latency.
-    int refs = s->refs > 0 ? s->refs : getenv("NVENCVT_REFS") ? atoi(getenv("NVENCVT_REFS")) : ENC_MAX_REFS;
+    int refs = s->refs > 0 ? s->refs : getenv("NVENCVT_REFS") ? atoi(getenv("NVENCVT_REFS")) : 1;
+    { FILE *rf = fopen("/tmp/nvencvt.refs", "r"); int v = 0;   // diagnostics: overrides everything, read at each session start
+      if (rf) { if (fscanf(rf, "%d", &v) == 1 && v > 0) refs = v; fclose(rf); } }
     refs = refs < 1 ? 1 : refs > ENC_MAX_REFS ? ENC_MAX_REFS : refs;
     EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0 };
@@ -266,6 +271,7 @@ static OSStatus open_encoder(State *s)
 static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, const EncFrame *fr, OSStatus err)
 {
     if (err) { VTEncoderSessionEmitEncodedFrame(s->session, frame, err, 0, NULL); return; }
+    if (s->dumpEs) { fwrite(fr->data, 1, fr->size, s->dumpEs); fflush(s->dumpEs); }
     // Annex B (4-byte start codes) -> AVCC (4-byte big-endian lengths), same size
     uint8_t *buf = malloc(fr->size);
     memcpy(buf, fr->data, fr->size);
@@ -342,6 +348,21 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     double tTile0 = now_ms();
     s->lastPf = pf;
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+    if (!s->dumpEs && (s->frames % 30) == 0 && access("/tmp/nvencvt.dump", F_OK) == 0) {   // start a dump (diagnostics)
+        char p[128]; snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.es", (int)getpid()); s->dumpEs = fopen(p, "wb");
+        snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.nv12", (int)getpid()); s->dumpYuv = bgra ? NULL : fopen(p, "wb");
+        s->dumpYuvLeft = 30; s->dumpIdr = true;
+        if (s->dumpEs) { uint8_t h[256]; size_t n = enc_headers(&s->enc, h); fwrite(h, 1, n, s->dumpEs); }
+        LOG("dump started (%dx%d, %s)", s->width, s->height, bgra ? "BGRA: stream only" : "NV12");
+    }
+    if (s->dumpYuv && s->dumpYuvLeft > 0) {   // the input as Parsec delivered it, tightly packed NV12
+        for (int pl = 0; pl < 2; pl++) {
+            const uint8_t *b = CVPixelBufferGetBaseAddressOfPlane(img, pl); size_t st = CVPixelBufferGetBytesPerRowOfPlane(img, pl);
+            int rows = pl ? (s->height + 1) / 2 : s->height;
+            for (int r = 0; r < rows; r++) fwrite(b + (size_t)r * st, 1, (size_t)s->width, s->dumpYuv);
+        }
+        if (--s->dumpYuvLeft == 0) { fclose(s->dumpYuv); s->dumpYuv = NULL; }
+    }
     if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
     else enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
                        CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
@@ -351,7 +372,7 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     unsigned i = s->qt % s->depth;
     s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur;
     s->q[i].tEntry = tEntry; s->q[i].tTile = now_ms() - tTile0;
-    s->q[i].ok = enc_submit(&s->enc, forceIdr, &s->q[i].ticket) == 0;
+    s->q[i].ok = enc_submit(&s->enc, forceIdr || s->dumpIdr, &s->q[i].ticket) == 0; s->dumpIdr = false;
     s->q[i].tCall = now_ms() - tEntry;
     s->qt++; s->frames++;
     pthread_cond_broadcast(&s->cv);
@@ -385,6 +406,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     if (s->statsFile) { stats_print(s); fclose(s->statsFile); s->statsFile = NULL; }
     if (s->opened) {
         enc_close(&s->enc); s->opened = false;
+        if (s->dumpEs) { fclose(s->dumpEs); s->dumpEs = NULL; } if (s->dumpYuv) { fclose(s->dumpYuv); s->dumpYuv = NULL; }
         pthread_mutex_lock(&gEngineLock); gEngineUse[s->engine]--; pthread_mutex_unlock(&gEngineLock);
     }
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }

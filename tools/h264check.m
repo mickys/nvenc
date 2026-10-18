@@ -3,6 +3,7 @@
 //   ./h264check [-v] W H in.h264 src.nv12 [dump.pgm]      dump.pgm: luma of the last decoded picture
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <math.h>
 
 int main(int argc, char **argv) { @autoreleasepool {
@@ -55,7 +56,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fmt);
     printf("SPS says %dx%d, %lu picture(s), %zu source frame(s)\n", d.width, d.height, (unsigned long)samples.count, nSrc);
     NSDictionary *spec = @{ (__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO };
-    NSDictionary *attr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) };
+    // FULLRANGE=1: full-range output (420f), for streams from full-range input (Parsec): else the decoder converts to video range
+    NSDictionary *attr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(getenv("FULLRANGE") ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) };
     VTDecompressionSessionRef dec = NULL;
     st = VTDecompressionSessionCreate(NULL, fmt, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attr, NULL, &dec);
     if (st) { printf("decoder create -> %d\n", (int)st); return 1; }
@@ -90,6 +92,26 @@ int main(int argc, char **argv) { @autoreleasepool {
         CFRelease(sb); CFRelease(bb);
         if (ds || !out) { printf("picture %lu: decode failed, status %d\n", (unsigned long)k, (int)ds); errors++; continue; }
         decoded++;
+        if (getenv("DECODED_MD5")) {   // MD5 of each decoded picture as tightly packed NV12 (as ffmpeg -f framemd5 -pix_fmt nv12)
+            CC_MD5_CTX m; CC_MD5_Init(&m); unsigned char dg[16];
+            CVPixelBufferLockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
+            for (int pl2 = 0; pl2 < 2; pl2++) {
+                const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, pl2); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, pl2);
+                for (int r = 0; r < (pl2 ? CH : H); r++) CC_MD5_Update(&m, o + r * os, (CC_LONG)W);
+            }
+            CVPixelBufferUnlockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
+            CC_MD5_Final(dg, &m);
+            printf("md5 %lu ", (unsigned long)k); for (int i = 0; i < 16; i++) printf("%02x", dg[i]); printf("\n");
+        }
+        if (getenv("DECODED_NV12")) {   // every decoded picture, tightly packed NV12, appended in decode order
+            static FILE *df; if (!df) df = fopen(getenv("DECODED_NV12"), "wb");
+            CVPixelBufferLockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
+            for (int pl2 = 0; pl2 < 2 && df; pl2++) {
+                const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, pl2); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, pl2);
+                for (int r = 0; r < (pl2 ? CH : H); r++) fwrite(o + r * os, 1, W, df);
+            }
+            CVPixelBufferUnlockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
+        }
         if (k < nSrc) {
             CVPixelBufferLockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
             const uint8_t *sy = (const uint8_t *)src.bytes + k * frameSz, *suv = sy + (size_t)W * H;
