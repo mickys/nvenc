@@ -3,6 +3,7 @@
 #include "blocklinear.h"
 #include "h264hdr.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "class/clc56f.h"
@@ -12,7 +13,7 @@
 #include "nvenc_drv.h"
 
 // picture setup buffer: the 512-byte header, then one control of each kind
-enum { OFF_ME = 0x400, OFF_MD = 0x500, OFF_Q = 0x600, OFF_SLICE = 0x700, SETUP_SIZE = 0x1000 };
+enum { OFF_ME = 0x400, OFF_MD = 0x500, OFF_Q = 0x600, OFF_SLICE = 0x700, SETUP_SIZE = 0x1000 };   // room for ENC_MAX_SLICES controls
 enum { LOG2_MAX_FRAME_NUM = 8 };
 
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
@@ -51,9 +52,14 @@ int enc_open(Enc *e, const EncConfig *cfg)
         rm_mem_alloc(rm, &e->coloc, (mbs * 64 + 0xffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[0], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[1], meSz, 0x1000, false, false, true) ||
+        rm_mem_alloc(rm, &e->rcproc, 0x10000, 0x1000, true, true, true) ||
+        rm_mem_alloc(rm, &e->rcdata, 0x10000, 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
-    memset(e->in.cpu, 0, e->in.size);
+    memset(e->in.cpu, 0, e->in.size); memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
     ((volatile NvU32 *)e->sem.cpu)[0] = 0;
+    if (!e->cfg.fps) e->cfg.fps = 60;
+    if (!e->cfg.vbv_bits) e->cfg.vbv_bits = e->cfg.bitrate;
+    if (!e->cfg.max_bitrate) e->cfg.max_bitrate = e->cfg.bitrate;
 
     NV_NVENC_ALLOCATION_PARAMETERS ep = { .size = sizeof ep, .engineInstance = (NvU32)cfg->engine };
     if (chan_create(rm, &e->chan, cfg->engine ? NV2080_ENGINE_TYPE_NVENC1 : NV2080_ENGINE_TYPE_NVENC0, NVC9B7_VIDEO_ENCODER, &ep)) return -1;
@@ -64,7 +70,8 @@ int enc_open(Enc *e, const EncConfig *cfg)
 void enc_close(Enc *e)
 {
     chan_destroy(&e->chan);
-    RmMem *m[] = { &e->in, &e->recon, &e->setup, &e->bs, &e->status, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem };
+    RmMem *m[] = { &e->in, &e->recon, &e->setup, &e->bs, &e->status, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem,
+                   &e->rcproc, &e->rcdata };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
     rm_close(&e->rm);
 }
@@ -133,7 +140,7 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
 {
     memset(out, 0, sizeof *out);
     Chan *c = &e->chan;
-    int W = e->cfg.width, H = e->cfg.height, mbs = e->wmb * e->hmb;
+    int W = e->cfg.width, H = e->cfg.height;
     bool idr = force_idr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period);
     if (idr) { e->frame_num = 0; e->sinceIdr = 0; e->nRefs = 0; }
     int slot = e->nextSlot;                                   // where this picture's reconstruction goes
@@ -156,7 +163,21 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     nvenc_h264_rc_s *r = &ps->rate_control;
     r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
     for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
-    r->framerate = 60; r->gop_length = 0xffffffffu;
+    r->framerate = e->cfg.fps; r->gop_length = 0xffffffffu;
+    if (e->cfg.rc_mode) {   // field encodings as the reference client fills them (it runs const QP, though): T3.06
+        double pixels = (double)W * H, perFrame = (double)e->cfg.bitrate / e->cfg.fps;
+        r->hrd_type = 2;                                     // NAL HRD
+        r->maxQPD = 6; r->baseQPD = 3;
+        r->framerate = e->cfg.fps << 8;
+        r->buffersize = (unsigned)e->cfg.vbv_bits; r->nal_cpb_size = r->vcl_cpb_size = e->cfg.vbv_bits;
+        r->nal_bitrate = e->cfg.max_bitrate; r->vcl_bitrate = e->cfg.max_bitrate;
+        r->gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
+        r->Np = e->cfg.idr_period > 0 ? (e->cfg.idr_period - 1) << 4 : 0x7fffffff;
+        r->Ravg = r->R = (int)(perFrame / pixels * 256);       // bits per pixel per frame, 23.8
+        r->Bmin = 0; r->iSizeRatioX = 1; r->iSizeRatioY = 1;
+        // single_frame_VBV stays 0: set to 1 (with a one-frame VBV) the rate went to 3x the target at QP 5 (T3.08). A
+        // one-frame VBV by itself works: frames stay under bitrate/fps.
+    }
 
     nvenc_h264_pic_control_s *pc = &ps->pic_control;
     memset(pc->l0, -2, sizeof pc->l0); memset(pc->l1, -2, sizeof pc->l1);   // -2 = unused, as the reference client
@@ -167,11 +188,17 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     pc->pic_type = idr ? 3 : 0; pc->ref_pic_flag = 1; pc->cabac_zero_word_enable = 1; pc->e4byteStartCode = 1;
     pc->slice_mode = 0;   // 1 hangs the engine (T2.05e); one control with all MBs = one slice
 
+    // slices: one slice control per slice, whole MB rows, under slice_mode 0 (slice_mode 1 hangs the engine: T2.05e, T3.09)
+    int nsl = e->cfg.slices < 1 ? 1 : e->cfg.slices > ENC_MAX_SLICES ? ENC_MAX_SLICES : e->cfg.slices;
+    if (nsl > e->hmb) nsl = e->hmb;
+    pc->num_forced_slices_minus1 = (unsigned char)(nsl - 1);
     nvenc_h264_slice_control_s *sc = (void *)((NvU8 *)e->setup.cpu + OFF_SLICE);
-    sc->num_mb = (unsigned)mbs; sc->qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc->qp_slice_min = 0; sc->qp_slice_max = 51;
-    // P: always override the active reference count, as the reference client does. With the flag clear the engine's
-    // slice header doesn't match the PPS default and the stream is undecodable from the first picture with all refs.
-    if (!idr) { sc->num_ref_idx_active_override_flag = 1; sc->num_ref_idx_l0_active_minus1 = (unsigned)(nRefs - 1); }
+    for (int k = 0; k < nsl; k++) {
+        int mb = ((k + 1) * e->hmb / nsl - k * e->hmb / nsl) * e->wmb;   // rows spread evenly
+        sc[k].num_mb = (unsigned)mb; sc[k].qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc[k].qp_slice_min = 0; sc[k].qp_slice_max = 51;
+        if (!idr) { sc[k].num_ref_idx_active_override_flag = 1; sc[k].num_ref_idx_l0_active_minus1 = (unsigned)(nRefs - 1); }
+    }
+
     setup_me((void *)((NvU8 *)e->setup.cpu + OFF_ME), !idr);
     setup_md((void *)((NvU8 *)e->setup.cpu + OFF_MD), !idr);
 
@@ -181,14 +208,15 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
     chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
     chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
-              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, NVC9B7_SET_CONTROL_PARAMS_RCMODE_CONSTQP));
+              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     struct { NvU32 m; NvU64 a; } bm[] = {
         { NVC9B7_SET_IN_DRV_PIC_SETUP, e->setup.gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
         { NVC9B7_SET_OUT_COLOC_DATA, e->coloc.gpu }, { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
         { NVC9B7_SET_OUT_ENC_STATUS, e->status.gpu }, { NVC9B7_SET_OUT_BITSTREAM, e->bs.gpu },
         { NVC9B7_SET_IN_CUR_PIC, e->in.gpu }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, e->in.gpu + e->lumaSz },
-        { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, e->in.gpu + e->lumaSz } };
+        { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, e->in.gpu + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
+        { NVC9B7_SET_IN_RCDATA, e->rcdata.gpu } };
     for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
     if (!idr) {
         chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));

@@ -5,8 +5,9 @@ A hardware H.264 encoder for macOS on NVIDIA GPUs before Blackwell (Turing, Ampe
 It drives the GPU's NVENC engine directly from user space and is written from public documentation only.
 
 **Status: early.** M0 (RM client, capability probe), M1 (a channel on NVENC0/1 that runs our commands: `tools/hello`)
-and M2 (one H.264 IDR frame from our own picture setup, 256x128 to 4K, ≥ 45 dB: `tools/encode1`) work. Next: M3,
-P-frames and rate control. Milestones and design: [docs/design.md](docs/design.md); step-by-step tasks with reports:
+M2 (one H.264 IDR frame from our own picture setup, 256x128 to 4K: `tools/encode1`) and M3 (`src/enc.c`: P-frames
+with up to 3 references, CBR/VBR, low-latency one-frame VBV, slices: `tools/encodeN`) work. Next: M4, the
+VideoToolbox encoder plugin. Milestones and design: [docs/design.md](docs/design.md); step-by-step tasks with reports:
 [docs/tasks.md](docs/tasks.md).
 
 Why: the driver's own encoder library is Blackwell-only and closed. With a layout fix it runs on an RTX 4090, but a
@@ -17,8 +18,8 @@ per process works ([measurements](https://github.com/mickys/kvm-tahoe-nvidia/blo
 
 | Path | What |
 |---|---|
-| `src/` | the encoder: `rm.c` (RM client, memory, GPU/CPU mappings), `channel.c` (GPFIFO channel on an engine, push buffer, doorbell, MMU fault info), `blocklinear.c` (NVENC input layout), `h264hdr.c` (SPS/PPS) |
-| `tools/` | test programs, each built against `src/`: `probe` (engines and classes), `hello` (M1: semaphores from host and NVENC), `encode1` (M2: one IDR frame), `h264check` (decode with Apple's decoder, PSNR), `rcerr` (RM's RC error log, root), `vtrandom` (one random frame through VideoToolbox) |
+| `src/` | the encoder: `rm.c` (RM client, memory, GPU/CPU mappings), `channel.c` (GPFIFO channel on an engine, push buffer, doorbell, MMU fault info), `blocklinear.c` (NVENC input layout), `h264hdr.c` (SPS/PPS), `enc.c` (the encode session: IDR/P, references, rate control, slices) |
+| `tools/` | test programs, each built against `src/`: `probe` (engines and classes), `hello` (M1: semaphores from host and NVENC), `encode1` (M2: one IDR frame), `encodeN` (M3: N frames, rate control via environment), `h264check` (decode with Apple's decoder, PSNR), `rcerr` (RM's RC error log, root), `vtrandom` (one random frame through VideoToolbox) |
 | `trace/` | `nvtrace.c`: a `DYLD_INSERT_LIBRARIES` interposer that records a process's RM escapes, NVENC channel methods and buffers |
 | `scripts/` | `prbdecode.py` (RM protobuf records), `trace2blob.py`, `mixsetup.py` (setup bisection) |
 | `docs/design.md` | sources, design, milestones, lessons per milestone |

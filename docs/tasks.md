@@ -33,11 +33,11 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 | T3.03 | Frame numbering: `frame_num`, POC LSB, `l0` list, `pic_type`, `ref_pic_flag`, IDR only on frame 0 | a 2-frame IDR+P stream decodes | done |
 | T3.04 | Per-frame state buffers: history and colocated data carried from frame to frame | no drift over 60 frames | done |
 | T3.05 | `tools/encodeN`: N frames of moving synthetic content at constant QP; `h264check` decodes all frames, per-frame PSNR | 60 frames decode, PSNR ≥ 40 dB each | done |
-| T3.06 | CBR: RC structure + `IN_RCDATA`/`IO_RC_PROCESS` buffers; measure the real bitrate | within ±10 % of the target over 60 frames | todo |
-| T3.07 | VBR (target + max bitrate) | average near target, peaks under max | todo |
-| T3.08 | Low-latency settings: no B-frames, infinite GOP, IDR on request, small VBV (one frame) | per-frame size stays near bitrate/fps | todo |
-| T3.09 | Multiple slices (fixed MB count per slice) | stream with N slices decodes | todo |
-| T3.10 | M3 notes in `design.md`, commit | committed | todo |
+| T3.06 | CBR: RC structure + `IN_RCDATA`/`IO_RC_PROCESS` buffers; measure the real bitrate | within ±10 % of the target over 60 frames | done |
+| T3.07 | VBR (target + max bitrate) | average near target, peaks under max | done |
+| T3.08 | Low-latency settings: no B-frames, infinite GOP, IDR on request, small VBV (one frame) | per-frame size stays near bitrate/fps | done |
+| T3.09 | Multiple slices (fixed MB count per slice) | stream with N slices decodes | done |
+| T3.10 | M3 notes in `design.md`, commit | committed | done |
 
 ## M4: VideoToolbox encoder plugin
 

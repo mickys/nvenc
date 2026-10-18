@@ -50,7 +50,7 @@ instead of nullmoth's.
 | M0 | RM client + capability probe | **done**: `src/rm.c`, `tools/probe.c` lists engines and classes |
 | M1 | "Hello NVENC": VA space, GPFIFO channel on NVENC0, NVC9B7 object, push buffer with NOP + semaphore release, doorbell | **done**: `tools/hello` — host and NVENC semaphores written ~12 µs after the doorbell, on NVENC0 and NVENC1 |
 | M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | **done** (2026-10-18): `tools/encode1`, 256x128 to 3840x2160 (and 3840x2025) decode at ≥ 45.8 dB luma, QP 26 |
-| M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | a 60-frame stream decodes at the requested bitrate |
+| M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | **done** (2026-10-18): `src/enc.c` + `tools/encodeN`; 60-120 frame streams with 1-3 refs, CBR within ±5 %, one-frame-VBV low latency, 1-16 slices |
 | M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | `vttest` and ffmpeg's `h264_videotoolbox` use it |
 | M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | Parsec 4K encode time well under today's ~9 ms |
 | M6 | Two sessions (NVENC0/1), HEVC | Sunshine-style double sessions; HEVC decodes |
@@ -99,3 +99,20 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
   (`tools/rcerr`, root; `scripts/prbdecode.py`) has no NVENC detail. `trace/nvtrace.c` records a working client (RM
   escapes, pushed methods, buffers), and `encode1` with `NVENC_REPLAY` replays a captured setup.
 - Speed (one IDR, intra 4x4 + 16x16, doorbell to semaphore): 2.0 ms at 1080p, 7.9 ms at 4K.
+
+## M3 notes (details in docs/reports/T3.*)
+
+- `src/enc.c` is the encoder session: `enc_open` / `enc_headers` / `enc_load_nv12` / `enc_encode`, synchronous.
+- **References:** DPB of `num_refs` + 1 recon slots; `SET_IN_REF_PIC<slot>_LUMA/_CHROMA`; `l0[i]` = **2 x slot**
+  (field-indexed), unused -2; `temp_dist_l0[i]` = i+1. **Every P slice must set `num_ref_idx_active_override_flag`**
+  (with the PPS default count instead, the stream breaks at the first picture with all refs). POC type 2,
+  `pic_order_cnt_lsb` = 2 x pictures since IDR. One colocated buffer (in = out), two ME predictor buffers swapped
+  per frame.
+- **ME/MD** follow the reference client's values (temporal + spatial + constant hints, stamps, FBM settings;
+  16x16 intra only, RDO 1). That is also faster than M2's settings (1080p IDR 1.1 ms instead of 2.0).
+- **Rate control:** RCMODE 1/2 (picture VBR/CBR) and 17/18 (MB-row) work with `Ravg` = `R` = bits per pixel per frame
+  (23.8), `framerate` = fps x 256, CPB sizes in bits, `SET_IO_RC_PROCESS` zeroed at open. CBR lands within ±5 %;
+  a one-frame VBV keeps every frame (IDRs included) under bitrate/fps. **`single_frame_VBV` = 1 breaks it** (3x the rate).
+- **Slices:** `slice_mode` 0 with one slice control per slice. `slice_mode` 1 hangs the engine. `max_slice_size`
+  has no effect yet.
+- Speed: 1080p P-frames ~1.0 ms, 4K ~4 ms (doorbell to semaphore, spin wait).
