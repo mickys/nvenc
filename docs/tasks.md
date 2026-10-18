@@ -53,16 +53,22 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 | T4.08 | Register through the Metal plugin instead of nullmoth's factory, per process (existing knob) | Parsec and ffmpeg `h264_videotoolbox` use it | done (vttest through the plugin; Parsec waits for a parsecd restart) |
 | T4.09 | M4 notes, commit | committed | done |
 
-## M5: GPU-resident input, event-driven completion
+## M5: input path and completion (revised 2026-10-18 after T5.01)
+
+Findings that changed the plan: NVENC on Ada reads only its own input layout (64x16 tiles of 16x4 sub-blocks, T2.05d);
+`input_bl_mode` is ignored, and neither the classic GOB layout (what the copy engine writes) nor pitch-linear input
+decodes correctly, with any block_height. A copy-engine pass from the IOSurface therefore can't feed NVENC directly; a
+GPU path needs a compute pass (Metal, in the plugin's RM client) and cross-client memory sharing. The CPU path comes
+first.
 
 | ID | Task | Done when | Status |
 |---|---|---|---|
-| T5.01 | Get a GPU address for an IOSurface's memory in our RM client (dup the driver's memory object, or import) | NVENC reads a frame from an IOSurface directly | todo |
-| T5.02 | Copy-engine channel (`0xc7b5`): pitch-linear -> block-linear copy of luma and chroma | tiled surface matches `bl_tile_plane` byte for byte | todo |
-| T5.03 | BGRA input: colour conversion on the GPU (Metal compute) or engine support, decide and implement | BGRA frames encode at ≥ 40 dB | todo |
-| T5.04 | Cross-channel ordering: copy channel releases a semaphore, NVENC channel acquires it | no CPU wait between copy and encode | todo |
-| T5.05 | Event-driven completion: RM event/notifier on semaphore release instead of spinning | encode thread sleeps while the engine works | todo |
-| T5.06 | Measure Parsec 4K: time per frame inside our encoder | well under ~9 ms | todo |
+| T5.01 | Measure the per-frame cost: CPU tiling vs engine (`tools/tilebench`) | numbers for 1080p and 4K | done |
+| T5.02 | Fast tiling: SSE/AVX2 tile writes (64x16 tiles), optionally split over threads | 4K tiling ≤ 1 ms | done |
+| T5.03 | Asynchronous encode: submit frame n and return; emit when the engine is done (output thread), so tiling of n+1 overlaps encoding of n | throughput limited by the engine, not CPU + engine | todo |
+| T5.04 | Event-driven completion: RM event / semaphore wake instead of spinning | encode thread sleeps while the engine works | todo |
+| T5.05 | Measure Parsec 4K: time per frame inside our encoder (needs a parsecd restart: user) | well under ~9 ms | todo |
+| T5.06 | GPU swizzle (later): Metal compute pass from the IOSurface into NVENC's layout, memory shared with our RM client | no CPU pass over the frame | todo |
 | T5.07 | M5 notes, commit | committed | todo |
 
 ## M6: two sessions, HEVC
