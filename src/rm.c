@@ -2,6 +2,7 @@
 #include "rm.h"
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "nv_escape.h"
@@ -124,7 +125,8 @@ NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sys
         rm_conn_close(conn); return p.params.status ? p.params.status : NV_ERR_GENERIC;
     }
     NvU32 caching = DRF_VAL(OS33, _FLAGS, _CACHING_TYPE, p.params.flags);
-    bool wc = !sysmem && caching == NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED;
+    bool wc = !sysmem && (caching == NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED || getenv("RM_FORCE_WC"));
+    if (rm->verbose || getenv("RM_SHOW_CACHING")) fprintf(stderr, "rm: CPU map 0x%08x %s: RM caching type %u -> %s\n", obj, sysmem ? "sysmem" : "vidmem", caching, wc ? "write-combined" : "default");
     mach_vm_address_t addr = 0; mach_vm_size_t len = 0;
     kern_return_t kr = IOConnectMapMemory64(conn->conn, 0, mach_task_self(), &addr, &len, kIOMapAnywhere | (wc ? kIOMapWriteCombineCache : 0));
     if (kr != KERN_SUCCESS) { if (rm->verbose) fprintf(stderr, "rm: IOConnectMapMemory64 -> 0x%08x\n", kr); rm_conn_close(conn); return NV_ERR_GENERIC; }

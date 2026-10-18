@@ -85,9 +85,78 @@ during a Parsec session shows `-[NVMTLTexture nvmtlSurfaceOut/In]` → `memmove`
    the Metal work releases.
 4. Never lock the source surface on the CPU, so no page-off happens.
 
-**Expected gain at 4K:** our encoder 4.7 ms → ~4.1-4.2 ms (the 0.87 ms CPU tiling becomes ~0.06 ms GPU plus ~0.3 ms
-submit/wait), plus whatever WindowServer spends copying the NV12 frame out on the CPU. The bigger win is system-wide: no
-CPU copies of 12-33 MB frames in WindowServer or in the encoder, and BGRA consumers avoid a 7.8 ms page-off.
+## Numbers (2026-10-18, RTX 4090 in a KVM guest, 4K desktop, Parsec streaming)
+
+### Per-frame costs of today's surface paths (`tools/surfcost.m`)
+
+| path, 3840x2160 | wall | CPU | 1920x1080 wall |
+|---|---|---|---|
+| NV12 rendered by Metal into a **two-plane** IOSurface (plugin fallback: private image + CPU copy-out) | **5.94 ms** | **5.24 ms** | 1.41 ms |
+| same planes as two **one-plane** IOSurfaces (VRAM import) | 0.24 ms | 0.25 ms | 0.66 ms |
+| CPU lock of a GPU-rendered BGRA surface (page-off: copy engine to a staging buffer, then a CPU copy into the pages) | **7.59 ms** | **7.17 ms** | 1.97 ms |
+| Metal convert + tile BGRA → NVENC-layout NV12, VRAM → VRAM (`vramtile`) | 0.063 ms GPU / 0.34 ms wall | ~0 | 0.029 ms GPU |
+| CPU copy of a BGRA frame into VRAM through BAR1, `memcpy` | **22.8 ms** | 22.8 ms | 5.5 ms |
+| same, 32-bit word loop (what NVAccel's display copy does) | **83.6 ms** | 83.6 ms | 21.1 ms |
+| CPU read back through BAR1 | ~7 s | | ~1.5 s |
+
+**BAR1 is effectively uncached in this VM.** RM maps it write-combined in the guest (caching type 2), but the host maps
+the 4090's BAR1 (`0x2100000000-0x2200000000`) as **uncached-minus** (`/sys/kernel/debug/x86/pat_memtype_list` on edi,
+VFIO's mapping), and guest write-combining doesn't take effect: 1.4 GB/s with `memcpy`, 0.37 GB/s with 32-bit stores.
+On bare metal, write-combined BAR writes are typically several times faster, so the display-copy numbers above are a
+property of this KVM setup as much as of the driver.
+
+### Live: WindowServer and Parsec during a session (20 s windows)
+
+| | static desktop | full-screen motion (CSS-animated layer in Safari) |
+|---|---|---|
+| Parsec frame rate (new desktop frames) | 20-30 fps | **~10 fps** |
+| our encoder, entry → emit | 4.7 ms | 5.0 ms |
+| WindowServer CPU (user / kernel) | 16 % / 3.5 % of a core | 23 % / **17 %** of a core |
+| display transactions (`debug.nvaccel_iop_ok`) | 0.15 per s | **4.8 per s** |
+| WindowServer GPU-mark waits that hit the 100 ms timeout | | **69 in 20 s** |
+| parsecd CPU | 16 % | 10 % |
+| screensharingd (a macOS Screen Sharing session open at the same time) | | 43 % |
+
+A `sample` of WindowServer during the motion test: the plugin's `-[NVMTLTexture nvmtlSurfaceOut]` was on the stack for
+~2860 samples in 8 s. Almost all of it (1343 samples under `nvmtlAdvancePart` alone) was **blocked in the kernel in
+`NVRM_ESC_SURF_DIRTY`**, not copying (`memmove` at the top of the stack: 136 samples). The escape takes NVAccel's
+accelerator family lock (`nvFamLock`, blocking), and the display transaction's CPU copy through BAR1 very likely runs
+under that same lock. That last link is inferred from the code, not measured.
+
+## What this means
+
+1. **Capture in VRAM saves little in our encoder:** 0.87 ms CPU tiling → ~0.06 ms GPU + ~0.3 ms submit/wait. Parsec's
+   encode latency would go 4.7 → ~4.1 ms (~3.9 ms with a GPU-side wait instead of a CPU wait).
+2. **For the capture producer it's a 24x difference** when NV12 is rendered by Metal: 5.9 ms → 0.24 ms per 4K frame,
+   if the plugin imported multi-plane surfaces into VRAM. In the live test, though, WindowServer's copy-outs were mostly
+   blocked rather than copying, so the CPU copy isn't the main cost there. How ScreenCaptureKit produces Parsec's 420f
+   frames (which process, which path) isn't pinned down yet.
+3. **CPU readers of GPU-rendered BGRA surfaces** (screenshots, BGRA capture, VideoToolbox conversions) pay a 7.6 ms
+   page-off per 4K frame today. Reading the VRAM copy on the GPU removes it.
+4. **The biggest cost on this machine is the display copy path, not capture.** With zero-copy scan-out off (it makes
+   capture black), every desktop update is copied by the CPU into the scanout through BAR1, word by word. Here that's
+   ~35-85 ms of WindowServer kernel time per full 4K update, about 17 % of a core under motion. It holds the accelerator
+   lock, the desktop runs at ~5-10 updates per second under motion, and Parsec can't deliver more frames than that.
+   **Enabling zero-copy scan-out would remove that copy**, but capture then has to read the composite from VRAM rather
+   than from the IOSurface's system pages: the same mechanism as above, on the producer side (WindowServer/SkyLight
+   and the plugin), plus a page-off or GPU read where capture needs the pixels. That's driver work.
+5. **Independent of the driver, write-combining for BAR1 in the VM** would make the existing copy path several times
+   cheaper (KVM/VFIO maps the BAR uncached-minus on edi). Whether the host kernel/QEMU can map it write-combined needs
+   research; it's a host-wide change on edi, so ask before touching it.
+
+## Expected improvements (summary)
+
+| change | who does it | gain (4K) | basis |
+|---|---|---|---|
+| encoder reads VRAM, GPU tiling | us (needs 2 below for NV12) | encode 4.7 → ~4.1 ms; ~0.9 ms CPU/frame saved | measured parts |
+| plugin imports multi-plane IOSurfaces into VRAM | nullmoth | NV12 producer 5.9 → 0.24 ms per frame; removes CPU copy-outs | measured (synthetic) |
+| consumers read VRAM instead of locking | us / apps | −7.6 ms per BGRA frame read | measured |
+| zero-copy scan-out compatible with capture | nullmoth (+ the above) | removes ~35-85 ms CPU per desktop update here; desktop under motion ~10 fps → up to the GPU's compositing rate; WindowServer −~17 % of a core | measured components, end result estimated |
+| write-combined BAR1 mapping in the VM | host (edi) | display copy several times cheaper without driver changes | measured uncached behaviour, gain estimated |
+
+Not measured yet (would need the user's OK, since it affects the live desktop and the Parsec stream): desktop frame rate
+and WindowServer CPU with zero-copy scan-out switched on (`sysctl debug.nvaccel_iop_flip=1`; capture goes black while
+it's on).
 
 **Risks and limits:**
 - The VRAM copies count against the BAR1 budget (2 GB with a 4 GB BAR1).
