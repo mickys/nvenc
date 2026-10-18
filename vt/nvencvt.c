@@ -57,6 +57,8 @@ typedef struct {
     int width, height;
     bool hevc;                      // hvc1 session (else avc1)
     bool ten;                       // HEVC Main 10 (ProfileLevel HEVC_Main10_*): 10-bit input, 10-bit stream
+    int h264Profile;                // ProfileLevel asked for: 66 Baseline, 77 Main, 100 High; 0 = not set (High)
+    int entropy;                    // H264EntropyMode asked for: 0 CAVLC, 1 CABAC, -1 not set
     bool fullRange;                 // input 420f / xf20 (full range, encoded as is): VUI video_full_range_flag (T7.01)
     bool opened, failed;
     int engine;
@@ -198,12 +200,18 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) { if (v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) LOG("frame reordering requested: not supported, no B-frames"); }
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !profile_ok(s, v)) st = kVTPropertyNotSupportedErr;
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->hevc) {
+        char pr[64] = ""; CFStringGetCString(v, pr, sizeof pr, kCFStringEncodingUTF8);
+        s->h264Profile = strstr(pr, "Baseline") ? 66 : strstr(pr, "High") ? 100 : 77;
+    }
+    else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && v && CFGetTypeID(v) == CFStringGetTypeID())
+        s->entropy = CFEqual(v, kVTH264EntropyMode_CABAC) ? 1 : 0;
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && s->hevc) {
         bool ten = CFEqual(v, kVTProfileLevel_HEVC_Main10_AutoLevel);
         if (ten != s->ten && !s->opened) { s->ten = ten; set_pixel_attrs(s); }
     }
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) || CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) ||
-             CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)) { /* accepted: Main profile, CAVLC, rate limits from AverageBitRate */ }
+             CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)) { /* accepted: rate limits from AverageBitRate */ }
     else st = kVTPropertyNotSupportedErr;
     if (gLog) { CFStringRef d = v ? CFCopyDescription(v) : NULL; char k[128], vb[256] = "";
         CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); if (d) { CFStringGetCString(d, vb, sizeof vb, kCFStringEncodingUTF8); CFRelease(d); }
@@ -211,6 +219,11 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     pthread_mutex_unlock(&s->lock);
     return st;
 }
+
+// H.264 profile and entropy coding: High + CABAC (+ 8x8 transform) unless the client asks for less: Baseline gets Main
+// with CAVLC (a P-only CAVLC stream; T7.02), Main gets CABAC unless H264EntropyMode says CAVLC
+static bool h264_high(const State *s) { return s->h264Profile == 0 || s->h264Profile == 100; }
+static bool h264_cabac(const State *s) { return s->h264Profile != 66 && s->entropy != 0; }
 
 static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef al, void *out)
 {
@@ -221,8 +234,9 @@ static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRe
     else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) { n = s->enc.cfg.num_refs ? s->enc.cfg.num_refs : (s->refs ? s->refs : ENC_MAX_REFS); v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) v = CFRetain(s->realTime ? kCFBooleanTrue : kCFBooleanFalse);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) v = CFRetain(kCFBooleanFalse);
-    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel) : kVTProfileLevel_H264_Main_AutoLevel);
-    else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc) v = CFRetain(kVTH264EntropyMode_CAVLC);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
+                                                                             : h264_high(s) ? kVTProfileLevel_H264_High_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel);
+    else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc) v = CFRetain(h264_cabac(s) ? kVTH264EntropyMode_CABAC : kVTH264EntropyMode_CAVLC);
     else if (CFEqual(key, kVTCompressionPropertyKey_NumberOfPendingFrames)) { n = 0; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder)) v = CFRetain(kCFBooleanTrue);
     else { if (gLog) { char k[128]; CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); LOG("copy %s: not available", k); } return kCMBaseObjectError_ValueNotAvailable; }
@@ -287,7 +301,8 @@ static OSStatus open_encoder(State *s)
       if (df) { if (fscanf(df, "%d", &v) == 1 && v >= 0) dpb_extra = v; fclose(df); } }
     dpb_extra = dpb_extra < 0 ? 0 : dpb_extra > 2 ? 2 : dpb_extra;
     EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
-                    .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange };
+                    .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange,
+                    .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s) };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
@@ -317,7 +332,7 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video",
+    LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s profile %d cabac %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video", s->hevc ? 0 : c.h264_profile, s->hevc ? 0 : (int)c.cabac,
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
@@ -511,6 +526,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_CreateInstance(FourCharC
     OSStatus st = CMDerivedObjectCreate(al, &gVT.base, VTVideoEncoderGetClassID(), &obj);
     if (st) return st;
     State *s = calloc(1, sizeof *s);
+    s->entropy = -1;
     pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
     s->hevc = codec == kCMVideoCodecType_HEVC;
     *(State **)CMBaseObjectGetDerivedStorage(obj) = s;

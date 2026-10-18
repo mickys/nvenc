@@ -101,9 +101,9 @@ void enc_close(Enc *e)
 
 static H264Params hdr_params(const Enc *e)
 {
-    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = 77, .level_idc = 51,
+    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51,
         .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = 2, .num_ref_frames = e->cfg.num_refs,
-        .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = 0, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
+        .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
 }
 
 // ENC_HEVC_OFF=ts,cqd,sao,amp,sis: experiment switches (T6.05), applied to the headers and the engine setup alike
@@ -204,8 +204,9 @@ static void setup_me(nvenc_h264_me_control_s *me, bool p)
 }
 
 // MD control: mode decision as the reference client sets it. intra_ssd_cnt_* must be >= 1 or the engine hangs (T2.05e).
-static void setup_md(nvenc_h264_md_control_s *md, bool p)
+static void setup_md(nvenc_h264_md_control_s *md, bool p, bool high)
 {
+    if (high) { md->intra_luma8x8_mode_enable = 0x1ff; md->priority_ipred_type_ip1 = 3; }   // High: all nine 8x8 intra modes (T7.02)
     md->intra_luma16x16_mode_enable = 0xf; md->intra_chroma_mode_enable = 0xf; md->inter_penalty_factor_for_ip1 = 16;
     md->l0_part_16x16_enable = 1; md->l0_part_16x8_enable = 1; md->l0_part_8x16_enable = 1; md->l0_part_8x8_enable = 1;
     md->pskip_enable = 1;
@@ -215,7 +216,7 @@ static void setup_md(nvenc_h264_md_control_s *md, bool p)
     md->pskip_esc_threshold = 9; md->bdirect_esc_threshold = 19;
     md->tempmv_wt_spread_threshold = 0xffff; md->tempmv_wt_distort_threshold = 0xffff;
     md->mv_cost_enable = 1; md->early_intra_mode_type_16x16dc = 1; md->early_intra_mode_type_16x16h = 1; md->early_intra_mode_type_16x16v = 1;
-    md->ip_search_mode = 7; md->multiply_bias_with_lambda = 1; md->early_termination_ip1 = 1; md->priority_ipred_type_ip1 = 1;
+    md->ip_search_mode = 7; md->multiply_bias_with_lambda = 1; md->early_termination_ip1 = 1; if (!high) md->priority_ipred_type_ip1 = 1;
     md->intra_ssd_cnt_4x4 = 1; md->intra_ssd_cnt_8x8 = 1; md->intra_ssd_cnt_16x16 = 1; md->skip_evaluate_enable = 1;
     md->rdo_level = 1; md->tu_search_num = 3; md->num_1div8_lambda_ssd = 1;
     md->luma_residual_zero_eval = p ? 2 : 0;
@@ -389,6 +390,8 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     ps->sps_data.frame_mbs_only = 1;
     ps->pps_data.num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1);
     ps->pps_data.deblocking_filter_control_present_flag = 1;
+    // High / CABAC as nullmoth's libnvenc_h264 sets them (profile_idc, entropy and 8x8 transform flags; T7.02)
+    ps->pps_data.entropy_coding_mode_flag = e->cfg.cabac; ps->pps_data.transform_8x8_mode_flag = e->cfg.h264_profile == 100;
     nvenc_h264_rc_s *r = &ps->rate_control;
     r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
     for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
@@ -429,7 +432,7 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     }
 
     setup_me((void *)((NvU8 *)setup->cpu + OFF_ME), !idr);
-    setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr);
+    setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr, e->cfg.h264_profile == 100);
     }
 
     // ---- methods ----

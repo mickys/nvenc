@@ -27,6 +27,8 @@ typedef struct {
     int slices;                     // slices per picture, whole MB rows (1..ENC_MAX_SLICES)
     bool spin;                      // wait for the engine by spinning only (default: spin 50 us, then sleep on the NVENC event)
     int depth;                      // frames in flight with enc_submit (1..ENC_MAX_DEPTH, default 1)
+    int h264_profile;               // H.264: 77 Main (default) or 100 High (adds the 8x8 transform and 8x8 intra modes)
+    bool cabac;                     // H.264: CABAC entropy coding (else CAVLC)
     int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
