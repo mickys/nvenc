@@ -6,6 +6,9 @@
 // above nullmoth's 1000), NVENCVT_NO_REGISTER, NVENCVT_LOG, NVENCVT_DEPTH, NVENCVT_ENGINE, NVENCVT_STATS=<file> (or touch
 // /tmp/nvencvt.stats: statistics every 2 s to /tmp/nvencvt-stats.log, also in apps that get no environment).
 #include "enc.h"
+#include "rm.h"
+#include "ctrl/ctrl0080/ctrl0080gpu.h"
+#include "clc9b7.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
@@ -406,8 +409,27 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_CreateInstance(FourCharC
     return noErr;
 }
 
+// The encoder drives the Ada NVENC class (NVC9B7_VIDEO_ENCODER, RTX 40). Registering on a GPU without it would make
+// VideoToolbox pick an encoder that cannot start, so look at the GPU's class list first.
+static bool gpu_has_ada_nvenc(void)
+{
+    Rm rm = { 0 };
+    if (rm_open(&rm)) { LOG("no NVIDIA RM device"); return false; }
+    static NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS cl;
+    memset(&cl, 0, sizeof cl);
+    bool ok = false;
+    if (rm_ctrl(&rm, rm.device, NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2, &cl, sizeof cl) == NV_OK)
+        for (NvU32 i = 0; i < cl.numClasses && !ok; i++) ok = cl.classList[i] == NVC9B7_VIDEO_ENCODER;
+    rm_close(&rm);
+    return ok;
+}
+
 __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
 {
+    if (!getenv("NVENCVT_ANY_GPU") && !gpu_has_ada_nvenc()) {
+        LOG("GPU has no Ada NVENC (class c9b7): not registering");
+        return kVTCouldNotFindVideoEncoderErr;
+    }
     CFNumberRef r = CFNumberCreate(NULL, kCFNumberIntType, &rating);
     const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("CMClassImplementationName"), CFSTR("VTRating"), CFSTR("VTIsHardwareAccelerated") };
     const void *v[] = { CFSTR(ENCODER_ID), CFSTR("nvenc H.264 (NVIDIA pre-Blackwell)"), r, kCFBooleanTrue };
