@@ -254,3 +254,41 @@ transactions/s). Kext frames resolved with `atos -l 0` against `/Library/Extensi
   don't take it here (multi-plane, pitch, BAR1 surface budget, or a stale tag) isn't known yet: the release plugin
   only logs failures. Next step: a plugin built with logging (`NVMTL_RELEASE=0`) to count skipped/copied surface-ins
   and see which surfaces fall back.
+
+### Surface statistics from the logging plugin (branch `plugin-logging`, 2026-10-18)
+
+Fork branch `plugin-logging` (from `nvenc-pre-blackwell`): the plugin sources the guest runs (v2.3.1 + our NVENC
+commits) plus per-process statistics in non-release builds, written every 2 s to `$TMPDIR/nvmtl-surfstat-<pid>.log`
+(WindowServer's: `/private/var/folders/zz/*/T/WindowServer/`, root only). Built with
+`PLUGIN_REF=plugin-logging RELEASE=0 guest/nvenc/build-plugin.sh` (kvm-tahoe-nvidia).
+
+Motion test, WindowServer, per 2 s:
+
+| | |
+|---|---|
+| textures created for IOSurfaces | ~300-360, all shared VRAM ("item 7"), 2-18 private (multi-plane / plane > 0) |
+| surface-ins with a copy | 36-46 (the frame rate), **0 skipped**, ~2,000-2,400 unchanged |
+| copied per surface-in | Safari's layer, 3158x1816 BGRA, pitch 12672, cache mode default: ~22 MB in ~17-20 ms |
+| of which the CPU copy from the surface's pages | ~14-17 ms |
+
+So Safari's layers *are* in shared VRAM, but each frame's pixels arrive in the surface's system pages and WindowServer
+uploads them: 0 skips means the VRAM tag is never current, because the producer didn't write through the GPU.
+
+**Why the producer doesn't use the GPU:** WebKit's GPU process can't load the plugin. Its sandbox
+(`com.apple.WebKit.GPUProcess.sb`) allows `file-read*` on `/Library/GPUBundles` but `file-map-executable` only on system
+paths (`/System/Library/Extensions`, the frameworks), and the log shows
+`com.apple.WebKit.GPU: Error loading /Library/GPUBundles/NVMTLDriver.bundle/... (file system sandbox blocked mmap())` at
+every Safari start (nullmoth's shipped plugin is also in `/Library/GPUBundles` and ad-hoc signed). Without Metal,
+WebKit paints its layers with the CPU, and every frame takes the upload path. This affects every WebKit view, not just
+this VM. Not mentioned in nullmoth's repository.
+
+**Why the upload is slow:** `tools/surfread.m` reads a 3158x1816 BGRA IOSurface the way the plugin does. In one process
+the pages read at 5-8 GB/s (2.6-4.5 ms per 22 MB); only the first read after the surface is mapped costs 14-17 ms
+(~5,400 page faults, ~2.6 us each in this VM). WindowServer pays that first-read cost every frame (14-17 ms), so its
+mapping of Safari's surfaces is new each time (consistent with ~150 new texture wrappers per second).
+
+**What would remove it:** an upload that doesn't touch the pages with WindowServer's CPU: the copy engine pulling the
+surface's system pages into its shared VRAM, the reverse of the kernel's existing page-off
+(`nvrm_surfshare_pageoff` → `nvrm_ce_copy_to_pages`). No "page-on" exists in the kexts today; it would be new code in
+NVRM/NVAccel plus a plugin change. Separately, a plugin installed where WebKit's GPU process may map code would let
+Safari render with Metal, but `/System/Library/Extensions` is on the sealed system volume.
