@@ -227,6 +227,7 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     // ---- methods ----
     if (chan_push_used(c) > 0x8000) chan_rewind(c);
     NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot;
+    NvU64 inVa = e->extInput ? e->extInput : in->gpu;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
     chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
     chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
@@ -236,8 +237,8 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
         { NVC9B7_SET_IN_DRV_PIC_SETUP, setup->gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
         { NVC9B7_SET_OUT_COLOC_DATA, e->coloc.gpu }, { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
         { NVC9B7_SET_OUT_ENC_STATUS, status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, bs->gpu },
-        { NVC9B7_SET_IN_CUR_PIC, in->gpu }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, in->gpu + e->lumaSz },
-        { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, in->gpu + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
+        { NVC9B7_SET_IN_CUR_PIC, inVa }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, inVa + e->lumaSz },
+        { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, inVa + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
         { NVC9B7_SET_IN_RCDATA, e->rcdata.gpu } };
     for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
     if (!idr) {

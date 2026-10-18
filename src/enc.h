@@ -49,6 +49,7 @@ typedef struct {
     NvU32 seq;                      // frames submitted (semaphore payload of the last one)
     NvU32 waited;                   // frames waited for
     bool forceIdr;                  // after a failed frame
+    NvU64 extInput;                 // != 0: GPU address of an input picture in NVENC's layout (luma, chroma at +lumaSz) to use instead of in[]
     unsigned frame_num, sinceIdr;   // frame_num of the next picture, pictures since the last IDR
     int slotOf[ENC_MAX_REFS];       // DPB slots of the reference frames, most recent first
     int nRefs;                      // valid entries in slotOf
