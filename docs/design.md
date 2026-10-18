@@ -52,7 +52,7 @@ instead of nullmoth's.
 | M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | **done** (2026-10-18): `tools/encode1`, 256x128 to 3840x2160 (and 3840x2025) decode at ≥ 45.8 dB luma, QP 26 |
 | M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | **done** (2026-10-18): `src/enc.c` + `tools/encodeN`; 60-120 frame streams with 1-3 refs, CBR within ±5 %, one-frame-VBV low latency, 1-16 slices |
 | M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | **done** (2026-10-18): `vt/nvencvt.c` → `libnvencvt.dylib`, registered by the Metal plugin (`NVMTL_NVENC_IMPL=nvenc`); `vttest` uses it (Parsec: pending a restart) |
-| M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | **done** (2026-10-18) except the optional GPU swizzle: fast CPU tiling (4K 0.65 ms), event-driven completion, async encoding; **Parsec 4K encode latency 4.7-4.8 ms** (nullmoth's: ~10.5-12 ms) |
+| M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | **done** (2026-10-18): fast CPU tiling (4K 0.65 ms), event-driven completion, async encoding; **Parsec 4K encode latency 4.7-4.8 ms** (nullmoth's: ~10.5-12 ms) |
 | M6 | Two sessions (NVENC0/1), HEVC | Sunshine-style double sessions; HEVC decodes |
 
 Step-by-step tasks for each milestone, with status and per-task reports: [tasks.md](tasks.md).
@@ -146,3 +146,6 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
   RealTime mode; Parsec then reports 4.7-4.8 ms at 4K. Parsec feeds NV12 (420f).
 - BGRA input is converted by us (vImage per band + tiler, 4K 3.3 ms) instead of by VideoToolbox (~10 ms).
 - The SPS carries a VUI (BT.709, no reordering).
+- A GPU (Metal compute) tiling pass is correct but slower here: 1.9 ms wall at 4K vs 0.87 ms on the CPU, because
+  IOSurfaces and mapped buffers are in system RAM on this driver. Worth revisiting only if capture surfaces move to VRAM
+  (`tools/gpuswizzle.m`, T5.06).

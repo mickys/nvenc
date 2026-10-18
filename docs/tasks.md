@@ -68,8 +68,8 @@ first.
 | T5.03 | Asynchronous encode: submit frame n and return; emit when the engine is done (output thread), so tiling of n+1 overlaps encoding of n | throughput limited by the engine, not CPU + engine | done |
 | T5.04 | Event-driven completion: RM event / semaphore wake instead of spinning | encode thread sleeps while the engine works | done |
 | T5.05 | Measure Parsec 4K: time per frame inside our encoder (needs a parsecd restart: user) | well under ~9 ms | done (Parsec L 4.7-4.8 ms, was ~10.5-12 ms with nullmoth's) |
-| T5.06 | GPU swizzle (later): Metal compute pass from the IOSurface into NVENC's layout, memory shared with our RM client | no CPU pass over the frame | todo |
-| T5.07 | M5 notes, commit | committed | todo |
+| T5.06 | GPU swizzle (later): Metal compute pass from the IOSurface into NVENC's layout, memory shared with our RM client | no CPU pass over the frame | measured, not adopted (GPU 1.9 ms vs CPU 0.87 ms at 4K: surfaces are in system RAM) |
+| T5.07 | M5 notes, commit | committed | done |
 
 ## M6: two sessions, HEVC
 
