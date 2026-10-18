@@ -57,6 +57,7 @@ typedef struct {
     int width, height;
     bool hevc;                      // hvc1 session (else avc1)
     bool ten;                       // HEVC Main 10 (ProfileLevel HEVC_Main10_*): 10-bit input, 10-bit stream
+    bool fullRange;                 // input 420f / xf20 (full range, encoded as is): VUI video_full_range_flag (T7.01)
     bool opened, failed;
     int engine;
     Enc enc;
@@ -286,7 +287,7 @@ static OSStatus open_encoder(State *s)
       if (df) { if (fscanf(df, "%d", &v) == 1 && v >= 0) dpb_extra = v; fclose(df); } }
     dpb_extra = dpb_extra < 0 ? 0 : dpb_extra > 2 ? 2 : dpb_extra;
     EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
-                    .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8 };
+                    .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
@@ -316,7 +317,7 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra,
+    LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video",
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
@@ -393,6 +394,10 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     double tEntry = now_ms();
     pthread_mutex_lock(&s->lock);
     OSStatus st = noErr;
+    // the stream's range follows the first frame: full-range YCbCr (420f, xf20) is encoded as it is and signalled in the
+    // VUI; BGRA and l10r are converted by us to video range, and 420v / x420 are video range (T7.01)
+    if (!s->opened) { OSType p0 = CVPixelBufferGetPixelFormatType(img);
+        s->fullRange = p0 == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; }
     if (!s->opened && !s->failed && (st = open_encoder(s))) s->failed = true;
     if (s->failed) { pthread_mutex_unlock(&s->lock); VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL); return kVTVideoEncoderMalfunctionErr; }
     OSType pf = CVPixelBufferGetPixelFormatType(img);

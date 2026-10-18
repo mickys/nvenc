@@ -95,7 +95,7 @@ first.
 | Task | What | Done when | Status |
 |---|---|---|---|
 | T7.00 | Registration without a Metal device (CLI apps like ffmpeg get -12908): VT plug-in bundle or another hook | `ffmpeg -c:v hevc_videotoolbox` uses our encoder without injection | open |
-| T7.01 | Full-range input (420f/xf20) signalled in the VUI (H.264 and HEVC) | Parsec's 420f stream decodes to the same levels as the source | open |
+| T7.01 | Full-range input (420f/xf20) signalled in the VUI (H.264 and HEVC) | Parsec's 420f stream decodes to the same levels as the source | done (ffmpeg, OBS) |
 | T7.02 | H.264 High profile, CABAC, 8x8 transform (observe nullmoth's libnvenc_h264) | ~10 % less bitrate at equal PSNR; decodes | open |
 | T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | open |
 | T7.04 | HEVC 4:4:4 (Range Extensions) | a 4:4:4 stream decodes | open |
