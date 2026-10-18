@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 
+static double cpu_ms(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1e3 + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) / 1e3; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
 int main(int argc, char **argv)
@@ -16,18 +18,20 @@ int main(int argc, char **argv)
     uint8_t *y = malloc((size_t)W * H), *uv = malloc((size_t)W * H / 2);
     for (size_t i = 0; i < (size_t)W * H; i++) y[i] = (uint8_t)(i * 7 >> 3);
     for (size_t i = 0; i < (size_t)W * H / 2; i++) uv[i] = (uint8_t)(i * 5 >> 2);
-    Enc e; EncConfig c = { .width = W, .height = H, .qp_i = 26, .qp_p = 28, .num_refs = 1 };
+    Enc e; EncConfig c = { .width = W, .height = H, .qp_i = 26, .qp_p = 28, .num_refs = 1, .spin = getenv("SPIN") != NULL };
     if (enc_open(&e, &c)) return 1;
-    double tl = 0, te = 0, tlMax = 0;
+    double tl = 0, te = 0, tlMax = 0, ce = 0;
     for (int f = 0; f < N; f++) {
         y[f] ^= 0xff;
         double t0 = now_ms(); enc_load_nv12(&e, y, W, uv, W); double t1 = now_ms();
+        double c1 = cpu_ms();
         EncFrame fr; if (enc_encode(&e, false, &fr)) { printf("encode failed\n"); return 1; }
-        double t2 = now_ms();
-        if (f >= 2) { tl += t1 - t0; te += t2 - t1; if (t1 - t0 > tlMax) tlMax = t1 - t0; }
+        double t2 = now_ms(), c2 = cpu_ms();
+        if (f >= 2) { tl += t1 - t0; te += t2 - t1; ce += c2 - c1; if (t1 - t0 > tlMax) tlMax = t1 - t0; }
     }
     int n = N - 2;
-    printf("%dx%d: tiling %.3f ms avg (max %.3f), encode %.3f ms avg, total %.3f ms per frame\n", W, H, tl / n, tlMax, te / n, (tl + te) / n);
+    printf("%dx%d (%s): tiling %.3f ms avg (max %.3f), encode %.3f ms avg (CPU %.3f ms), total %.3f ms per frame\n", W, H,
+           e.ev.h ? "event" : "spin", tl / n, tlMax, te / n, ce / n, (tl + te) / n);
     enc_close(&e);
     return 0;
 }

@@ -53,3 +53,10 @@ void rm_mem_free(Rm *rm, RmMem *m);
 NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sysmem, RmConn *conn, void **cpu);
 // undo rm_map_cpu: unmap from the task, RM UNMAP_MEMORY (NVK's order), close the connection
 void rm_unmap_cpu(Rm *rm, RmConn *conn);
+
+// An RM event on a non-stall interrupt notifier (e.g. NV2080_NOTIFIERS_NVENC0), waited on through the user client's
+// selector 6 (as nullmoth's NVK port): a connection registered with NV_ESC_ALLOC_OS_EVENT carries the event count.
+typedef struct { RmConn conn; NvHandle h; } RmEvent;
+NV_STATUS rm_event_open(Rm *rm, RmEvent *ev, NvU32 notifyIndex);
+int64_t rm_event_wait(RmEvent *ev, uint32_t seen, uint32_t timeout_us);   // returns the count (seen 0, timeout 0: just read it); < 0 = error
+void rm_event_close(Rm *rm, RmEvent *ev);

@@ -64,11 +64,17 @@ int enc_open(Enc *e, const EncConfig *cfg)
     NV_NVENC_ALLOCATION_PARAMETERS ep = { .size = sizeof ep, .engineInstance = (NvU32)cfg->engine };
     if (chan_create(rm, &e->chan, cfg->engine ? NV2080_ENGINE_TYPE_NVENC1 : NV2080_ENGINE_TYPE_NVENC0, NVC9B7_VIDEO_ENCODER, &ep)) return -1;
     chan_mthd(&e->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B7_VIDEO_ENCODER);
+    // completion event (see enc_encode)
+    if (!cfg->spin && rm_event_open(rm, &e->ev, cfg->engine ? NV2080_NOTIFIERS_NVENC1 : NV2080_NOTIFIERS_NVENC0)) {
+        if (cfg->verbose) fprintf(stderr, "enc: no NVENC event - spinning\n");
+        memset(&e->ev, 0, sizeof e->ev);
+    }
     return 0;
 }
 
 void enc_close(Enc *e)
 {
+    if (e->ev.h) rm_event_close(&e->rm, &e->ev);
     chan_destroy(&e->chan);
     RmMem *m[] = { &e->in, &e->recon, &e->setup, &e->bs, &e->status, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem,
                    &e->rcproc, &e->rcdata };
@@ -233,9 +239,26 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     chan_mthd(c, 0, NVC9B7_SEMAPHORE_A, 3, (NvU32)(e->sem.gpu >> 32), (NvU32)e->sem.gpu, payload);
     chan_mthd(c, 0, NVC9B7_SEMAPHORE_D, 1, DRF_DEF(C9B7, _SEMAPHORE_D, _STRUCTURE_SIZE, _ONE) |
               DRF_DEF(C9B7, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B7, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
+    // event: the host waits for that release, then raises the channel's non-stall interrupt (NVK's way), which RM
+    // counts on the NVENC<n> notifier. (The engine's own SEMAPHORE_D AWAKEN bit produced no event: T5.04.)
+    if (e->ev.h) {
+        chan_mthd(c, 0, NVC56F_SEM_ADDR_LO, 5, (NvU32)e->sem.gpu, (NvU32)(e->sem.gpu >> 32), payload, 0u,
+                  DRF_DEF(C56F, _SEM_EXECUTE, _OPERATION, _ACQ_CIRC_GEQ) | DRF_DEF(C56F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT));
+        chan_mthd(c, 0, NVC56F_NON_STALL_INTERRUPT, 1, 0u);
+    }
     volatile NvU32 *sv = e->sem.cpu;
     double t0 = now_ms(); chan_submit(c);
-    while (*sv != payload && !chan_error(c) && now_ms() - t0 < 3000) { }
+    for (;;) {   // spin 50 us, then sleep on the event (re-checking the semaphore between reading and waiting on the count)
+        if (*sv == payload || chan_error(c)) break;
+        double el = now_ms() - t0;
+        if (el > 3000) break;
+        if (e->ev.h && el > 0.05) {
+            int64_t seen = rm_event_wait(&e->ev, 0, 0);
+            if (seen < 0) { rm_event_close(&e->rm, &e->ev); continue; }
+            if (*sv == payload) break;
+            rm_event_wait(&e->ev, (uint32_t)seen, 2000);
+        }
+    }
     out->ms = now_ms() - t0;
 
     nvenc_pic_stat_s *st = e->status.cpu;

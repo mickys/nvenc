@@ -19,6 +19,7 @@ typedef struct {
     int vbv_bits;                   // CPB size in bits (0 = one second)
     int fps;                        // frame rate for rate control (default 60)
     int slices;                     // slices per picture, whole MB rows (1..ENC_MAX_SLICES)
+    bool spin;                      // wait for the engine by spinning only (default: spin 50 us, then sleep on the NVENC event)
     bool verbose;
 } EncConfig;
 
@@ -44,6 +45,7 @@ typedef struct {
     int slotOf[ENC_MAX_REFS];       // DPB slots of the reference frames, most recent first
     int nRefs;                      // valid entries in slotOf
     int nextSlot;
+    RmEvent ev;                     // NVENC non-stall event (ev.h == 0: none, spin)
 } Enc;
 
 int  enc_open(Enc *e, const EncConfig *cfg);                    // 0 = ok

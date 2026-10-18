@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "nv_escape.h"
+#include "class/cl0005.h"
 #include "class/cl0000.h"
 #include "class/cl0080.h"
 #include "class/cl2080.h"
@@ -15,7 +16,7 @@
 #include "class/cl90f1.h"
 #include "nv-unix-nvos-params-wrappers.h"
 
-enum { SEL_ESC = 1, SEL_BINDFD = 3 };
+enum { SEL_ESC = 1, SEL_BINDFD = 3, SEL_EVWAIT = 6 };
 
 static io_connect_t open_conn_fd(NvU32 type, int *fdOut)
 {
@@ -186,4 +187,39 @@ void rm_mem_free(Rm *rm, RmMem *m)
     if (m->hVirt) rm_free(rm, rm->device, m->hVirt);
     if (m->hPhys) rm_free(rm, rm->device, m->hPhys);
     memset(m, 0, sizeof *m);
+}
+
+NV_STATUS rm_event_open(Rm *rm, RmEvent *ev, NvU32 notifyIndex)
+{
+    memset(ev, 0, sizeof *ev); ev->conn.fd = -1;
+    if (rm_conn_open(&ev->conn, 0)) return NV_ERR_GENERIC;
+    nv_ioctl_alloc_os_event_t oe = { .hClient = rm->client, .hDevice = rm->device, .fd = (NvU32)ev->conn.fd };
+    if (rm_esc(rm, ev->conn.conn, NV_ESC_ALLOC_OS_EVENT, &oe, sizeof oe) || oe.Status) {
+        NV_STATUS st = oe.Status ? oe.Status : NV_ERR_GENERIC; rm_conn_close(&ev->conn); return st;
+    }
+    NV0005_ALLOC_PARAMETERS p = { .hParentClient = rm->client, .hSrcResource = rm->subdevice, .hClass = NV01_EVENT_OS_EVENT,
+        .notifyIndex = notifyIndex | NV01_EVENT_NONSTALL_INTR | NV01_EVENT_WITHOUT_EVENT_DATA | NV01_EVENT_SUBDEVICE_SPECIFIC,
+        .data = (NvP64)(uintptr_t)ev->conn.fd };
+    ev->h = rm_handle(rm);
+    NV_STATUS st = rm_alloc(rm, rm->subdevice, ev->h, NV01_EVENT_OS_EVENT, &p);
+    if (st) { ev->h = 0; rm_conn_close(&ev->conn); }
+    return st;
+}
+
+int64_t rm_event_wait(RmEvent *ev, uint32_t seen, uint32_t timeout_us)
+{
+    uint64_t in[2] = { seen, timeout_us }, out = 0; uint32_t n = 1;
+    kern_return_t kr = IOConnectCallScalarMethod(ev->conn.conn, SEL_EVWAIT, in, 2, &out, &n);
+    return kr == KERN_SUCCESS ? (int64_t)(uint32_t)out : -1;
+}
+
+void rm_event_close(Rm *rm, RmEvent *ev)
+{
+    if (ev->h) rm_free(rm, rm->subdevice, ev->h);
+    if (ev->conn.conn) {
+        nv_ioctl_free_os_event_t fe = { .hClient = rm->client, .hDevice = rm->device, .fd = (NvU32)ev->conn.fd };
+        rm_esc(rm, ev->conn.conn, NV_ESC_FREE_OS_EVENT, &fe, sizeof fe);
+        rm_conn_close(&ev->conn);
+    }
+    memset(ev, 0, sizeof *ev);
 }
