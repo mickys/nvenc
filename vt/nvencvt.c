@@ -30,6 +30,10 @@
 typedef struct CMBaseProtocolVTable CMBaseProtocolVTable;
 typedef struct CMBaseProtocolTable CMBaseProtocolTable;
 #include "CMBaseObjectSPI.h"
+
+#ifndef NVENC_VERSION
+#define NVENC_VERSION "dev"   // build.sh passes git describe --tags --always --dirty
+#endif
 typedef CMBaseObjectRef VTVideoEncoderRef;
 typedef void *VTEncoderSessionRef;
 typedef void *VTEncoderFrameRef;
@@ -572,6 +576,22 @@ static OSStatus register_one(FourCharCode codec, CFStringRef id, CFStringRef nam
 // The plugin calls NVEncVT_Register in every process it is enabled for, while the Metal device is created, so the
 // check must be cheap: the GPU's PCI device ID from the IORegistry (~0.1 ms) instead of an RM client and the class list
 // (6-9 ms). Ada (AD102-AD107: RTX 40, RTX Ada, L4/L40) is device IDs 0x2600-0x28ff. -1: no NVIDIA GPU in the registry.
+// the card's name for the encoder names, from the GPU's IORegistry "model" ("NVIDIA GeForce RTX 4090" -> "RTX 4090")
+static char gCardName[64] = "GPU";
+static void card_name_from(io_object_t d)
+{
+    CFTypeRef m = IORegistryEntryCreateCFProperty(d, CFSTR("model"), NULL, 0);
+    if (m && CFGetTypeID(m) == CFDataGetTypeID() && CFDataGetLength(m) > 0) {
+        char b[96] = ""; CFIndex n = CFDataGetLength(m) < (CFIndex)sizeof b - 1 ? CFDataGetLength(m) : (CFIndex)sizeof b - 1;
+        CFDataGetBytes(m, CFRangeMake(0, n), (UInt8 *)b); b[n] = 0;
+        const char *p = b;
+        if (!strncmp(p, "NVIDIA ", 7)) p += 7;
+        if (!strncmp(p, "GeForce ", 8)) p += 8;
+        if (*p) snprintf(gCardName, sizeof gCardName, "%s", p);
+    }
+    if (m) CFRelease(m);
+}
+
 static int pci_has_ada(void)
 {
     io_iterator_t it = 0; io_object_t d; int found = -1;
@@ -583,8 +603,8 @@ static int pci_has_ada(void)
         if (dev && CFGetTypeID(dev) == CFDataGetTypeID() && CFDataGetLength(dev) >= 2) CFDataGetBytes(dev, CFRangeMake(0, 2), (UInt8 *)&id);
         if (ven) CFRelease(ven);
         if (dev) CFRelease(dev);
+        if (v == 0x10de && found < 1) { found = id >= 0x2600 && id <= 0x28ff; if (found == 1) card_name_from(d); }
         IOObjectRelease(d);
-        if (v == 0x10de && found < 1) found = id >= 0x2600 && id <= 0x28ff;
     }
     IOObjectRelease(it);
     return found;
@@ -684,12 +704,19 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
         LOG("GPU is not Ada (no NVENC class c9b7): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
-    OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), CFSTR("nvenc H.264 (NVIDIA RTX 40)"), rating);
+    // "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.7.0": codec, the card, this project and its version (git describe)
+    char nameAvc[160], nameHevc[160];
+    const char *ver = NVENC_VERSION[0] == 'v' ? NVENC_VERSION + 1 : NVENC_VERSION;
+    snprintf(nameAvc, sizeof nameAvc, "NVENC - H.264 - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
+    snprintf(nameHevc, sizeof nameHevc, "NVENC - HEVC - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
+    CFStringRef na = CFStringCreateWithCString(NULL, nameAvc, kCFStringEncodingUTF8), nh = CFStringCreateWithCString(NULL, nameHevc, kCFStringEncodingUTF8);
+    OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), na, rating);
     OSStatus sh = getenv("NVENCVT_NO_HEVC") ? kVTCouldNotFindVideoEncoderErr
-                : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), CFSTR("nvenc HEVC (NVIDIA RTX 40)"), rating);
+                : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), nh, rating);
+    CFRelease(na); CFRelease(nh);
     LOG("registered %s -> %d, %s -> %d (rating %d)", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, rating);
     static const char *const ids[] = { ENCODER_ID, ENCODER_ID_HEVC };
-    static const char *const names[] = { "nvenc H.264 (NVIDIA RTX 40)", "nvenc HEVC (NVIDIA RTX 40)" };
+    const char *const names[] = { nameAvc, nameHevc };
     static const char *const codecs[] = { "H.264", "HEVC" };
     rename_encoders(ids, names, codecs, sh ? 1 : 2);
     return st;
