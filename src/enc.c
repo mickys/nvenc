@@ -25,6 +25,9 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->cfg = *cfg;
     if (e->cfg.num_refs < 1) e->cfg.num_refs = 1;
     if (e->cfg.num_refs > ENC_MAX_REFS) e->cfg.num_refs = ENC_MAX_REFS;
+    // HEVC: one active reference. With two or more the engine predicts reference 1 differently than the slice header and
+    // dist_scale_factor describe (2 refs: 13 dB, 25 dB with the scale factors; T6.07); nullmoth's library uses one too.
+    if (cfg->codec == ENC_HEVC) e->cfg.num_refs = 1;
     int W = cfg->width, H = cfg->height;
     e->wmb = (W + 15) / 16; e->hmb = (H + 15) / 16;
     Rm *rm = &e->rm; rm->verbose = cfg->verbose;
@@ -275,12 +278,23 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
             pc->l0[i] = (char)(2 * e->slotOf[i]); pc->temp_dist_l0[i] = (char)(i + 1); pc->poc_entry_l0[i] = (char)i;
             rps->delta_poc_s0_minus1[i] = 0; rps->used_by_curr_pic_s0_flag |= (unsigned short)(1u << i);
         }
-        pc->dist_scale_factor[0][0] = 256; pc->same_poc[0] = 1;
+        if (nRefs < 8) pc->temp_dist_l0[nRefs] = -1;   // as nullmoth's: -1 after the last reference
+        // MV scaling between references (8.5.3.2.8): distScaleFactor = (tb * tx + 32) >> 6, tx = (16384 + td / 2) / td,
+        // stored [source td][target tb]; 256 = 1.0 (nullmoth's [0][0] with one reference)
+        for (int i = 0; i < nRefs; i++) for (int j = 0; j < nRefs; j++) {
+            int tb = i + 1, td = j + 1, tx = (16384 + td / 2) / td, f = (tb * tx + 32) >> 6;
+            pc->dist_scale_factor[j][i] = (short)(f < -4096 ? -4096 : f > 4095 ? 4095 : f);
+        }
+        pc->same_poc[0] = 1;
+        pc->diff_pic_order_cnt_zero[0] = 0xfefefefeu;  // as nullmoth's (B-only meaning)
     }
     nvenc_h265_slice_control_s *sc = (void *)((NvU8 *)setup->cpu + OFF_SLICE);
     pc->num_forced_slices_minus1 = 0;
-    sc->num_ctus = (unsigned)ctbs; sc->qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc->slice_type = idr ? 2 : 1;
+    // slice_type numbered like pic_type (0 P, 1 B, 2 I), not as the header's comment says (0 B, 1 P): with 1 the engine
+    // faulted on the first P picture; nullmoth's library sends 0 (T6.07)
+    sc->num_ctus = (unsigned)ctbs; sc->qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc->slice_type = idr ? 2 : 0;
     sc->slice_loop_filter_across_slices_enabled_flag = 1; sc->slice_sao_luma_flag = !hp.no_sao; sc->slice_sao_chroma_flag = !hp.no_sao;
+    if (!idr) { sc->num_ref_idx_active_override_flag = 1; sc->num_ref_idx_l0_active_minus1 = (unsigned)(nRefs - 1); }   // as for H.264
     setup_me_hevc((void *)((NvU8 *)setup->cpu + OFF_ME));
     setup_md_hevc((void *)((NvU8 *)setup->cpu + OFF_MD));
     setup_q_hevc((void *)((NvU8 *)setup->cpu + OFF_Q));
@@ -383,9 +397,12 @@ methods:
         chan_mthd(c, 0, NVC9B7_SET_IN_MEPRED_DATA, 1, (NvU32)(meIn->gpu >> 8));
         chan_mthd(c, 0, NVC9B7_SET_OUT_MEPRED_DATA, 1, (NvU32)(meOut->gpu >> 8));
         for (int i = 0; i < nRefs; i++) {
+            // H.264: REF_PIC<n> by DPB slot (l0 = 2 x slot). HEVC: by position in list 0 (poc_entry_l0[i] = i), while l0
+            // still carries 2 x slot (nullmoth's third picture: l0[0] 2, the reference in REF_PIC0; T6.07)
+            NvU32 n = hevc ? (NvU32)i : (NvU32)e->slotOf[i];
             NvU64 ra = e->recon.gpu + (NvU64)e->slotOf[i] * e->rSlot;
-            chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * (NvU32)e->slotOf[i], 1, (NvU32)(ra >> 8));
-            chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * (NvU32)e->slotOf[i], 1, (NvU32)((ra + e->rLuma) >> 8));
+            chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * n, 1, (NvU32)(ra >> 8));
+            chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * n, 1, (NvU32)((ra + e->rLuma) >> 8));
         }
     }
     chan_mthd(c, 0, NVC9B7_EXECUTE, 1, 0u);

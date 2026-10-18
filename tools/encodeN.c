@@ -1,5 +1,5 @@
 // encodeN.c (milestone M3): encode N frames of moving synthetic NV12 content through src/enc.c (IDR + P, constant QP).
-//   ./encodeN [-v] W H N QP_I QP_P REFS out.h264 out.nv12
+//   ./encodeN [-v] [-hevc] W H N QP_I QP_P REFS out.h264|out.h265 out.nv12
 // Environment: IDR_PERIOD=<n> (an IDR every n frames), RC=<RCMODE> BITRATE=<bit/s> MAXRATE=<bit/s> VBV=<bits>,
 // SLICES=<n>.
 // Writes the Annex B stream (SPS + PPS once, then every picture) and all source frames for h264check.
@@ -29,9 +29,11 @@ int main(int argc, char **argv)
 {
     int ai = 1; bool verbose = false;
     if (argc > 1 && !strcmp(argv[1], "-v")) { verbose = true; ai++; }
+    bool hevc = false;
+    if (argc > ai && !strcmp(argv[ai], "-hevc")) { hevc = true; ai++; }
     if (argc - ai < 8) { fprintf(stderr, "usage: encodeN [-v] W H N QP_I QP_P REFS out.h264 out.nv12\n"); return 2; }
     int W = atoi(argv[ai]), H = atoi(argv[ai + 1]), N = atoi(argv[ai + 2]), CH = (H + 1) / 2;
-    EncConfig cfg = { .width = W, .height = H, .qp_i = atoi(argv[ai + 3]), .qp_p = atoi(argv[ai + 4]), .num_refs = atoi(argv[ai + 5]),
+    EncConfig cfg = { .codec = hevc ? ENC_HEVC : ENC_H264, .width = W, .height = H, .qp_i = atoi(argv[ai + 3]), .qp_p = atoi(argv[ai + 4]), .num_refs = atoi(argv[ai + 5]),
                       .idr_period = getenv("IDR_PERIOD") ? atoi(getenv("IDR_PERIOD")) : 0, .verbose = verbose,
                       .rc_mode = getenv("RC") ? atoi(getenv("RC")) : 0, .bitrate = getenv("BITRATE") ? atoi(getenv("BITRATE")) : 0,
                       .max_bitrate = getenv("MAXRATE") ? atoi(getenv("MAXRATE")) : 0, .vbv_bits = getenv("VBV") ? atoi(getenv("VBV")) : 0,
