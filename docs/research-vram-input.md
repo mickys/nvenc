@@ -233,3 +233,24 @@ The macOS Screen Sharing frame grab (`vnc-shot.py`) was black with only the curs
 stock image and 4 GB included, so that is unrelated to BAR1 size or PAT. Not investigated yet.
 
 Raw results: `notes/bar1-tests/` (project folder) and `notes/bar1-cycle-*.log`, made by `vm/tahoe/bar1-cycle.sh`.
+
+### Where the desktop's time goes after the PAT fix (spindump, 2026-10-18)
+
+`spindump` of the whole system for 10 s during the Safari motion test (PA6 = WC, BAR1 4 GB; 12-17 display
+transactions/s). Kext frames resolved with `atos -l 0` against `/Library/Extensions/NV*.kext`. Raw:
+`notes/bar1-tests/ws-motion-patwc.spindump` (project folder).
+
+- **The display copy is no longer the bottleneck.** `NVDisplayPipe::performTransaction` runs on a kernel_task thread
+  (`debug.nvaccel_iop_async=1`, every transaction from an IOSurface: `iop_src_surf`). It costs ~76 samples in 10 s
+  (~8 % of a core): ~75 in `nvAccelSurfCopyReady` → `NVResource::pageoff` → `nvrm_ce_copy_to_pages` (copy engine into
+  the surface's pages; about half of that is `os_delay_us` busy-polling for the copy engine), and ~30 in the word
+  copy into the scanout (about 2 ms per transaction, down from tens of ms).
+- **WindowServer's main thread is the limit:** 6.0 s CPU in 10 s. Of its 1001 samples, 809 are in NVMTLDriver and
+  **403 in `-[NVMTLTexture nvmtlSurfaceIn]`** (306 in `nvmtl_vk_image_write`, 122 in page-fault traps). That's the
+  compositor copying client surfaces (Safari's layer) from their system pages into VRAM on the CPU for every frame,
+  after the producer's frame was paged off from VRAM into those pages: a VRAM → RAM → VRAM round trip per frame.
+- The plugin has a path that avoids this ("item 7": single-plane IOSurfaces with `pitch % 32 == 0` alias the
+  family's VRAM copy, and surface-in is skipped while the VRAM tag is current; on by default). Why Safari's layers
+  don't take it here (multi-plane, pitch, BAR1 surface budget, or a stale tag) isn't known yet: the release plugin
+  only logs failures. Next step: a plugin built with logging (`NVMTL_RELEASE=0`) to count skipped/copied surface-ins
+  and see which surfaces fall back.
