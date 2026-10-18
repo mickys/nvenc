@@ -49,7 +49,7 @@ instead of nullmoth's.
 |---|---|---|
 | M0 | RM client + capability probe | **done**: `src/rm.c`, `tools/probe.c` lists engines and classes |
 | M1 | "Hello NVENC": VA space, GPFIFO channel on NVENC0, NVC9B7 object, push buffer with NOP + semaphore release, doorbell | **done**: `tools/hello` — host and NVENC semaphores written ~12 µs after the doorbell, on NVENC0 and NVENC1 |
-| M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | Apple's decoder decodes it, PSNR ≥ 40 dB |
+| M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | **done** (2026-10-18): `tools/encode1`, 256x128 to 3840x2160 (and 3840x2025) decode at ≥ 45.8 dB luma, QP 26 |
 | M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | a 60-frame stream decodes at the requested bitrate |
 | M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | `vttest` and ffmpeg's `h264_videotoolbox` use it |
 | M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | Parsec 4K encode time well under today's ~9 ms |
@@ -78,3 +78,24 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
   (`NV_NVENC_ALLOCATION_PARAMETERS.engineInstance`), `GPFIFO_SCHEDULE`, work-submit token (also in notifier[1]).
   Submit = GPFIFO entry, `GPPut` in USERD, token to `NVC361_NOTIFY_CHANNEL_PENDING` of the `AMPERE_USERMODE_A` page.
 - Engine object on subchannel 0 via `NVC56F_SET_OBJECT`; NVENC's own `SEMAPHORE_A..D` release works.
+
+## M2 notes (what the docs don't say; details in docs/reports/T2.0x)
+
+- **Input layout** (`nvenc_in_tile_plane`): with `input_cfg.block_height` = 2 and `input_bl_mode` 0, NVENC on Ada reads
+  64-byte x 16-row tiles of 1 KB, row-major, with 16-byte x 4-row sub-blocks inside (order x16, y4, x32, y8). It is
+  not the classic 64x8 GOB. Measured from a working client's input surface (T2.05d).
+- **Two settings hang the engine** (app timer fires after ~1.08 s, `error_status` 1, RC 47): `pic_control.slice_mode` = 1,
+  and `md_control.intra_ssd_cnt_4x4/8x8/16x16` = 0. Use `slice_mode` 0 (one slice control with all MBs = one slice)
+  and SSD counts ≥ 1 (T2.05e).
+- **Over-reads/-writes:** the engine reads 8-12 KB past the input's chroma plane, and writes the reconstructed picture
+  with rows rounded up. Give the input 64 KB of slack and round the recon planes to 32 rows (T2.04, T2.09).
+- **Reconstructed pictures:** block-linear with block_height 2 (`tiled_16x16` 0) works, as the reference client uses;
+  the doc's "tiled_16x16 must be 1 for refpics" is not needed on Ada. Each plane gets its own method
+  (`SET_OUT_REF_PIC_LUMA` / `_CHROMA`, `SET_IN_CUR_PIC` / `_CHROMA_U` / `_CHROMA_V`), with surface offsets 0.
+- **Status:** `error_status` 2 with `ucode_error_status` 0 shows up on good frames. Real errors carry a code from
+  `ERROR_CODES` (e.g. 3 `E_PICSETUP_OFFSET`, 13 input missing, 14 history missing), and a hang shows as `error_status` 1.
+- The magic may be 0xC9B70006 (nvenc_drv.h) or 0xCFB70006 (what the reference client writes); both work.
+- **Debugging:** `chan_fault()` gives the MMU fault address (`NV906F_CTRL_CMD_GET_MMU_FAULT_INFO`). RM's RC error log
+  (`tools/rcerr`, root; `scripts/prbdecode.py`) has no NVENC detail. `trace/nvtrace.c` records a working client (RM
+  escapes, pushed methods, buffers), and `encode1` with `NVENC_REPLAY` replays a captured setup.
+- Speed (one IDR, intra 4x4 + 16x16, doorbell to semaphore): 2.0 ms at 1080p, 7.9 ms at 4K.

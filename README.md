@@ -4,8 +4,10 @@ A hardware H.264 encoder for macOS on NVIDIA GPUs before Blackwell (Turing, Ampe
 [nullmoth's NVIDIA driver](https://github.com/nullmoth/nvidia-macos-driver) and exposed to apps through VideoToolbox.
 It drives the GPU's NVENC engine directly from user space and is written from public documentation only.
 
-**Status: early.** M0 (RM client, capability probe) and M1 (a channel on NVENC0/1 that runs our commands: `tools/hello`)
-work. Next: M2, one H.264 IDR frame. Milestones and design: [docs/design.md](docs/design.md).
+**Status: early.** M0 (RM client, capability probe), M1 (a channel on NVENC0/1 that runs our commands: `tools/hello`)
+and M2 (one H.264 IDR frame from our own picture setup, 256x128 to 4K, ≥ 45 dB: `tools/encode1`) work. Next: M3,
+P-frames and rate control. Milestones and design: [docs/design.md](docs/design.md); step-by-step tasks with reports:
+[docs/tasks.md](docs/tasks.md).
 
 Why: the driver's own encoder library is Blackwell-only and closed. With a layout fix it runs on an RTX 4090, but a
 4K frame still costs ~9 ms in CPU copies, tiling and spin-waiting, the bitrate setting is ignored, and only one session
@@ -15,9 +17,13 @@ per process works ([measurements](https://github.com/mickys/kvm-tahoe-nvidia/blo
 
 | Path | What |
 |---|---|
-| `src/` | the encoder: `rm.c` (RM client, memory, GPU/CPU mappings), `channel.c` (GPFIFO channel on an engine, push buffer, doorbell) |
-| `tools/` | test programs, each built against `src/`: `probe` (engines and classes), `hello` (M1: semaphores from host and NVENC) |
-| `docs/design.md` | sources, design, milestones |
+| `src/` | the encoder: `rm.c` (RM client, memory, GPU/CPU mappings), `channel.c` (GPFIFO channel on an engine, push buffer, doorbell, MMU fault info), `blocklinear.c` (NVENC input layout), `h264hdr.c` (SPS/PPS) |
+| `tools/` | test programs, each built against `src/`: `probe` (engines and classes), `hello` (M1: semaphores from host and NVENC), `encode1` (M2: one IDR frame), `h264check` (decode with Apple's decoder, PSNR), `rcerr` (RM's RC error log, root), `vtrandom` (one random frame through VideoToolbox) |
+| `trace/` | `nvtrace.c`: a `DYLD_INSERT_LIBRARIES` interposer that records a process's RM escapes, NVENC channel methods and buffers |
+| `scripts/` | `prbdecode.py` (RM protobuf records), `trace2blob.py`, `mixsetup.py` (setup bisection) |
+| `docs/design.md` | sources, design, milestones, lessons per milestone |
+| `docs/tasks.md`, `docs/reports/` | the milestones split into tasks; one report per finished task |
+| `docs/traces/` | captures of a working NVENC client (picture setups, logs) |
 | `scripts/fetch-vendor.sh` | NVIDIA's open-gpu-kernel-modules (RM API, 610.57.04) and open-gpu-doc (NVENC docs) into `vendor/` |
 
 ## Build and run
@@ -28,6 +34,7 @@ Needs a macOS guest/host with nullmoth's driver and the Command Line Tools, reac
 scripts/fetch-vendor.sh
 ./build.sh                 # NVENC_GUEST=<ssh host>, default "tahoe"; binaries land in the guest's ~/nvenc-dev
 ssh tahoe ~/nvenc-dev/probe
+ssh tahoe 'cd ~/nvenc-dev && ./encode1 1920 1080 26 /tmp/o.h264 /tmp/o.nv12 && ./h264check 1920 1080 /tmp/o.h264 /tmp/o.nv12'
 ```
 
 ## Ground rules

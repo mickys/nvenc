@@ -22,7 +22,7 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 | T2.07 | Our SPS/PPS match the slice header the engine wrote (frame_num/POC bits, entropy, deblocking flag) | Apple's decoder accepts the stream | done (Apple decodes; POC type 2 added) |
 | T2.08 | Input layout right: block-linear NV12 as the engine reads it (flat-colour and gradient tests if the picture is scrambled) | PSNR ≥ 40 dB at QP 26 | done (layout measured in T2.05d; other sizes in T2.09) |
 | T2.09 | Sizes: 256x128, 1920x1080 (cropped MB row), 3840x2160, 3840x2025 (odd height) | all decode at ≥ 40 dB | done |
-| T2.10 | Clean up `encode1` (keep only knobs that still matter), M2 notes in `design.md`, commit | committed, README status updated | todo |
+| T2.10 | Clean up `encode1` (keep only knobs that still matter), M2 notes in `design.md`, commit | committed, README status updated | done |
 
 ## M3: P-frames, rate control, slices
 
