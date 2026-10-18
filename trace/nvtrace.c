@@ -67,7 +67,7 @@ static Conn *conn_get(io_connect_t c, int create)
 static Conn *conn_by_fd(int fd) { for (int i = gNConn - 1; i >= 0; i--) if (gConn[i].fd == fd) return &gConn[i]; return NULL; }
 
 // ---- memory objects ----
-typedef struct { NvHandle client, h; NvU32 cls, type, flags, attr, attr2, mapFlags, kind; NvU64 size; void *cpu; NvU64 gpu, gpuLen; } Mem;
+typedef struct { NvHandle client, h; NvU32 cls, type, flags, attr, attr2, mapFlags, kind; NvU64 size; void *cpu; io_connect_t cpuConn; NvU64 gpu, gpuLen; } Mem;
 static Mem gMem[8192]; static int gNMem;
 static Mem *mem_get(NvHandle client, NvHandle h, int create)
 {
@@ -75,9 +75,13 @@ static Mem *mem_get(NvHandle client, NvHandle h, int create)
     if (!create || gNMem == 8192) return NULL;
     memset(&gMem[gNMem], 0, sizeof gMem[0]); gMem[gNMem].client = client; gMem[gNMem].h = h; return &gMem[gNMem++];
 }
+// GPU addresses are per client (VA space): since driver 2.3.6 the encoder library and NVK in the same process each have
+// a client, with GPFIFOs at the same address. The poller sets the client of the channel it follows.
+static NvHandle gVaClient;
 static Mem *mem_by_gpu(NvU64 va)
 {
-    for (int i = gNMem - 1; i >= 0; i--) if (gMem[i].gpuLen && va >= gMem[i].gpu && va < gMem[i].gpu + gMem[i].gpuLen) return &gMem[i];
+    for (int i = gNMem - 1; i >= 0; i--)
+        if (gMem[i].gpuLen && va >= gMem[i].gpu && va < gMem[i].gpu + gMem[i].gpuLen && (!gVaClient || gMem[i].client == gVaClient)) return &gMem[i];
     return NULL;
 }
 static void *va2cpu(NvU64 va)
@@ -180,6 +184,7 @@ static void *poller(void *arg)
         pthread_mutex_lock(&gLock);
         for (int k = 0; k < gNChan; k++) {
             Chan *c = &gChan[k];
+            gVaClient = c->client;
             volatile NvU64 *gp = va2cpu(c->gpfifoVa);
             if (!gp || !c->entries) continue;
             if (!c->snap) c->snap = calloc(c->entries, 8);
@@ -196,6 +201,7 @@ static void *poller(void *arg)
                 c->cur = (c->cur + 1) % c->entries;
             }
         }
+        gVaClient = 0;
         pthread_mutex_unlock(&gLock);
         usleep(20);
     }
@@ -246,6 +252,10 @@ static void log_alloc(const char *who, NvHandle client, NvHandle parent, NvHandl
 static void esc_before(Conn *cn, NvU32 cmd, void *d, size_t sz, void *ra)
 {
     (void)cn; (void)ra; (void)sz;
+    if (cmd == NV_ESC_RM_UNMAP_MEMORY && sz >= 12) {   // hClient, hDevice, hMemory: the poller must stop reading it
+        const NvU32 *w = d; Mem *m = mem_get(w[0], w[2], 0);
+        if (m) m->cpu = NULL;
+    }
     if (cmd == NV_ESC_RM_MAP_MEMORY && sz >= sizeof(nv_ioctl_nvos33_parameters_with_fd)) {
         // remember which connection the next IOConnectMapMemory64 belongs to
         nv_ioctl_nvos33_parameters_with_fd *p = d; Conn *mc = conn_by_fd(p->fd);
@@ -351,10 +361,31 @@ static kern_return_t my_IOConnectMapMemory64(io_connect_t c, uint32_t type, task
     if (cn) {
         L("CPUMAP %-23s conn 0x%x type %u opt 0x%x -> 0x%llx len 0x%llx (mem 0x%08x off 0x%llx) kr 0x%x\n", caller(__builtin_return_address(0)), c, type, opt,
           kr ? 0ull : (unsigned long long)*addr, kr ? 0ull : (unsigned long long)*size, cn->mapMem, (unsigned long long)cn->mapOff, kr);
-        if (!kr && cn->mapMem) { Mem *m = mem_get(cn->mapClient, cn->mapMem, 1); m->cpu = (void *)(uintptr_t)(*addr - cn->mapOff); }
+        if (!kr && cn->mapMem) { Mem *m = mem_get(cn->mapClient, cn->mapMem, 1); m->cpu = (void *)(uintptr_t)(*addr - cn->mapOff); m->cpuConn = c; }
     }
     pthread_mutex_unlock(&gLock);
     return kr;
+}
+
+// Since driver 2.3.6 a mapping is undone by closing its connection (nvrm_xnu_munmap -> IOServiceClose): forget the
+// CPU address, or the poller reads unmapped memory
+static void forget_conn_maps(io_connect_t c)
+{
+    for (int i = 0; i < gNMem; i++) if (gMem[i].cpu && gMem[i].cpuConn == c) { gMem[i].cpu = NULL; gMem[i].cpuConn = 0; }
+}
+static kern_return_t my_IOServiceClose(io_connect_t c)
+{
+    pthread_mutex_lock(&gLock);
+    if (conn_get(c, 0)) { forget_conn_maps(c); L("CLOSE  conn 0x%x\n", c); }
+    pthread_mutex_unlock(&gLock);
+    return IOServiceClose(c);
+}
+static kern_return_t my_IOConnectUnmapMemory64(io_connect_t c, uint32_t type, task_port_t t, mach_vm_address_t addr)
+{
+    pthread_mutex_lock(&gLock);
+    if (conn_get(c, 0)) { forget_conn_maps(c); L("CPUUNMAP conn 0x%x 0x%llx\n", c, (unsigned long long)addr); }
+    pthread_mutex_unlock(&gLock);
+    return IOConnectUnmapMemory64(c, type, t, addr);
 }
 
 // ---- VideoToolbox encoder registration: wrap the factory and dump the encoder object's vtable (M4, T4.03) ----
@@ -415,4 +446,6 @@ INTERPOSE(my_IOConnectCallScalarMethod, IOConnectCallScalarMethod);
 INTERPOSE(my_IOConnectCallMethod, IOConnectCallMethod);
 INTERPOSE(my_IOConnectCallStructMethod, IOConnectCallStructMethod);
 INTERPOSE(my_IOConnectMapMemory64, IOConnectMapMemory64);
+INTERPOSE(my_IOServiceClose, IOServiceClose);
+INTERPOSE(my_IOConnectUnmapMemory64, IOConnectUnmapMemory64);
 INTERPOSE(my_VTRegisterVideoEncoderWithInfo, VTRegisterVideoEncoderWithInfo);

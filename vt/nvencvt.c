@@ -48,13 +48,15 @@ typedef struct { CMBaseVTable base; const EncoderClass *encoderClass; } EncoderV
 #define ENCODER_ID "org.nvenc.videoencoder.avc"
 #define ENCODER_ID_HEVC "org.nvenc.videoencoder.hevc"
 static bool gLog;
-#define LOG(...) do { if (gLog) { fprintf(stderr, "nvencvt: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+static FILE *gLogF;   // NVENCVT_LOG: stderr; flag file /tmp/nvencvt.log (apps started by launchd): /tmp/nvencvt-<pid>.log
+#define LOG(...) do { if (gLog) { FILE *lf_ = gLogF ? gLogF : stderr; fprintf(lf_, "nvencvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
 
 typedef struct {
     pthread_mutex_t lock;
     VTEncoderSessionRef session;
     int width, height;
     bool hevc;                      // hvc1 session (else avc1)
+    bool ten;                       // HEVC Main 10 (ProfileLevel HEVC_Main10_*): 10-bit input, 10-bit stream
     bool opened, failed;
     int engine;
     Enc enc;
@@ -154,8 +156,8 @@ static int num(CFTypeRef v, int dflt)
     return x;
 }
 
-// Profiles our 8-bit 4:2:0 stream satisfies: H.264 Baseline/Main/High (a P-only CAVLC Main stream decodes on all
-// three) at every level, HEVC Main. Registered as SupportedSelectionProperties, so VideoToolbox picks another encoder
+// Profiles we produce: H.264 Baseline/Main/High (a P-only CAVLC Main stream decodes on all three) at every level,
+// HEVC Main and Main 10 (T6.14). Registered as SupportedSelectionProperties, so VideoToolbox picks another encoder
 // (Apple's) when an app asks for a profile not listed (HEVC Main10, H.264 High 4:2:2 ...), as Apple's encoders declare.
 static CFArrayRef profiles(bool hevc)
 {
@@ -168,7 +170,7 @@ static CFArrayRef profiles(bool hevc)
             CFStringRef x = CFStringCreateWithFormat(NULL, NULL, CFSTR("H264_%s_%s"), prof[i], lev[j]); CFArrayAppendValue(h, x); CFRelease(x);
         }
         CFArrayAppendValue(h, CFSTR("H264_ConstrainedBaseline_AutoLevel")); CFArrayAppendValue(h, CFSTR("H264_ConstrainedHigh_AutoLevel"));
-        CFArrayAppendValue(v, kVTProfileLevel_HEVC_Main_AutoLevel);
+        CFArrayAppendValue(v, kVTProfileLevel_HEVC_Main_AutoLevel); CFArrayAppendValue(v, kVTProfileLevel_HEVC_Main10_AutoLevel);
         list[0] = h; list[1] = v;
     });
     return list[hevc];
@@ -178,6 +180,8 @@ static bool profile_ok(const State *s, CFTypeRef v)
     CFArrayRef l = profiles(s->hevc);
     return v && CFGetTypeID(v) == CFStringGetTypeID() && CFArrayContainsValue(l, CFRangeMake(0, CFArrayGetCount(l)), v);
 }
+
+static OSStatus set_pixel_attrs(State *s);
 
 static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
 {
@@ -193,6 +197,10 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) { if (v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) LOG("frame reordering requested: not supported, no B-frames"); }
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !profile_ok(s, v)) st = kVTPropertyNotSupportedErr;
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && s->hevc) {
+        bool ten = CFEqual(v, kVTProfileLevel_HEVC_Main10_AutoLevel);
+        if (ten != s->ten && !s->opened) { s->ten = ten; set_pixel_attrs(s); }
+    }
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) || CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) ||
              CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)) { /* accepted: Main profile, CAVLC, rate limits from AverageBitRate */ }
     else st = kVTPropertyNotSupportedErr;
@@ -212,13 +220,42 @@ static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRe
     else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) { n = s->enc.cfg.num_refs ? s->enc.cfg.num_refs : (s->refs ? s->refs : ENC_MAX_REFS); v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) v = CFRetain(s->realTime ? kCFBooleanTrue : kCFBooleanFalse);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) v = CFRetain(kCFBooleanFalse);
-    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)) v = CFRetain(s->hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel) : kVTProfileLevel_H264_Main_AutoLevel);
     else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc) v = CFRetain(kVTH264EntropyMode_CAVLC);
     else if (CFEqual(key, kVTCompressionPropertyKey_NumberOfPendingFrames)) { n = 0; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder)) v = CFRetain(kCFBooleanTrue);
-    else return kCMBaseObjectError_ValueNotAvailable;
+    else { if (gLog) { char k[128]; CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); LOG("copy %s: not available", k); } return kCMBaseObjectError_ValueNotAvailable; }
     *(CFTypeRef *)out = v;
     return noErr;
+}
+
+// the input formats we take: NV12 or BGRA (BGRA is converted by us, in the tiling pass, much faster than VideoToolbox's
+// conversion: T5.05); a Main 10 session takes 16-bit 4:2:0 (x420 / xf20, P010 layout). Set again when the profile changes.
+static OSStatus set_pixel_attrs(State *s)
+{
+    if (!s->session) return noErr;
+    int f[12] = { kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_32BGRA };
+    // Main 10: P010 or l10r (ScreenCaptureKit's 10-bit RGB, what Parsec sends; converted by us: else VideoToolbox converts it
+    // through Metal on its serial queue, 20+ ms per 4K frame and frames queued behind it, T6.14)
+    if (s->ten) { f[0] = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange; f[1] = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; f[2] = kCVPixelFormatType_ARGB2101010LEPacked; }
+    int nf = 3;
+    if (access("/tmp/nvencvt.anyfmt", F_OK) == 0) {   // diagnostics: offer every format a capture source might deliver, log what comes
+        int all[] = { kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+                      kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_32BGRA,
+                      kCVPixelFormatType_ARGB2101010LEPacked, kCVPixelFormatType_64RGBAHalf, kCVPixelFormatType_30RGB,
+                      kCVPixelFormatType_64ARGB, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_32ARGB };
+        nf = 12; memcpy(f, all, sizeof all);
+    }
+    CFNumberRef n[12]; for (int i = 0; i < nf; i++) n[i] = CFNumberCreate(NULL, kCFNumberIntType, &f[i]);
+    CFArrayRef fmts = CFArrayCreate(NULL, (const void **)n, nf, &kCFTypeArrayCallBacks);
+    CFNumberRef w = CFNumberCreate(NULL, kCFNumberIntType, &s->width), h = CFNumberCreate(NULL, kCFNumberIntType, &s->height);
+    CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void *k[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey };
+    const void *v[] = { fmts, w, h, ios };
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    OSStatus st = VTEncoderSessionSetPixelBufferAttributes(s->session, attrs);
+    CFRelease(attrs); CFRelease(ios); CFRelease(w); CFRelease(h); CFRelease(fmts); for (int i = 0; i < nf; i++) CFRelease(n[i]);
+    return st;
 }
 
 // ---- encoder functions ----
@@ -226,17 +263,7 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 {
     State *s = state(e);
     s->session = session; s->width = dims.width; s->height = dims.height;
-    // NV12 or BGRA in (BGRA is converted by us, in the tiling pass, much faster than VideoToolbox's conversion: T5.05)
-    int f1 = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, f2 = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, f3 = kCVPixelFormatType_32BGRA;
-    CFNumberRef n1 = CFNumberCreate(NULL, kCFNumberIntType, &f1), n2 = CFNumberCreate(NULL, kCFNumberIntType, &f2), n3 = CFNumberCreate(NULL, kCFNumberIntType, &f3);
-    const void *fv[] = { n1, n2, n3 }; CFArrayRef fmts = CFArrayCreate(NULL, fv, 3, &kCFTypeArrayCallBacks);
-    CFNumberRef w = CFNumberCreate(NULL, kCFNumberIntType, &s->width), h = CFNumberCreate(NULL, kCFNumberIntType, &s->height);
-    CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    const void *k[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey };
-    const void *v[] = { fmts, w, h, ios };
-    CFDictionaryRef attrs = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    OSStatus st = VTEncoderSessionSetPixelBufferAttributes(session, attrs);
-    CFRelease(attrs); CFRelease(ios); CFRelease(w); CFRelease(h); CFRelease(fmts); CFRelease(n1); CFRelease(n2); CFRelease(n3);
+    OSStatus st = set_pixel_attrs(s);
     LOG("startSession %dx%d (pixel buffer attributes -> %d)", s->width, s->height, (int)st);
     return noErr;
 }
@@ -259,7 +286,7 @@ static OSStatus open_encoder(State *s)
       if (df) { if (fscanf(df, "%d", &v) == 1 && v >= 0) dpb_extra = v; fclose(df); } }
     dpb_extra = dpb_extra < 0 ? 0 : dpb_extra > 2 ? 2 : dpb_extra;
     EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
-                    .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0 };
+                    .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8 };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
@@ -289,7 +316,7 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s encoder open on NVENC%d: %dx%d refs %d dpb+%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", c.engine, c.width, c.height, c.num_refs, c.dpb_extra,
+    LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra,
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
@@ -370,20 +397,26 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     if (s->failed) { pthread_mutex_unlock(&s->lock); VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL); return kVTVideoEncoderMalfunctionErr; }
     OSType pf = CVPixelBufferGetPixelFormatType(img);
     bool bgra = pf == kCVPixelFormatType_32BGRA;
-    if ((pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && !bgra) ||
+    bool p010 = pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+    bool l10r = pf == kCVPixelFormatType_ARGB2101010LEPacked;
+    if ((pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && !bgra && !((p010 || l10r) && s->ten)) ||
+        (bgra && s->ten) ||
         (int)CVPixelBufferGetWidth(img) < s->width || (int)CVPixelBufferGetHeight(img) < s->height) {
-        LOG("unexpected pixel buffer %.4s %zux%zu", (char *)&pf, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img));
+        { OSType be = CFSwapInt32HostToBig(pf); LOG("unexpected pixel buffer %.4s %zux%zu", (char *)&be, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img)); }
         pthread_mutex_unlock(&s->lock);
         VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTPixelTransferNotSupportedErr, 0, NULL);
         return noErr;
     }
     while (s->qt - s->qh >= s->depth) pthread_cond_wait(&s->cv, &s->lock);   // a free input slot
     double tTile0 = now_ms();
+    if (gLog && s->frames == 0) { OSType be = CFSwapInt32HostToBig(pf); CFTypeRef m = CVBufferCopyAttachment(img, kCVImageBufferYCbCrMatrixKey, NULL), t = CVBufferCopyAttachment(img, kCVImageBufferTransferFunctionKey, NULL);
+        char ms[64] = "-", ts[64] = "-"; if (m) { CFStringGetCString(m, ms, sizeof ms, kCFStringEncodingUTF8); CFRelease(m); } if (t) { CFStringGetCString(t, ts, sizeof ts, kCFStringEncodingUTF8); CFRelease(t); }
+        LOG("first frame %.4s %zux%zu matrix %s transfer %s", (char *)&be, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img), ms, ts); }
     s->lastPf = pf;
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     if (!s->dumpEs && (s->frames % 30) == 0 && access("/tmp/nvencvt.dump", F_OK) == 0) {   // start a dump (diagnostics)
         char p[128]; snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.es", (int)getpid()); s->dumpEs = fopen(p, "wb");
-        snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.nv12", (int)getpid()); s->dumpYuv = bgra ? NULL : fopen(p, "wb");
+        snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.nv12", (int)getpid()); s->dumpYuv = bgra || p010 || l10r ? NULL : fopen(p, "wb");
         s->dumpYuvLeft = 30; s->dumpIdr = true;
         if (s->dumpEs) { uint8_t h[256]; size_t n = enc_headers(&s->enc, h); fwrite(h, 1, n, s->dumpEs); }
         LOG("dump started (%dx%d, %s)", s->width, s->height, bgra ? "BGRA: stream only" : "NV12");
@@ -396,7 +429,10 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         }
         if (--s->dumpYuvLeft == 0) { fclose(s->dumpYuv); s->dumpYuv = NULL; }
     }
-    if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
+    if (l10r) enc_load_l10r(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
+    else if (p010) enc_load_p010(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                            CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    else if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
     else enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
                        CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
     CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
@@ -549,6 +585,10 @@ __attribute__((constructor)) static void init(void)
     // register by itself only when injected (DYLD_INSERT_LIBRARIES); loaded by the Metal plugin (NVMTL_NVENCVT),
     // the plugin calls NVEncVT_Register
     gLog = getenv("NVENCVT_LOG") != NULL;
+    if (!gLog && access("/tmp/nvencvt.log", F_OK) == 0) {
+        char p[64]; snprintf(p, sizeof p, "/tmp/nvencvt-%d.log", (int)getpid());
+        if ((gLogF = fopen(p, "a"))) gLog = true;
+    }
     const char *ins = getenv("DYLD_INSERT_LIBRARIES");
     if (ins && strstr(ins, "nvencvt") && !getenv("NVENCVT_NO_REGISTER"))
         NVEncVT_Register(getenv("NVENCVT_RATING") ? atoi(getenv("NVENCVT_RATING")) : 1100);

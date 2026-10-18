@@ -120,3 +120,54 @@ void nvenc_in_tile_bgra(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *s
     });
     _mm_sfence();
 }
+
+// l10r -> P010, BT.709 video range (Y 64..940, C 64..960), 16.16 fixed point: Y = 64 + (11931 R + 40137 G + 4052 B) >> 16;
+// Cb = 512 + (-6576 R - 22124 G + 28700 B) >> 16; Cr = 512 + (28700 R - 26069 G - 2631 B) >> 16 (coefficients x 876/1023 or
+// 896/1023). Two rows at a time: two luma rows, one chroma row from the 2x2 sums (VideoToolbox's
+// own l10r -> x420 transfer point-samples the top-left pixel instead: 43 dB apart on vttest's pattern, T6.14). Plain loops the compiler vectorizes;
+// an AVX2 build of the same code is used where the CPU has it.
+#define L10R_ROWS_BODY \
+    for (size_t x = 0; x < w; x++) { \
+        uint32_t a = s0[x], b = s1[x]; \
+        int ra = (a >> 20) & 1023, ga = (a >> 10) & 1023, ba = a & 1023, rb = (b >> 20) & 1023, gb = (b >> 10) & 1023, bb = b & 1023; \
+        y0[x] = (uint16_t)((64 + ((11931 * ra + 40137 * ga + 4052 * ba + 32768) >> 16)) << 6); \
+        y1[x] = (uint16_t)((64 + ((11931 * rb + 40137 * gb + 4052 * bb + 32768) >> 16)) << 6); \
+    } \
+    for (size_t x = 0; x < w; x += 2) { \
+        size_t x1 = x + 1 < w ? x + 1 : x; \
+        uint32_t a0 = s0[x], b0 = s1[x], a1 = s0[x1], b1 = s1[x1]; \
+        int r = ((a0 >> 20) & 1023) + ((a1 >> 20) & 1023) + ((b0 >> 20) & 1023) + ((b1 >> 20) & 1023); \
+        int g = ((a0 >> 10) & 1023) + ((a1 >> 10) & 1023) + ((b0 >> 10) & 1023) + ((b1 >> 10) & 1023); \
+        int bl = (a0 & 1023) + (a1 & 1023) + (b0 & 1023) + (b1 & 1023); \
+        uv[x] = (uint16_t)((512 + ((-6576 * r - 22124 * g + 28700 * bl + (1 << 17)) >> 18)) << 6); \
+        uv[x + 1] = (uint16_t)((512 + ((28700 * r - 26069 * g - 2631 * bl + (1 << 17)) >> 18)) << 6); \
+    }
+static void l10r_rows_generic(const uint32_t *s0, const uint32_t *s1, uint16_t *y0, uint16_t *y1, uint16_t *uv, size_t w) { L10R_ROWS_BODY }
+__attribute__((target("avx2")))
+static void l10r_rows_avx2(const uint32_t *s0, const uint32_t *s1, uint16_t *y0, uint16_t *y1, uint16_t *uv, size_t w) { L10R_ROWS_BODY }
+
+void nvenc_in_tile_l10r(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch)
+{
+    static int avx2 = -1; if (avx2 < 0) avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    void (*conv)(const uint32_t *, const uint32_t *, uint16_t *, uint16_t *, uint16_t *, size_t) = avx2 ? l10r_rows_avx2 : l10r_rows_generic;
+    // super-bands of 32 luma rows = 2 luma tile rows + 1 chroma tile row; rows of 2 x width bytes (16-bit samples)
+    size_t sbands = (rows + 31) / 32, bw = (((width + 1) & ~(size_t)1) * 2 + 63) & ~(size_t)63, crows = (rows + 1) / 2;
+    size_t chunks = sbands >= 16 ? 4 : 1, per = (sbands + chunks - 1) / chunks;
+    dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+        uint8_t *buf = aligned_alloc(64, bw * 48);   // 32 luma rows + 16 chroma rows
+        if (!buf) return;
+        uint8_t *uvb = buf + bw * 32;
+        for (size_t sb = k * per; sb < (k + 1) * per && sb < sbands; sb++) {
+            size_t r0 = sb * 32;
+            for (size_t r = 0; r < 32 && r0 + r < rows; r += 2) {
+                const uint32_t *s0 = (const uint32_t *)(src + (r0 + r) * src_stride);
+                const uint32_t *s1 = r0 + r + 1 < rows ? (const uint32_t *)(src + (r0 + r + 1) * src_stride) : s0;   // odd height: repeat
+                conv(s0, s1, (uint16_t *)(buf + r * bw), (uint16_t *)(buf + (r + 1) * bw), (uint16_t *)(uvb + (r / 2) * bw), width);
+            }
+            for (size_t b = 2 * sb; b < 2 * sb + 2 && b * 16 < rows; b++) tile_band(dst_luma, buf - r0 * bw, bw, width * 2, b, rows, pitch);
+            tile_band(dst_chroma, uvb - (r0 / 2) * bw, bw, ((width + 1) & ~(size_t)1) * 2, sb, crows, pitch);
+        }
+        free(buf);
+    });
+    _mm_sfence();
+}

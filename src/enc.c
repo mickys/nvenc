@@ -35,14 +35,18 @@ int enc_open(Enc *e, const EncConfig *cfg)
     // input: NVENC's input layout (block_height 2); the engine reads 8-12 KB past the chroma plane, hence the slack.
     // HEVC: planes cover whole 32-row CTBs (the engine pads the source to the CTB grid itself, but reads that far)
     bool hevc = cfg->codec == ENC_HEVC;
+    // 10-bit (HEVC Main 10): input and reconstructed samples are 16 bits; the surface configs keep the pitch in samples,
+    // the planes and field offsets double (nullmoth's libnvenc_hevc, docs/reports/T6.14.md)
+    if (!hevc || e->cfg.bit_depth != 10) e->cfg.bit_depth = 8;
+    e->bps = e->cfg.bit_depth > 8 ? 2 : 1;
     size_t inRows = hevc ? (((size_t)e->hmb * 16 + 31) & ~(size_t)31) : (size_t)e->hmb * 16;
     e->pitch = ((size_t)e->wmb * 16 + 63) & ~(size_t)63;
-    e->lumaSz = (nvenc_in_plane_size(e->pitch, inRows) + 255) & ~(size_t)255;
-    e->chromaSz = nvenc_in_plane_size(e->pitch, inRows / 2);
+    e->lumaSz = (nvenc_in_plane_size(e->pitch * e->bps, inRows) + 255) & ~(size_t)255;
+    e->chromaSz = nvenc_in_plane_size(e->pitch * e->bps, inRows / 2);
     // reconstructed pictures: block-linear block_height 2, rows rounded up to 32 (the engine writes that far)
     e->rPitch = ((size_t)e->wmb * 16 + 255) & ~(size_t)255;
-    e->rLuma = (e->rPitch * (((size_t)e->hmb * 16 + 31) & ~(size_t)31) + 255) & ~(size_t)255;
-    e->rSlot = (e->rLuma + e->rPitch * (((size_t)e->hmb * 8 + 31) & ~(size_t)31) + 0xffff) & ~(size_t)0xffff;
+    e->rLuma = (e->rPitch * e->bps * (((size_t)e->hmb * 16 + 31) & ~(size_t)31) + 255) & ~(size_t)255;
+    e->rSlot = (e->rLuma + e->rPitch * e->bps * (((size_t)e->hmb * 8 + 31) & ~(size_t)31) + 0xffff) & ~(size_t)0xffff;
     if (hevc) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
     int slots = e->cfg.num_refs + 1;
     size_t mbs = (size_t)e->wmb * e->hmb;
@@ -110,8 +114,9 @@ static HevcParams hevc_params(const Enc *e)
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
         .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
+        .bit_depth = e->cfg.bit_depth,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
-        .no_ts = hevc_off("ts"), .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
+        .no_ts = hevc_off("ts") || e->cfg.bit_depth > 8,   /* nullmoth's 10-bit setup turns transform skip off */ .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
         .sis = hevc_off("sis") };
 }
 
@@ -128,11 +133,46 @@ size_t enc_headers(Enc *e, uint8_t *out)
     return n + h264_write_pps(&hp, out + n);
 }
 
+// 8-bit rows widened to 16-bit samples (value << 8) for a 10-bit session, then tiled like P010
+static void load_widened(Enc *e, uint8_t *dst, const uint8_t *src, size_t stride, size_t width, size_t rows)
+{
+    uint16_t *buf = malloc(width * 2 * rows);
+    if (!buf) return;
+    for (size_t r = 0; r < rows; r++) for (size_t c = 0; c < width; c++) buf[r * width + c] = (uint16_t)(src[r * stride + c] << 8);
+    nvenc_in_tile_plane(dst, (const uint8_t *)buf, width * 2, width * 2, rows, e->pitch * 2);
+    free(buf);
+}
+
+// 16-bit samples as P010 has them (10 bits in the high bits): NVENC takes them as they are, in the 8-bit layout with
+// twice the bytes per row (low-bit alignment gives garbage, T6.14)
+static void load_16(Enc *e, uint8_t *dst, const uint16_t *src, size_t stride, size_t width, size_t rows)
+{
+    nvenc_in_tile_plane(dst, (const uint8_t *)src, stride, width * 2, rows, e->pitch * 2);
+}
+
+void enc_load_p010(Enc *e, const uint16_t *y, size_t yStride, const uint16_t *uv, size_t uvStride)
+{
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    load_16(e, in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height);
+    load_16(e, (uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)(e->cfg.width + 1) & ~(size_t)1, (size_t)(e->cfg.height + 1) / 2);
+}
+
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride)
 {
     RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    if (e->bps == 2) {
+        load_widened(e, in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height);
+        load_widened(e, (uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)(e->cfg.width + 1) & ~(size_t)1, (size_t)(e->cfg.height + 1) / 2);
+        return;
+    }
     nvenc_in_tile_plane(in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
     nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)e->cfg.width, (size_t)(e->cfg.height + 1) / 2, e->pitch);
+}
+
+void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride)
+{
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    nvenc_in_tile_l10r(in->cpu, (uint8_t *)in->cpu + e->lumaSz, src, stride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch * 2);
 }
 
 void enc_load_bgra(Enc *e, const uint8_t *bgra, size_t stride)
@@ -238,21 +278,29 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     nvenc_h265_surface_cfg_s rc = ic; rc.sfc_pitch = rc.sfc_pitch_chroma = (unsigned short)e->rPitch;
     rc.frame_width_minus1 = (unsigned short)(cw - 1); rc.frame_height_minus1 = (unsigned short)(ch - 1);
     // nullmoth's sets the field offsets of the reference/output surfaces to half a plane (unused in frame mode)
-    rc.luma_bot_offset = (unsigned)((size_t)ch / 2 * e->rPitch / 256);
-    rc.chroma_bot_offset = (unsigned)((((size_t)ch / 2 + 31) & ~(size_t)31) / 2 * e->rPitch / 256);
+    rc.luma_bot_offset = (unsigned)((size_t)ch / 2 * e->rPitch * e->bps / 256);
+    rc.chroma_bot_offset = (unsigned)((((size_t)ch / 2 + 31) & ~(size_t)31) / 2 * e->rPitch * e->bps / 256);
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
     nvenc_h265_sps_data_s *sp = &ps->sps_data;
     sp->chroma_format_idc = 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = 1; sp->max_cu_size = 2;
     sp->min_tu_size = 0; sp->max_tu_size = 3; sp->max_transform_depth_inter = 3; sp->max_transform_depth_intra = 3;
     sp->amp_enabled_flag = !hp.no_amp; sp->num_short_term_ref_pic_sets = 1; sp->sample_adaptive_offset_enabled_flag = !hp.no_sao;
     sp->strong_intra_smoothing_enabled_flag = hp.sis ? 1 : 0;
+    sp->bit_depth_minus_8 = (unsigned)(e->cfg.bit_depth - 8);
     nvenc_h265_pps_data_s *pp = &ps->pps_data;   // matches hevc_write_pps()
     pp->num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1); pp->transform_skip_enabled_flag = !hp.no_ts;
     pp->pps_loop_filter_across_slices_enabled_flag = 1; pp->cu_qp_delta_enabled_flag = !hp.no_cqd; pp->cabac_init_present_flag = 1;
     pp->sign_data_hiding_enabled_flag = !hp.no_sdh;
+    if (e->cfg.bit_depth > 8) {
+        // nullmoth's 10-bit setup also sets an undocumented bit (pps_data reserved1, byte 7 bit 3) and the reserved word at
+        // 0x314 to 0x0222 (0x0999 in 8-bit, which we leave 0); meanings unknown (T6.14)
+        ((NvU8 *)pp)[7] |= 0x08;
+        ((NvU8 *)ps)[0x314] = 0x22; ((NvU8 *)ps)[0x315] = 0x02;
+    }
     nvenc_h265_rc_s *r = &ps->rate_control;
     r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
-    for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
+    // 10-bit extends the QP range down by 6 * (bit_depth - 8): nullmoth's sets minQP -12
+    for (int i = 0; i < 3; i++) { r->minQP[i] = (unsigned char)(e->cfg.bit_depth > 8 ? -12 : 0); r->maxQP[i] = 51; r->rhopbi[i] = 256; }
     r->framerate = e->cfg.fps; r->gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
     if (e->cfg.rc_mode) {   // as the H.264 path (M3, T3.06-T3.08): NAL HRD, fixed-point rate per pixel and frame
         double pixels = (double)W * H, perFrame = (double)e->cfg.bitrate / e->cfg.fps;

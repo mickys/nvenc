@@ -20,3 +20,7 @@ void nvenc_in_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, si
 // BGRA (8-bit, 4 bytes per pixel) -> NV12 in NVENC's input layout, BT.709 video range, 2x2 chroma average; converted per
 // 16-row band in a cache-sized buffer, bands over two threads. dst_luma / dst_chroma: the two planes (pitch bytes per row).
 void nvenc_in_tile_bgra(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);
+// l10r (ARGB2101010 little-endian packed: B bits 0-9, G 10-19, R 20-29; ScreenCaptureKit's 10-bit format) -> 10-bit 4:2:0
+// (P010 samples: value << 6) in NVENC's input layout, BT.709 video range, 2x2 chroma average. pitch: bytes per row
+// (2 x the pitch in samples). Converted per 32-row super-band into a cache-sized buffer, bands over threads.
+void nvenc_in_tile_l10r(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);

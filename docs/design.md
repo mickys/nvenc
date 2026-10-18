@@ -170,6 +170,9 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
 - **Announce spare DPB pictures**: with `max_dec_pic_buffering` = refs + 1, a hardware decoder (AMD Polaris, macOS
   Sonoma) overwrote references still in use (ghosting on moving windows) while software decoders were bit-exact;
   `libnvencvt` announces refs + 3 (T6.12).
+- **Main 10** (T6.14): `bit_depth_minus_8` 2, 16-bit planes with the pitch fields in samples, field offsets doubled,
+  minQP -12, transform skip off, two undocumented values; input is P010 as CoreVideo has it (high bits). Parsec sends
+  l10r (10-bit RGB): converted in the tiling pass, or VideoToolbox's Metal conversion adds 1-2 frame periods.
 - Results: 4K QP 22/25 HEVC 30 Mbit/s at 50.2 dB vs H.264 52 Mbit/s at 48.7 dB, same encode time (~4.1 ms); CBR/VBR/
   low latency within 10 % of target; Parsec HEVC encode latency 4.4-5.3 ms at 4K.
 

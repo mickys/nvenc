@@ -87,4 +87,5 @@ first.
 | T6.10 | M6 notes, commit, overlay update | committed | done |
 | T6.11 | HEVC with 2-3 reference frames (T6.07 open point) | multi-reference streams decode | done |
 | T6.12 | Ghosting on a hardware HEVC decoder (Parsec client, AMD Polaris) with 3 references | no ghost on that client | done: 2 spare DPB pictures |
-| T6.13 | libnvencvt for every app: cheap GPU check, declare/refuse unsupported profiles; `tools/avwrite` | AVAssetWriter H.264/HEVC 360p-4K through our encoder | done (HEVC Main10 open) |
+| T6.13 | libnvencvt for every app: cheap GPU check, declare/refuse unsupported profiles; `tools/avwrite` | AVAssetWriter H.264/HEVC 360p-4K through our encoder | done |
+| T6.14 | HEVC Main 10: 10-bit setup from nullmoth's (tracer fixed for 2.3.6), P010 and l10r input | Parsec 10-bit through our encoder | done: L 7.0-7.3 ms at 4K |

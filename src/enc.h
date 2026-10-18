@@ -27,6 +27,7 @@ typedef struct {
     int slices;                     // slices per picture, whole MB rows (1..ENC_MAX_SLICES)
     bool spin;                      // wait for the engine by spinning only (default: spin 50 us, then sleep on the NVENC event)
     int depth;                      // frames in flight with enc_submit (1..ENC_MAX_DEPTH, default 1)
+    int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;
@@ -45,8 +46,9 @@ typedef struct {
     Rm rm;
     Chan chan;
     int wmb, hmb;
-    size_t pitch, lumaSz, chromaSz; // input picture (NVENC input layout)
-    size_t rPitch, rLuma, rSlot;    // reconstructed pictures: one slot per DPB entry
+    size_t pitch, lumaSz, chromaSz; // input picture (NVENC input layout); pitch in samples
+    size_t rPitch, rLuma, rSlot;    // reconstructed pictures: one slot per DPB entry; rPitch in samples
+    size_t bps;                     // bytes per sample: 1, or 2 for 10-bit (the surface pitch fields stay in samples)
     // per frame in flight (slot = ticket % depth): input picture, picture setup, bitstream, status
     RmMem in[ENC_MAX_DEPTH], setup[ENC_MAX_DEPTH], bs[ENC_MAX_DEPTH], status[ENC_MAX_DEPTH];
     struct { bool idr; unsigned frame_num, poc; double t0; } pend[ENC_MAX_DEPTH];
@@ -67,6 +69,10 @@ void enc_close(Enc *e);
 size_t enc_headers(Enc *e, uint8_t *out);                       // SPS + PPS (HEVC: VPS + SPS + PPS), Annex B (~64 / ~96 bytes)
 // copy an NV12 frame (pitch-linear planes) into the next frame's input surface (needs enc_inflight() < depth)
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride);
+// copy a 16-bit 4:2:0 frame (P010-style: 10 bits in the high bits of each 16-bit sample) into a 10-bit session's input
+void enc_load_p010(Enc *e, const uint16_t *y, size_t yStride, const uint16_t *uv, size_t uvStride);
+// convert an l10r frame (ARGB2101010 LE, ScreenCaptureKit's 10-bit format) into a 10-bit session's input (BT.709 video range)
+void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride);
 // convert a BGRA frame (BT.709 video range) into the next frame's input surface
 void enc_load_bgra(Enc *e, const uint8_t *bgra, size_t stride);
 int  enc_encode(Enc *e, bool force_idr, EncFrame *out);         // encode the loaded frame and wait; 0 = ok

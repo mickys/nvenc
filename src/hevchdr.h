@@ -17,6 +17,7 @@ typedef struct {
     int pic_init_qp;                // 26 + init_qp_minus26
     int vui;                        // write VUI: square pixels, BT.709 colour description
     int full_range;                 // VUI video_full_range_flag
+    int bit_depth;                  // 8 (Main) or 10 (Main 10); 0 = 8
     int no_sdh, no_ts, no_cqd, no_sao, no_amp, sis;   // experiments (T6.05): coding tools off (sis: strong intra smoothing on)
 } HevcParams;
 

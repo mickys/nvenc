@@ -1,5 +1,6 @@
 // hevchdr.c: see hevchdr.h. Exp-Golomb bit writer + emulation prevention (as h264hdr.c).
 #include "hevchdr.h"
+#include <stdbool.h>
 #include <string.h>
 
 typedef struct { uint8_t buf[192]; int bits; } Bw;
@@ -34,10 +35,10 @@ static int level(const HevcParams *p) { return p->level_idc ? p->level_idc : hev
 size_t hevc_coded_width(const HevcParams *p) { return ((size_t)p->width + 31) & ~(size_t)31; }
 size_t hevc_coded_height(const HevcParams *p) { return ((size_t)p->height + 31) & ~(size_t)31; }
 
-static void profile_tier_level(Bw *b, int level_idc)            // 7.3.3, sps_max_sub_layers_minus1 = 0
+static void profile_tier_level(Bw *b, int level_idc, bool ten)  // 7.3.3, sps_max_sub_layers_minus1 = 0
 {
-    put(b, 0, 2); put(b, 0, 1); put(b, 1, 5);                   // general_profile_space, tier Main, profile Main
-    put(b, 0x60000000u, 32);                                    // compatibility flags: Main and Main 10
+    put(b, 0, 2); put(b, 0, 1); put(b, ten ? 2 : 1, 5);         // general_profile_space, tier Main, profile Main / Main 10
+    put(b, ten ? 0x20000000u : 0x60000000u, 32);                // compatibility flags: Main 10 only / Main and Main 10
     put(b, 1, 1); put(b, 0, 1); put(b, 0, 1); put(b, 1, 1);     // progressive, not interlaced, not non-packed, frame only
     put(b, 0, 32); put(b, 0, 11);                               // 43 reserved constraint bits
     put(b, 0, 1);                                               // general_inbld_flag
@@ -51,7 +52,7 @@ size_t hevc_write_vps(const HevcParams *p, uint8_t *out)
     put(&b, 1, 1); put(&b, 1, 1);                               // base layer internal / available
     put(&b, 0, 6); put(&b, 0, 3); put(&b, 1, 1);                // max_layers_minus1, max_sub_layers_minus1, temporal_id_nesting
     put(&b, 0xffff, 16);                                        // vps_reserved_0xffff_16bits
-    profile_tier_level(&b, level(p));
+    profile_tier_level(&b, level(p), p->bit_depth > 8);
     put(&b, 1, 1);                                              // vps_sub_layer_ordering_info_present_flag
     ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, 0); ue(&b, 0);   // max_dec_pic_buffering_minus1, no reorder, no latency limit
     put(&b, 0, 6); ue(&b, 0);                                   // vps_max_layer_id, vps_num_layer_sets_minus1
@@ -66,14 +67,15 @@ size_t hevc_write_sps(const HevcParams *p, uint8_t *out)
     Bw b; memset(&b, 0, sizeof b);
     unsigned cw = (unsigned)hevc_coded_width(p), ch = (unsigned)hevc_coded_height(p);
     put(&b, 0, 4); put(&b, 0, 3); put(&b, 1, 1);                // vps id, max_sub_layers_minus1, temporal_id_nesting
-    profile_tier_level(&b, level(p));
+    profile_tier_level(&b, level(p), p->bit_depth > 8);
     ue(&b, 0);                                                  // sps_seq_parameter_set_id
     ue(&b, 1);                                                  // chroma_format_idc 4:2:0
     ue(&b, cw); ue(&b, ch);
     unsigned cr = (cw - (unsigned)p->width) / 2, cb = (ch - (unsigned)p->height) / 2;   // 4:2:0: conformance window units of 2 pixels
     put(&b, cr || cb ? 1 : 0, 1);
     if (cr || cb) { ue(&b, 0); ue(&b, cr); ue(&b, 0); ue(&b, cb); }
-    ue(&b, 0); ue(&b, 0);                                       // bit depth luma / chroma - 8
+    unsigned bd = p->bit_depth > 8 ? (unsigned)p->bit_depth - 8 : 0;
+    ue(&b, bd); ue(&b, bd);                                     // bit depth luma / chroma - 8
     ue(&b, (unsigned)p->log2_max_poc_lsb_minus4);
     put(&b, 1, 1);                                              // sps_sub_layer_ordering_info_present_flag
     ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, 0); ue(&b, 0);
