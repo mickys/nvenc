@@ -7,7 +7,7 @@ It drives the GPU's NVENC engine directly from user space and is written from pu
 **Status: early.** M0 (RM client, capability probe), M1 (a channel on NVENC0/1 that runs our commands: `tools/hello`)
 M2 (one H.264 IDR frame from our own picture setup, 256x128 to 4K: `tools/encode1`) and M3 (`src/enc.c`: P-frames
 with up to 3 references, CBR/VBR, low-latency one-frame VBV, slices: `tools/encodeN`) work. M4 (`libnvencvt.dylib`: a VideoToolbox H.264
-encoder, registered by the Metal plugin with `NVMTL_NVENC_IMPL=nvenc` or injected with `DYLD_INSERT_LIBRARIES`) works.
+encoder, loaded by the Metal plugin with `NVMTL_NVENCVT=<process list|1>` in nvrm610.conf (patch in kvm-tahoe-nvidia `guest/nvenc`) or injected with `DYLD_INSERT_LIBRARIES`) works.
 Next: M5, GPU-resident input. Milestones and design: [docs/design.md](docs/design.md); step-by-step tasks with reports:
 [docs/tasks.md](docs/tasks.md).
 

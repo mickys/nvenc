@@ -1,7 +1,7 @@
 // nvencvt.c: a VideoToolbox H.264 encoder on top of src/enc.c (M4). Interface: docs/vt-encoder.md.
 // Built as libnvencvt.dylib. Injected, it registers the encoder in the process (constructor), e.g.
 //   DYLD_INSERT_LIBRARIES=~/nvenc-dev/libnvencvt.dylib ./vttest hw avc1 1920 1080 60
-// Loaded otherwise (the Metal plugin with NVMTL_NVENC_IMPL=nvenc), call NVEncVT_Register(rating), or register
+// Loaded otherwise (the Metal plugin with NVMTL_NVENCVT set), call NVEncVT_Register(rating), or register
 // NVEncVT_CreateInstance as the factory yourself. Environment: NVENCVT_RATING (default 1100,
 // above nullmoth's 1000), NVENCVT_NO_REGISTER, NVENCVT_LOG, NVENCVT_DEPTH, NVENCVT_ENGINE, NVENCVT_STATS=<file> (or touch
 // /tmp/nvencvt.stats: statistics every 2 s to /tmp/nvencvt-stats.log, also in apps that get no environment).
@@ -420,7 +420,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
 
 __attribute__((constructor)) static void init(void)
 {
-    // register by itself only when injected (DYLD_INSERT_LIBRARIES); loaded by the Metal plugin (NVMTL_NVENC_IMPL=nvenc),
+    // register by itself only when injected (DYLD_INSERT_LIBRARIES); loaded by the Metal plugin (NVMTL_NVENCVT),
     // the plugin calls NVEncVT_Register
     gLog = getenv("NVENCVT_LOG") != NULL;
     const char *ins = getenv("DYLD_INSERT_LIBRARIES");
