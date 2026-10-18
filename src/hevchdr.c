@@ -29,8 +29,10 @@ int hevc_level_for(int width, int height)
     return 183;                                                 // 6.1
 }
 static int level(const HevcParams *p) { return p->level_idc ? p->level_idc : hevc_level_for(p->width, p->height); }
-size_t hevc_coded_width(const HevcParams *p) { return ((size_t)p->width + 15) & ~(size_t)15; }
-size_t hevc_coded_height(const HevcParams *p) { return ((size_t)p->height + 15) & ~(size_t)15; }
+// whole 32x32 CTBs: NVENC encodes a partial last CTB row/column as if it were whole (a 720-line picture coded as 720 lines
+// decoded wrong), so the picture is coded CTB-aligned and the conformance window crops it, as nullmoth's does (T6.06)
+size_t hevc_coded_width(const HevcParams *p) { return ((size_t)p->width + 31) & ~(size_t)31; }
+size_t hevc_coded_height(const HevcParams *p) { return ((size_t)p->height + 31) & ~(size_t)31; }
 
 static void profile_tier_level(Bw *b, int level_idc)            // 7.3.3, sps_max_sub_layers_minus1 = 0
 {

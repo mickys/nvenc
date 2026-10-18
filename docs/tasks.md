@@ -80,8 +80,8 @@ first.
 | T6.03 | Observe nullmoth's `libnvenc_hevc` at runtime (option B: RM escapes, pushed methods, buffers): `tools/hevcref.m` registers its `NVEncHEVC_CreateInstance` in-process, one 256x128 IDR under `trace/nvtrace` | picture setup + method trace in `docs/traces/` | done |
 | T6.04 | HEVC VPS/SPS/PPS writer (`src/hevchdr.c`) | Apple's `CMVideoFormatDescriptionCreateFromHEVCParameterSets` accepts them | done |
 | T6.05 | One HEVC IDR from our own picture setup: codec switch in `enc.c` (application ID, codec type, H.265 setup), `encode1` HEVC mode at 256x128 | decodes ≥ 40 dB | done |
-| T6.06 | HEVC IDR at 720p, 1080p, 3840x2160 (CTB alignment, recon layout) | all decode ≥ 40 dB | doing |
-| T6.07 | HEVC P-frames (1 reference, short-term RPS) | 60-frame stream decodes, no errors | todo |
+| T6.06 | HEVC IDR at 720p, 1080p, 3840x2160 (CTB alignment, recon layout) | all decode ≥ 40 dB | done |
+| T6.07 | HEVC P-frames (1 reference, short-term RPS) | 60-frame stream decodes, no errors | doing |
 | T6.08 | HEVC rate control (CBR/VBR/low-latency, reuse M3) | bitrate within 10 % of target | todo |
 | T6.09 | HEVC through VideoToolbox: `hvc1` in `libnvencvt`; `vttest` HEVC; Parsec with HEVC | encoder used, decodes | todo |
 | T6.10 | M6 notes, commit, overlay update | committed | todo |

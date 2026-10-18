@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 typedef struct {
-    int width, height;              // display size; coded size is rounded up to the 16-pixel min CB (conformance window)
+    int width, height;              // display size; coded size is whole 32x32 CTBs (conformance window crops it)
     int level_idc;                  // 30 x level (93 = 3.1, 123 = 4.1, 153 = 5.1); 0 = from the picture size at 60 fps
     int log2_max_poc_lsb_minus4;    // 4 (as nullmoth's)
     int max_dec_pic_buffering;      // DPB size in pictures (references + current)

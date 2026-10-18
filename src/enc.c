@@ -47,6 +47,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     int slots = e->cfg.num_refs + 1;
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
+    if (hevc) histSz = ((size_t)(W + 31) / 32 * 768 + 0xffff) & ~(size_t)0xffff;   // HEVC: 768 bytes per CTB column (nullmoth's size, T6.06)
     size_t meSz = (mbs * 64 + 0xffff) & ~(size_t)0xffff;   // ME predictor data per MB (the reference client uses 4 MB at any size)
     if (e->cfg.depth < 1) e->cfg.depth = 1;
     if (e->cfg.depth > ENC_MAX_DEPTH) e->cfg.depth = ENC_MAX_DEPTH;
@@ -231,14 +232,18 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
     nvenc_h265_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
         .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
+    // reference/output pictures: the coded (CTB-aligned) size; the input keeps the display size and the engine pads it
+    HevcParams hp = hevc_params(e);
+    int cw = (int)hevc_coded_width(&hp), ch = (int)hevc_coded_height(&hp);
     nvenc_h265_surface_cfg_s rc = ic; rc.sfc_pitch = rc.sfc_pitch_chroma = (unsigned short)e->rPitch;
+    rc.frame_width_minus1 = (unsigned short)(cw - 1); rc.frame_height_minus1 = (unsigned short)(ch - 1);
     // nullmoth's sets the field offsets of the reference/output surfaces to half a plane (unused in frame mode)
-    rc.luma_bot_offset = (unsigned)(e->rLuma / 2 / 256); rc.chroma_bot_offset = (unsigned)(e->rLuma / 4 / 256);
+    rc.luma_bot_offset = (unsigned)((size_t)ch / 2 * e->rPitch / 256);
+    rc.chroma_bot_offset = (unsigned)((((size_t)ch / 2 + 31) & ~(size_t)31) / 2 * e->rPitch / 256);
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
     nvenc_h265_sps_data_s *sp = &ps->sps_data;
     sp->chroma_format_idc = 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = 1; sp->max_cu_size = 2;
     sp->min_tu_size = 0; sp->max_tu_size = 3; sp->max_transform_depth_inter = 3; sp->max_transform_depth_intra = 3;
-    HevcParams hp = hevc_params(e);
     sp->amp_enabled_flag = !hp.no_amp; sp->num_short_term_ref_pic_sets = 1; sp->sample_adaptive_offset_enabled_flag = !hp.no_sao;
     sp->strong_intra_smoothing_enabled_flag = hp.sis ? 1 : 0;
     nvenc_h265_pps_data_s *pp = &ps->pps_data;   // matches hevc_write_pps()
