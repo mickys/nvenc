@@ -128,7 +128,9 @@ NV_STATUS rm_map_cpu(Rm *rm, NvHandle parent, NvHandle obj, NvU64 size, bool sys
     bool wc = !sysmem && (caching == NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED || getenv("RM_FORCE_WC"));
     if (rm->verbose || getenv("RM_SHOW_CACHING")) fprintf(stderr, "rm: CPU map 0x%08x %s: RM caching type %u -> %s\n", obj, sysmem ? "sysmem" : "vidmem", caching, wc ? "write-combined" : "default");
     mach_vm_address_t addr = 0; mach_vm_size_t len = 0;
-    kern_return_t kr = IOConnectMapMemory64(conn->conn, 0, mach_task_self(), &addr, &len, kIOMapAnywhere | (wc ? kIOMapWriteCombineCache : 0));
+    IOOptionBits cache = wc ? kIOMapWriteCombineCache : 0;
+    if (getenv("RM_MAP_CACHE") && !sysmem) cache = (IOOptionBits)strtoul(getenv("RM_MAP_CACHE"), NULL, 0) << 8;   // research knob (BAR1 caching experiments): 1 inhibit, 2 writethru, 3 copyback, 4 write-combine
+    kern_return_t kr = IOConnectMapMemory64(conn->conn, 0, mach_task_self(), &addr, &len, kIOMapAnywhere | cache);
     if (kr != KERN_SUCCESS) { if (rm->verbose) fprintf(stderr, "rm: IOConnectMapMemory64 -> 0x%08x\n", kr); rm_conn_close(conn); return NV_ERR_GENERIC; }
     *cpu = (void *)addr;
     conn->addr = (void *)addr; conn->len = len; conn->stub = p.params.pLinearAddress; conn->hParent = parent; conn->hMem = obj;

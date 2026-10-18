@@ -99,11 +99,10 @@ during a Parsec session shows `-[NVMTLTexture nvmtlSurfaceOut/In]` → `memmove`
 | same, 32-bit word loop (what NVAccel's display copy does) | **83.6 ms** | 83.6 ms | 21.1 ms |
 | CPU read back through BAR1 | ~7 s | | ~1.5 s |
 
-**BAR1 is effectively uncached in this VM.** RM maps it write-combined in the guest (caching type 2), but the host maps
-the 4090's BAR1 (`0x2100000000-0x2200000000`) as **uncached-minus** (`/sys/kernel/debug/x86/pat_memtype_list` on edi,
-VFIO's mapping), and guest write-combining doesn't take effect: 1.4 GB/s with `memcpy`, 0.37 GB/s with 32-bit stores.
-On bare metal, write-combined BAR writes are typically several times faster, so the display-copy numbers above are a
-property of this KVM setup as much as of the driver.
+**BAR1 was effectively uncached in this VM** (1.4 GB/s with `memcpy`, 0.37 GB/s with 32-bit stores), although RM maps it
+write-combined in the guest (caching type 2). The cause turned out to be in the guest, not on the host: the AMD_Vanilla
+kernel patch that OpenCore applies to XNU sets PAT entry 6 to uncached-minus, and XNU maps write-combined memory through
+PAT entry 6. See "BAR1 caching: cause and fix" below. With the fix, the same copy takes 3.1-5.5 ms instead of 86 ms.
 
 ### Live: WindowServer and Parsec during a session (20 s windows)
 
@@ -140,9 +139,8 @@ under that same lock. That last link is inferred from the code, not measured.
    **Enabling zero-copy scan-out would remove that copy**, but capture then has to read the composite from VRAM rather
    than from the IOSurface's system pages: the same mechanism as above, on the producer side (WindowServer/SkyLight
    and the plugin), plus a page-off or GPU read where capture needs the pixels. That's driver work.
-5. **Independent of the driver, write-combining for BAR1 in the VM** would make the existing copy path several times
-   cheaper (KVM/VFIO maps the BAR uncached-minus on edi). Whether the host kernel/QEMU can map it write-combined needs
-   research; it's a host-wide change on edi, so ask before touching it.
+5. **Independent of the driver, write-combining for BAR1 in the VM** makes every CPU write through BAR1 much cheaper.
+   The fix is a guest boot setting (OpenCore), not a host change; see "BAR1 caching: cause and fix" below.
 
 ## Expected improvements (summary)
 
@@ -152,7 +150,7 @@ under that same lock. That last link is inferred from the code, not measured.
 | plugin imports multi-plane IOSurfaces into VRAM | nullmoth | NV12 producer 5.9 → 0.24 ms per frame; removes CPU copy-outs | measured (synthetic) |
 | consumers read VRAM instead of locking | us / apps | −7.6 ms per BGRA frame read | measured |
 | zero-copy scan-out compatible with capture | nullmoth (+ the above) | removes ~35-85 ms CPU per desktop update here; desktop under motion ~10 fps → up to the GPU's compositing rate; WindowServer −~17 % of a core | measured components, end result estimated |
-| write-combined BAR1 mapping in the VM | host (edi) | display copy several times cheaper without driver changes | measured uncached behaviour, gain estimated |
+| write-combined BAR1 in the VM (PA6 = WC in the AMD_Vanilla PAT patch) | us (OpenCore config) | CPU → BAR1 writes 86 → 3-5.5 ms per 4K frame; desktop under motion 4.3-4.8 → 12-17 display transactions/s | **measured** (below) |
 
 Not measured yet (would need the user's OK, since it affects the live desktop and the Parsec stream): desktop frame rate
 and WindowServer CPU with zero-copy scan-out switched on (`sysctl debug.nvaccel_iop_flip=1`; capture goes black while
@@ -163,3 +161,75 @@ it's on).
 - The share/dup path has no access check beyond IOSurface lookup. Fine for us, but nullmoth may want to restrict it.
 - It ties our encoder to undocumented driver escapes (0xE2/0xE3, ABI version 2) that can change between releases.
   Check the version and fall back to the CPU path.
+
+## BAR1 caching: cause and fix (2026-10-18)
+
+### What was tried, and what the numbers said
+
+`tools/surfcost` part C writes one 4K BGRA frame (31.6 MB) into VRAM through a BAR1 mapping. `RM_MAP_CACHE=1..4`
+(`src/rm.c`) forces the guest mapping to uncached, write-through, copy-back or write-combined.
+
+| configuration | word loop | memcpy |
+|---|---|---|
+| stock guest, any `RM_MAP_CACHE` mode (1080p: 21.3-21.8 ms / 5.5-5.8 ms, all the same) | 86 ms | 23 ms |
+| + host MTRR write-combining over BAR1 on edi (`/proc/mtrr`) | 86 ms | 23 ms |
+| **guest PAT fixed (PA6 = WC)**, BAR1 32 GB, with or without the host MTRR | **3.1 ms** | **4.9 ms** |
+| guest PAT fixed, BAR1 4 GB | 5.5 ms | 6.2 ms |
+
+Every guest cache mode giving the same speed, even copy-back over a host write-combining MTRR, meant the guest page
+table bits weren't reaching the hardware as requested. The host side was already right: KVM's NPT entries use PAT
+entry 0 (write-back) and rely on host MTRRs (Linux 6.1 `arch/x86/kvm/mmu/spte.c`), the WC MTRR covered BAR1 exactly,
+and KVM copies the guest's IA32_PAT into the VMCB (`svm.c`, `save.g_pat`).
+
+### Cause
+
+Tracing the guest's IA32_PAT writes on edi (`kvm:kvm_msr` with filter `ecx == 0x277`, during boot) showed 16 writes
+(one per vCPU), all `0x0007010600070106`: PA0 WB, PA1 WC, PA2 UC-, PA3 UC, PA4 WB, PA5 WC, **PA6 UC-**, PA7 UC.
+
+- XNU (`osfmk/i386/mtrr.c`, `mtrr_update_action`) normally sets **PA6 = WC**. Its pmap encodes write-combined pages as
+  PAT|PCD = entry 6, and kIOMapWriteCombineCache mappings use it.
+- The enabled AMD_Vanilla patch **"Algrey / Zormeister | _mtrr_update_action | Fix PAT | 15.0+"** replaces that code
+  with `mov eax, 0x00070106; mov edx, 0x00070106; wrmsr`, a fixed PAT whose entry 6 is UC-. The 10.13+ version does
+  the same; the "Shaneee" variants (disabled) make every entry write-back.
+- So in this guest every write-combined mapping (RM's BAR1 mappings, kIOMapWriteCombineCache) ran uncached-minus.
+  The earlier explanation (edi's PAT maps BAR1 uncached-minus for VFIO) was wrong: that is QEMU's host mapping, which
+  the guest's accesses don't use.
+
+### Fix
+
+`vm/tahoe/make-config.py --pat-wc` (with `--cpu amd`) rewrites the patch's Replace data to `edx = 0x00010106`
+(PA4 WB, PA5 WC, **PA6 WC**, PA7 UC), keeping PA0-PA3. The image is `OpenCore-amd-patwc-gpu-debug.img`. After boot
+the trace shows `0x0001010600070106` on all 16 vCPUs. No host change is needed: the host MTRR made no difference with
+the fix in place, so it was removed again.
+
+### Effect on the desktop (Safari, full-screen CSS gradient animation, `vm/tahoe/bench/desk-sample.sh`, 20 s)
+
+| | display transactions/s | WindowServer user / system (% of a core) |
+|---|---|---|
+| stock PAT, BAR1 32 GB | 4.3-4.8 | 24 / 14 |
+| PA6 = WC, BAR1 32 GB | 8.8 | 46 / 32 |
+| **PA6 = WC, BAR1 4 GB** | **12.3-16.8** | 44-52 / 21-33 |
+
+The desktop update rate under motion goes up about 3x at the standard BAR1 size. Kernel time per transaction is still
+~20-35 ms, so nullmoth's in-kernel display copy most likely still writes through an uncached mapping. NVKMS asks for
+kernel mappings with `flags = 0` (caching type "cached"), and what RM makes of that for video memory isn't verified.
+Mapping the scanout write-combined there would be a driver change.
+
+### BAR1 size retest (same day, root port + `phys-bits=40`, AMD profile)
+
+| BAR1 | boots, display | NVRM placement | driver policy |
+|---|---|---|---|
+| 4 GB | yes | 0xce00000000 | scanout by-handle, surface budget 2 GB |
+| 8 GB | yes | 0xcc00000000 | by-handle, budget 4 GB |
+| 16 GB | yes | 0xc800000000 | by-handle, budget 8 GB |
+| 32 GB | yes | 0xc000000000 | **static-bar1** (BAR1 ≥ VRAM), budget 16 GB |
+
+The earlier "32 GB: macOS drops the card" predates the root port and `phys-bits=40` setup. The plugin still places
+LOCAL+mapped allocations in system RAM at every size (`b80 … default`). surfcost's B paths didn't change with BAR1 size
+(B1 4.7-5.0 ms, B2 0.26-0.31 ms, page-off 6.9-8.6 ms). With the PAT fix, 4 GB gave the best desktop rate of the
+sizes measured, so 4 GB stays the default.
+
+The macOS Screen Sharing frame grab (`vnc-shot.py`) was black with only the cursor after every reboot in this series,
+stock image and 4 GB included, so that is unrelated to BAR1 size or PAT. Not investigated yet.
+
+Raw results: `notes/bar1-tests/` (project folder) and `notes/bar1-cycle-*.log`, made by `vm/tahoe/bar1-cycle.sh`.
