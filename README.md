@@ -46,3 +46,7 @@ Public sources only: NVIDIA's open-gpu-doc and open-gpu-kernel-modules, nullmoth
 published headers and SPI declarations, the H.264 standard. No disassembly or patching of closed binaries, including
 nullmoth's codec libraries; where an interface isn't documented (VideoToolbox's encoder plugin vtable), it is worked
 out black-box by observing calls into our own code.
+
+## License
+
+MIT (see `LICENSE`). The headers in `vendor/` (NVIDIA open-gpu-kernel-modules, open-gpu-doc, WebKit SPI) keep their own licences.
