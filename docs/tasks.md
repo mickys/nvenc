@@ -89,3 +89,13 @@ first.
 | T6.12 | Ghosting on a hardware HEVC decoder (Parsec client, AMD Polaris) with 3 references | no ghost on that client | done: 2 spare DPB pictures |
 | T6.13 | libnvencvt for every app: cheap GPU check, declare/refuse unsupported profiles; `tools/avwrite` | AVAssetWriter H.264/HEVC 360p-4K through our encoder | done |
 | T6.14 | HEVC Main 10: 10-bit setup from nullmoth's (tracer fixed for 2.3.6), P010 and l10r input | Parsec 10-bit through our encoder | done: L 7.0-7.3 ms at 4K |
+
+## M7: encoder quality (2026-10-18)
+
+| Task | What | Done when | Status |
+|---|---|---|---|
+| T7.00 | Registration without a Metal device (CLI apps like ffmpeg get -12908): VT plug-in bundle or another hook | `ffmpeg -c:v hevc_videotoolbox` uses our encoder without injection | open |
+| T7.01 | Full-range input (420f/xf20) signalled in the VUI (H.264 and HEVC) | Parsec's 420f stream decodes to the same levels as the source | open |
+| T7.02 | H.264 High profile, CABAC, 8x8 transform (observe nullmoth's libnvenc_h264) | ~10 % less bitrate at equal PSNR; decodes | open |
+| T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | open |
+| T7.04 | HEVC 4:4:4 (Range Extensions) | a 4:4:4 stream decodes | open |
