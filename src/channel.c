@@ -91,6 +91,14 @@ NV_STATUS chan_submit(Chan *c)
     return NV_OK;
 }
 
+bool chan_rewind(Chan *c)
+{
+    // the push buffer is linear: start over once the channel has fetched everything (GPGet == GPPut)
+    if (c->cur != c->segStart || chan_gpget(c) != c->gpPut) return false;
+    c->cur = c->segStart = c->push.cpu;
+    return true;
+}
+
 NvU32 chan_gpget(Chan *c) { return ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPGet; }
 NvU32 chan_error(Chan *c) { return ((volatile NvNotification *)c->notifier.cpu)[0].status; }
 
@@ -102,3 +110,5 @@ NV_STATUS chan_fault(Chan *c, NvU64 *addr, NvU32 *type, char str[32])
     memcpy(str, p.faultString, 32); str[31] = 0;
     return st;
 }
+
+size_t chan_push_used(Chan *c) { return (size_t)((NvU8 *)c->cur - (NvU8 *)c->push.cpu); }

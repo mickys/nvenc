@@ -1,15 +1,19 @@
-// h264check.m: decode an Annex B H.264 stream (one picture) with Apple's software decoder and compare it with the
-// source NV12 frame. Lists the NAL units first.
-//   ./h264check W H in.h264 src.nv12 [dump.pgm]
+// h264check.m: decode an Annex B H.264 stream with Apple's software decoder and compare every picture with the source
+// NV12 frames (tightly packed, concatenated). Lists the NAL units first (only the first 12 unless -v).
+//   ./h264check [-v] W H in.h264 src.nv12 [dump.pgm]      dump.pgm: luma of the last decoded picture
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
 #include <math.h>
 
 int main(int argc, char **argv) { @autoreleasepool {
-    if (argc < 5) { fprintf(stderr, "usage: h264check W H in.h264 src.nv12 [dump.pgm]\n"); return 2; }
-    int W = atoi(argv[1]), H = atoi(argv[2]);
-    NSData *es = [NSData dataWithContentsOfFile:@(argv[3])], *src = [NSData dataWithContentsOfFile:@(argv[4])];
+    int ai = 1; bool verbose = false;
+    if (argc > 1 && !strcmp(argv[1], "-v")) { verbose = true; ai++; }
+    if (argc - ai < 4) { fprintf(stderr, "usage: h264check [-v] W H in.h264 src.nv12 [dump.pgm]\n"); return 2; }
+    int W = atoi(argv[ai]), H = atoi(argv[ai + 1]), CH = (H + 1) / 2;
+    NSData *es = [NSData dataWithContentsOfFile:@(argv[ai + 2])], *src = [NSData dataWithContentsOfFile:@(argv[ai + 3])];
+    const char *dump = argc - ai > 4 ? argv[ai + 4] : NULL;
     if (!es || !src) { printf("cannot read inputs\n"); return 1; }
+    size_t frameSz = (size_t)W * H + (size_t)W * CH, nSrc = src.length / frameSz;
     const uint8_t *p = es.bytes; size_t n = es.length;
     // split on start codes
     NSMutableArray *nals = [NSMutableArray array];
@@ -22,49 +26,68 @@ int main(int argc, char **argv) { @autoreleasepool {
         } else i++;
     }
     if (start != SIZE_MAX && start < n) [nals addObject:[NSData dataWithBytes:p + start length:n - start]];
-    NSData *sps = nil, *pps = nil; NSMutableData *sample = [NSMutableData data];
+    // one sample per picture: a slice with first_mb_in_slice == 0 (first bit after the header is 1) starts a new one
+    NSData *sps = nil, *pps = nil; NSMutableArray *samples = [NSMutableArray array]; int shown = 0;
     for (NSData *nal in nals) {
-        int t = ((const uint8_t *)nal.bytes)[0] & 0x1f;
-        printf("NAL type %2d, %6lu bytes, header 0x%02x\n", t, (unsigned long)nal.length, ((const uint8_t *)nal.bytes)[0]);
+        const uint8_t *b = nal.bytes; int t = b[0] & 0x1f;
+        if (verbose || shown++ < 12) printf("NAL type %2d, %6lu bytes, header 0x%02x\n", t, (unsigned long)nal.length, b[0]);
         if (t == 7) sps = nal; else if (t == 8) pps = nal;
-        else if (t == 1 || t == 5) { uint32_t be = CFSwapInt32HostToBig((uint32_t)nal.length); [sample appendBytes:&be length:4]; [sample appendData:nal]; }
+        else if (t == 1 || t == 5) {
+            if (!samples.count || (nal.length > 1 && (b[1] & 0x80))) [samples addObject:[NSMutableData data]];
+            uint32_t be = CFSwapInt32HostToBig((uint32_t)nal.length);
+            [samples.lastObject appendBytes:&be length:4]; [samples.lastObject appendData:nal];
+        }
     }
-    if (!sps || !pps || !sample.length) { printf("missing SPS/PPS/slices\n"); return 1; }
+    if (!sps || !pps || !samples.count) { printf("missing SPS/PPS/slices\n"); return 1; }
     const uint8_t *ps[2] = { sps.bytes, pps.bytes }; size_t pl[2] = { sps.length, pps.length };
     CMVideoFormatDescriptionRef fmt = NULL;
     OSStatus st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &fmt);
     if (st) { printf("format description from SPS/PPS -> %d\n", (int)st); return 1; }
     CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fmt);
-    printf("SPS says %dx%d\n", d.width, d.height);
-    CMBlockBufferRef bb = NULL;
-    CMBlockBufferCreateWithMemoryBlock(NULL, (void *)sample.bytes, sample.length, kCFAllocatorNull, NULL, 0, sample.length, 0, &bb);
-    CMSampleBufferRef sb = NULL; size_t ss = sample.length;
-    CMSampleBufferCreateReady(NULL, bb, fmt, 1, 0, NULL, 1, &ss, &sb);
+    printf("SPS says %dx%d, %lu picture(s), %zu source frame(s)\n", d.width, d.height, (unsigned long)samples.count, nSrc);
     NSDictionary *spec = @{ (__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO };
     NSDictionary *attr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) };
     VTDecompressionSessionRef dec = NULL;
     st = VTDecompressionSessionCreate(NULL, fmt, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attr, NULL, &dec);
     if (st) { printf("decoder create -> %d\n", (int)st); return 1; }
-    __block CVPixelBufferRef out = NULL; __block OSStatus ds = 0;
-    VTDecompressionSessionDecodeFrameWithOutputHandler(dec, sb, 0, NULL, ^(OSStatus s, VTDecodeInfoFlags fl, CVImageBufferRef img, CMTime pts, CMTime dur) {
-        ds = s; if (img) out = CVPixelBufferRetain(img); });
-    VTDecompressionSessionWaitForAsynchronousFrames(dec);
-    if (ds || !out) { printf("decode failed: status %d\n", (int)ds); return 1; }
-    CVPixelBufferLockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
-    const uint8_t *sy = src.bytes, *suv = sy + (size_t)W * H;
-    double se[2] = { 0, 0 }; size_t cnt[2] = { 0, 0 };
-    for (int pl2 = 0; pl2 < 2; pl2++) {
-        const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, pl2); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, pl2);
-        const uint8_t *s = pl2 ? suv : sy; int rows = pl2 ? (H + 1) / 2 : H;
-        for (int r = 0; r < rows; r++) for (int c = 0; c < W; c++) { double df = (double)o[r * os + c] - s[r * W + c]; se[pl2] += df * df; cnt[pl2]++; }
+    double sumY = 0, sumC = 0, minY = 1e9, minC = 1e9; int decoded = 0, errors = 0;
+    for (NSUInteger k = 0; k < samples.count; k++) {
+        NSData *sample = samples[k];
+        CMBlockBufferRef bb = NULL;
+        CMBlockBufferCreateWithMemoryBlock(NULL, (void *)sample.bytes, sample.length, kCFAllocatorNull, NULL, 0, sample.length, 0, &bb);
+        CMSampleBufferRef sb = NULL; size_t ss = sample.length;
+        CMSampleTimingInfo ti = { .duration = CMTimeMake(1, 60), .presentationTimeStamp = CMTimeMake((int64_t)k, 60), .decodeTimeStamp = kCMTimeInvalid };
+        CMSampleBufferCreateReady(NULL, bb, fmt, 1, 1, &ti, 1, &ss, &sb);
+        __block CVPixelBufferRef out = NULL; __block OSStatus ds = 0;
+        VTDecompressionSessionDecodeFrameWithOutputHandler(dec, sb, 0, NULL, ^(OSStatus s, VTDecodeInfoFlags fl, CVImageBufferRef img, CMTime pts, CMTime dur) {
+            ds = s; if (img) out = CVPixelBufferRetain(img); });
+        VTDecompressionSessionWaitForAsynchronousFrames(dec);
+        CFRelease(sb); CFRelease(bb);
+        if (ds || !out) { printf("picture %lu: decode failed, status %d\n", (unsigned long)k, (int)ds); errors++; continue; }
+        decoded++;
+        if (k < nSrc) {
+            CVPixelBufferLockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
+            const uint8_t *sy = (const uint8_t *)src.bytes + k * frameSz, *suv = sy + (size_t)W * H;
+            double se[2] = { 0, 0 }; size_t cnt[2] = { 0, 0 };
+            for (int pl2 = 0; pl2 < 2; pl2++) {
+                const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, pl2); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, pl2);
+                const uint8_t *s = pl2 ? suv : sy; int rows = pl2 ? CH : H;
+                for (int r = 0; r < rows; r++) for (int c = 0; c < W; c++) { double df = (double)o[r * os + c] - s[r * W + c]; se[pl2] += df * df; cnt[pl2]++; }
+            }
+            double py = 10 * log10(255.0 * 255.0 / (se[0] / cnt[0] + 1e-9)), pc = 10 * log10(255.0 * 255.0 / (se[1] / cnt[1] + 1e-9));
+            sumY += py; sumC += pc; if (py < minY) minY = py; if (pc < minC) minC = pc;
+            if (verbose || samples.count <= 8) printf("picture %lu: %lu bytes, luma %.2f dB, chroma %.2f dB\n", (unsigned long)k, (unsigned long)sample.length, py, pc);
+            if (dump && k + 1 == samples.count) {
+                FILE *f = fopen(dump, "wb"); fprintf(f, "P5 %d %d 255\n", W, H);
+                const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, 0); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, 0);
+                for (int r = 0; r < H; r++) fwrite(o + r * os, 1, W, f); fclose(f);
+            }
+            CVPixelBufferUnlockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
+        }
+        CVPixelBufferRelease(out);
     }
-    if (argc > 5) {
-        FILE *f = fopen(argv[5], "wb"); fprintf(f, "P5 %d %d 255\n", W, H);
-        const uint8_t *o = CVPixelBufferGetBaseAddressOfPlane(out, 0); size_t os = CVPixelBufferGetBytesPerRowOfPlane(out, 0);
-        for (int r = 0; r < H; r++) fwrite(o + r * os, 1, W, f); fclose(f);
-    }
-    CVPixelBufferUnlockBaseAddress(out, kCVPixelBufferLock_ReadOnly);
-    double py = 10 * log10(255.0 * 255.0 / (se[0] / cnt[0] + 1e-9)), pc = 10 * log10(255.0 * 255.0 / (se[1] / cnt[1] + 1e-9));
-    printf("RESULT decoded %zux%zu, luma PSNR %.2f dB, chroma PSNR %.2f dB\n", CVPixelBufferGetWidth(out), CVPixelBufferGetHeight(out), py, pc);
-    return 0;
+    int m = decoded < (int)nSrc ? decoded : (int)nSrc;
+    printf("RESULT decoded %dx%d, luma PSNR %.2f dB, chroma PSNR %.2f dB (average of %d), min luma %.2f, min chroma %.2f, %d decode errors\n",
+           d.width, d.height, m ? sumY / m : 0, m ? sumC / m : 0, m, m ? minY : 0, m ? minC : 0, errors);
+    return errors ? 1 : 0;
 } }

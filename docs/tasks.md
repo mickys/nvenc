@@ -28,11 +28,11 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 
 | ID | Task | Done when | Status |
 |---|---|---|---|
-| T3.01 | Move the single-frame code into a library: `src/enc.c` (session: buffers, channel, picture setup) + `tools/encode1` on top of it | `encode1` gives the same result through `enc.c` | todo |
-| T3.02 | Two reconstructed pictures, ping-pong: frame n writes one, frame n+1 references it (`SET_IN_REF_PIC*`) | a P-frame encodes without engine errors | todo |
-| T3.03 | Frame numbering: `frame_num`, POC LSB, `l0` list, `pic_type`, `ref_pic_flag`, IDR only on frame 0 | a 2-frame IDR+P stream decodes | todo |
-| T3.04 | Per-frame state buffers: history and colocated data carried from frame to frame | no drift over 60 frames | todo |
-| T3.05 | `tools/encodeN`: N frames of moving synthetic content at constant QP; `h264check` decodes all frames, per-frame PSNR | 60 frames decode, PSNR ≥ 40 dB each | todo |
+| T3.01 | Move the single-frame code into a library: `src/enc.c` (session: buffers, channel, picture setup) + `tools/encode1` on top of it | `encode1` gives the same result through `enc.c` | done |
+| T3.02 | Two reconstructed pictures, ping-pong: frame n writes one, frame n+1 references it (`SET_IN_REF_PIC*`) | a P-frame encodes without engine errors | done |
+| T3.03 | Frame numbering: `frame_num`, POC LSB, `l0` list, `pic_type`, `ref_pic_flag`, IDR only on frame 0 | a 2-frame IDR+P stream decodes | done |
+| T3.04 | Per-frame state buffers: history and colocated data carried from frame to frame | no drift over 60 frames | done |
+| T3.05 | `tools/encodeN`: N frames of moving synthetic content at constant QP; `h264check` decodes all frames, per-frame PSNR | 60 frames decode, PSNR ≥ 40 dB each | done |
 | T3.06 | CBR: RC structure + `IN_RCDATA`/`IO_RC_PROCESS` buffers; measure the real bitrate | within ±10 % of the target over 60 frames | todo |
 | T3.07 | VBR (target + max bitrate) | average near target, peaks under max | todo |
 | T3.08 | Low-latency settings: no B-frames, infinite GOP, IDR on request, small VBV (one frame) | per-frame size stays near bitrate/fps | todo |
