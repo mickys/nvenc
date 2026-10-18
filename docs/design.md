@@ -53,7 +53,7 @@ instead of nullmoth's.
 | M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | **done** (2026-10-18): `src/enc.c` + `tools/encodeN`; 60-120 frame streams with 1-3 refs, CBR within ±5 %, one-frame-VBV low latency, 1-16 slices |
 | M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | **done** (2026-10-18): `vt/nvencvt.c` → `libnvencvt.dylib`, registered by the Metal plugin (`NVMTL_NVENCVT`, since 2026-10-18 the only plugin patch: nullmoth's closed encoder is no longer enabled before Blackwell); `vttest` and Parsec use it |
 | M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | **done** (2026-10-18): fast CPU tiling (4K 0.65 ms), event-driven completion, async encoding; **Parsec 4K encode latency 4.7-4.8 ms** (nullmoth's: ~10.5-12 ms) |
-| M6 | Two sessions (NVENC0/1), HEVC | **done** (2026-10-18): sessions spread over NVENC0/1; HEVC IDR + P + RC at every size, through VideoToolbox and Parsec (one reference) |
+| M6 | Two sessions (NVENC0/1), HEVC | **done** (2026-10-18): sessions spread over NVENC0/1; HEVC IDR + P (1-3 refs) + RC at every size, through VideoToolbox and Parsec |
 
 Step-by-step tasks for each milestone, with status and per-task reports: [tasks.md](tasks.md).
 
@@ -163,9 +163,10 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
   Reference slots 64 KB larger than the planes (as nullmoth's).
 - **`slice_control.slice_type` is numbered like `pic_type`** (0 P, 1 B, 2 I), not as the header comment says; with 1
   the first P picture faults.
-- **References**: `SET_IN_REF_PIC<i>` by position in list 0 (`poc_entry_l0[i] = i`), `l0[i]` = 2 x DPB slot; inline
-  short-term RPS per P slice. **Two or more references don't work yet** (reference 1 predicted differently; the
-  `dist_scale_factor` table helps but doesn't fix it): HEVC is clamped to one reference, as nullmoth's library uses.
+- **References**: `SET_IN_REF_PIC<i>` by position in list 0 (`poc_entry_l0[i] = i`), `l0[i]` = 2 x DPB slot,
+  `temp_dist_l0[i]` = POC distance (unused -1), `dist_scale_factor[td ref][tb ref]` = HEVC distScaleFactor (unused rows
+  -1), **`same_poc` = 8x8 bit matrix, diagonal set** (0x201 for two refs; nullmoth's 1 only works with one), inline
+  short-term RPS per P slice. 1-3 references work (T6.11).
 - Results: 4K QP 22/25 HEVC 30 Mbit/s at 50.2 dB vs H.264 52 Mbit/s at 48.7 dB, same encode time (~4.1 ms); CBR/VBR/
   low latency within 10 % of target; Parsec HEVC encode latency 4.4-5.3 ms at 4K.
 

@@ -85,3 +85,4 @@ first.
 | T6.08 | HEVC rate control (CBR/VBR/low-latency, reuse M3) | bitrate within 10 % of target | done |
 | T6.09 | HEVC through VideoToolbox: `hvc1` in `libnvencvt`; `vttest` HEVC; Parsec with HEVC | encoder used, decodes | done |
 | T6.10 | M6 notes, commit, overlay update | committed | done |
+| T6.11 | HEVC with 2-3 reference frames (T6.07 open point) | multi-reference streams decode | done |

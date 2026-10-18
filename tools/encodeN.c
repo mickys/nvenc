@@ -1,7 +1,7 @@
 // encodeN.c (milestone M3): encode N frames of moving synthetic NV12 content through src/enc.c (IDR + P, constant QP).
 //   ./encodeN [-v] [-hevc] W H N QP_I QP_P REFS out.h264|out.h265 out.nv12
 // Environment: IDR_PERIOD=<n> (an IDR every n frames), RC=<RCMODE> BITRATE=<bit/s> MAXRATE=<bit/s> VBV=<bits>,
-// SLICES=<n>.
+// SLICES=<n>, ENCN_STATIC=<n> (cycle through n fixed pictures).
 // Writes the Annex B stream (SPS + PPS once, then every picture) and all source frames for h264check.
 #include "enc.h"
 #include <math.h>
@@ -44,7 +44,9 @@ int main(int argc, char **argv)
     uint8_t *y = malloc((size_t)W * H), *uv = malloc((size_t)W * CH);
     double bits = 0, ms = 0, msMax = 0, bitsSteady = 0, pMax = 0; int fails = 0, nSteady = 0, qpMin = 99, qpMax = 0;
     for (int f = 0; f < N; f++) {
-        frame(y, uv, W, H, f);
+        // ENCN_STATIC=n: cycle through n fixed pictures (A B A B ... for n = 2), each very different from the next
+        int ns = getenv("ENCN_STATIC") ? atoi(getenv("ENCN_STATIC")) : 0;
+        frame(y, uv, W, H, ns > 0 ? (f % ns) * 37 : f);
         fwrite(y, 1, (size_t)W * H, fs); fwrite(uv, 1, (size_t)W * CH, fs);
         enc_load_nv12(&e, y, W, uv, W);
         EncFrame fr;

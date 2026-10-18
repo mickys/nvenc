@@ -25,9 +25,6 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->cfg = *cfg;
     if (e->cfg.num_refs < 1) e->cfg.num_refs = 1;
     if (e->cfg.num_refs > ENC_MAX_REFS) e->cfg.num_refs = ENC_MAX_REFS;
-    // HEVC: one active reference. With two or more the engine predicts reference 1 differently than the slice header and
-    // dist_scale_factor describe (2 refs: 13 dB, 25 dB with the scale factors; T6.07); nullmoth's library uses one too.
-    if (cfg->codec == ENC_HEVC) e->cfg.num_refs = 1;
     int W = cfg->width, H = cfg->height;
     e->wmb = (W + 15) / 16; e->hmb = (H + 15) / 16;
     Rm *rm = &e->rm; rm->verbose = cfg->verbose;
@@ -281,22 +278,27 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     pc->nal_unit_type = idr ? 19 : 1; pc->nuh_temporal_id_plus1 = 1; pc->e4byteStartCode = 1;
     pc->qpfifo = 1; pc->enable_source_image_padding = 1; pc->strips_in_frame = 1; pc->chroma_skip_threshold_4x4 = 8;
     pc->pic_order_cnt_lsb = (unsigned short)(e->sinceIdr & 0xff);
-    if (!idr) {   // inline short-term RPS: the references, most recent first, one POC apart (T6.07)
+    if (!idr) {   // inline short-term RPS: the references, most recent first, one POC apart (T6.07, T6.11)
         nvenc_h265_strps_s *rps = &pc->short_term_rps;
         rps->num_negative_pics = (short)nRefs;
+        memset(pc->temp_dist_l0, -1, sizeof pc->temp_dist_l0);                    // unused entries -1, as nullmoth's
+        for (int r = 1; r < 8; r++) for (int c2 = 0; c2 < 8; c2++) pc->dist_scale_factor[r][c2] = -1;   // unused rows -1
         for (int i = 0; i < nRefs; i++) {
-            pc->l0[i] = (char)(2 * e->slotOf[i]); pc->temp_dist_l0[i] = (char)(i + 1); pc->poc_entry_l0[i] = (char)i;
+            // l0: 2 x DPB slot; the picture itself goes to SET_IN_REF_PIC<i> (list position, poc_entry_l0[i] = i)
+            pc->l0[i] = (char)(2 * e->slotOf[i]); pc->poc_entry_l0[i] = (char)i; pc->temp_dist_l0[i] = (char)(i + 1);
             rps->delta_poc_s0_minus1[i] = 0; rps->used_by_curr_pic_s0_flag |= (unsigned short)(1u << i);
         }
-        if (nRefs < 8) pc->temp_dist_l0[nRefs] = -1;   // as nullmoth's: -1 after the last reference
-        // MV scaling between references (8.5.3.2.8): distScaleFactor = (tb * tx + 32) >> 6, tx = (16384 + td / 2) / td,
-        // stored [source td][target tb]; 256 = 1.0 (nullmoth's [0][0] with one reference)
+        // MV scaling between references (8.5.3.2.7): distScaleFactor = (tb * tx + 32) >> 6, tx = (16384 + td / 2) / td,
+        // stored [td reference][tb reference]; 256 = 1.0
         for (int i = 0; i < nRefs; i++) for (int j = 0; j < nRefs; j++) {
             int tb = i + 1, td = j + 1, tx = (16384 + td / 2) / td, f = (tb * tx + 32) >> 6;
             pc->dist_scale_factor[j][i] = (short)(f < -4096 ? -4096 : f > 4095 ? 4095 : f);
         }
-        pc->same_poc[0] = 1;
-        pc->diff_pic_order_cnt_zero[0] = 0xfefefefeu;  // as nullmoth's (B-only meaning)
+        // same_poc: an 8x8 bit matrix over pairs of references, bit i * 8 + j set when references i and j are the same
+        // picture (the diagonal: 0x201 for two). With only bit 0 (nullmoth's value for one reference) the engine scaled MVs
+        // between a reference and itself, and multi-reference streams decoded wrong (T6.11)
+        for (int i = 0; i < nRefs; i++) pc->same_poc[(i * 9) / 32] |= 1u << ((i * 9) % 32);
+        pc->diff_pic_order_cnt_zero[0] = pc->diff_pic_order_cnt_zero[1] = 0xfefefefeu;   // as nullmoth's
     }
     nvenc_h265_slice_control_s *sc = (void *)((NvU8 *)setup->cpu + OFF_SLICE);
     pc->num_forced_slices_minus1 = 0;
