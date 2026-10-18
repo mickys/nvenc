@@ -79,12 +79,12 @@ size_t hevc_write_sps(const HevcParams *p, uint8_t *out)
     ue(&b, 0); ue(&b, 3);                                       // min TB 4 (log2 - 2 = 0), max TB 32 (diff 3)
     ue(&b, 3); ue(&b, 3);                                       // max_transform_hierarchy_depth inter / intra
     put(&b, 0, 1);                                              // scaling_list_enabled_flag
-    put(&b, 1, 1); put(&b, 1, 1); put(&b, 0, 1);                // amp, sample_adaptive_offset, pcm
+    put(&b, p->no_amp ? 0 : 1, 1); put(&b, p->no_sao ? 0 : 1, 1); put(&b, 0, 1);   // amp, sample_adaptive_offset, pcm
     ue(&b, 1);                                                  // num_short_term_ref_pic_sets
     ue(&b, (unsigned)p->sps_rps_negative); ue(&b, 0);           // st_ref_pic_set(0): negative pictures, no positive
     for (int i = 0; i < p->sps_rps_negative; i++) { ue(&b, 0); put(&b, 0, 1); }   // delta_poc_s0_minus1 0, not used by curr
     put(&b, 0, 1);                                              // long_term_ref_pics_present_flag
-    put(&b, 0, 1); put(&b, 0, 1);                               // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    put(&b, 0, 1); put(&b, p->sis ? 1 : 0, 1);                  // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
     put(&b, p->vui ? 1 : 0, 1);
     if (p->vui) {                                               // E.2.1
         put(&b, 1, 1); put(&b, 1, 8);                           // aspect_ratio_info_present, aspect_ratio_idc 1 (square)
@@ -107,11 +107,11 @@ size_t hevc_write_pps(const HevcParams *p, uint8_t *out)
     Bw b; memset(&b, 0, sizeof b);
     ue(&b, 0); ue(&b, 0);                                       // pps id, sps id
     put(&b, 0, 1); put(&b, 0, 1); put(&b, 0, 3);                // dependent slices, output_flag_present, extra slice header bits
-    put(&b, 1, 1); put(&b, 1, 1);                               // sign_data_hiding, cabac_init_present
+    put(&b, p->no_sdh ? 0 : 1, 1); put(&b, 1, 1);               // sign_data_hiding, cabac_init_present
     ue(&b, (unsigned)(p->num_ref_idx_l0_default ? p->num_ref_idx_l0_default : 1) - 1); ue(&b, 0);   // l0 / l1 default active - 1
     se(&b, p->pic_init_qp - 26);
-    put(&b, 0, 1); put(&b, 1, 1);                               // constrained_intra_pred, transform_skip_enabled
-    put(&b, 1, 1); ue(&b, 0);                                   // cu_qp_delta_enabled, diff_cu_qp_delta_depth 0
+    put(&b, 0, 1); put(&b, p->no_ts ? 0 : 1, 1);                // constrained_intra_pred, transform_skip_enabled
+    put(&b, p->no_cqd ? 0 : 1, 1); if (!p->no_cqd) ue(&b, 0);   // cu_qp_delta_enabled, diff_cu_qp_delta_depth 0
     se(&b, 0); se(&b, 0); put(&b, 0, 1);                        // cb / cr qp offsets, slice chroma offsets present
     put(&b, 0, 1); put(&b, 0, 1); put(&b, 0, 1);                // weighted pred / bipred, transquant bypass
     put(&b, 0, 1); put(&b, 0, 1);                               // tiles, entropy coding sync

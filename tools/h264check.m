@@ -1,4 +1,4 @@
-// h264check.m: decode an Annex B H.264 stream with Apple's software decoder and compare every picture with the source
+// h264check.m: decode an Annex B H.264 or HEVC stream (told apart by the first NAL unit) with Apple's software decoder and compare every picture with the source
 // NV12 frames (tightly packed, concatenated). Lists the NAL units first (only the first 12 unless -v).
 //   ./h264check [-v] W H in.h264 src.nv12 [dump.pgm]      dump.pgm: luma of the last decoded picture
 #import <Foundation/Foundation.h>
@@ -26,23 +26,32 @@ int main(int argc, char **argv) { @autoreleasepool {
         } else i++;
     }
     if (start != SIZE_MAX && start < n) [nals addObject:[NSData dataWithBytes:p + start length:n - start]];
-    // one sample per picture: a slice with first_mb_in_slice == 0 (first bit after the header is 1) starts a new one
-    NSData *sps = nil, *pps = nil; NSMutableArray *samples = [NSMutableArray array]; int shown = 0;
+    // one sample per picture: a slice that starts a picture (H.264 first_mb_in_slice == 0, HEVC
+    // first_slice_segment_in_pic_flag: the first bit after the NAL header is 1) starts a new one
+    bool hevc = nals.count && ((((const uint8_t *)[nals[0] bytes])[0] >> 1) & 0x3f) == 32;   // starts with a VPS
+    NSData *vps = nil, *sps = nil, *pps = nil; NSMutableArray *samples = [NSMutableArray array]; int shown = 0;
     for (NSData *nal in nals) {
-        const uint8_t *b = nal.bytes; int t = b[0] & 0x1f;
+        const uint8_t *b = nal.bytes; int t = hevc ? (b[0] >> 1) & 0x3f : b[0] & 0x1f, hl = hevc ? 2 : 1;
         if (verbose || shown++ < 12) printf("NAL type %2d, %6lu bytes, header 0x%02x\n", t, (unsigned long)nal.length, b[0]);
-        if (t == 7) sps = nal; else if (t == 8) pps = nal;
-        else if (t == 1 || t == 5) {
-            if (!samples.count || (nal.length > 1 && (b[1] & 0x80))) [samples addObject:[NSMutableData data]];
+        bool slice = hevc ? t < 32 : (t == 1 || t == 5);
+        if (hevc ? t == 32 : false) vps = nal;
+        else if (t == (hevc ? 33 : 7)) sps = nal; else if (t == (hevc ? 34 : 8)) pps = nal;
+        else if (slice) {
+            if (!samples.count || ((int)nal.length > hl && (b[hl] & 0x80))) [samples addObject:[NSMutableData data]];
             uint32_t be = CFSwapInt32HostToBig((uint32_t)nal.length);
             [samples.lastObject appendBytes:&be length:4]; [samples.lastObject appendData:nal];
         }
     }
-    if (!sps || !pps || !samples.count) { printf("missing SPS/PPS/slices\n"); return 1; }
-    const uint8_t *ps[2] = { sps.bytes, pps.bytes }; size_t pl[2] = { sps.length, pps.length };
-    CMVideoFormatDescriptionRef fmt = NULL;
-    OSStatus st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &fmt);
-    if (st) { printf("format description from SPS/PPS -> %d\n", (int)st); return 1; }
+    if (!sps || !pps || (hevc && !vps) || !samples.count) { printf("missing parameter sets/slices\n"); return 1; }
+    CMVideoFormatDescriptionRef fmt = NULL; OSStatus st;
+    if (hevc) {
+        const uint8_t *ps[3] = { vps.bytes, sps.bytes, pps.bytes }; size_t pl[3] = { vps.length, sps.length, pps.length };
+        st = CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &fmt);
+    } else {
+        const uint8_t *ps[2] = { sps.bytes, pps.bytes }; size_t pl[2] = { sps.length, pps.length };
+        st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &fmt);
+    }
+    if (st) { printf("format description from the parameter sets -> %d\n", (int)st); return 1; }
     CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fmt);
     printf("SPS says %dx%d, %lu picture(s), %zu source frame(s)\n", d.width, d.height, (unsigned long)samples.count, nSrc);
     NSDictionary *spec = @{ (__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO };

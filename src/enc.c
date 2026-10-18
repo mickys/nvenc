@@ -2,6 +2,7 @@
 #include "enc.h"
 #include "blocklinear.h"
 #include "h264hdr.h"
+#include "hevchdr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,14 +32,18 @@ int enc_open(Enc *e, const EncConfig *cfg)
     rm->verbose = cfg->verbose;
     if (rm_va_init(rm)) return -1;
 
-    // input: NVENC's input layout (block_height 2); the engine reads 8-12 KB past the chroma plane, hence the slack
+    // input: NVENC's input layout (block_height 2); the engine reads 8-12 KB past the chroma plane, hence the slack.
+    // HEVC: planes cover whole 32-row CTBs (the engine pads the source to the CTB grid itself, but reads that far)
+    bool hevc = cfg->codec == ENC_HEVC;
+    size_t inRows = hevc ? (((size_t)e->hmb * 16 + 31) & ~(size_t)31) : (size_t)e->hmb * 16;
     e->pitch = ((size_t)e->wmb * 16 + 63) & ~(size_t)63;
-    e->lumaSz = (nvenc_in_plane_size(e->pitch, (size_t)e->hmb * 16) + 255) & ~(size_t)255;
-    e->chromaSz = nvenc_in_plane_size(e->pitch, (size_t)e->hmb * 8);
+    e->lumaSz = (nvenc_in_plane_size(e->pitch, inRows) + 255) & ~(size_t)255;
+    e->chromaSz = nvenc_in_plane_size(e->pitch, inRows / 2);
     // reconstructed pictures: block-linear block_height 2, rows rounded up to 32 (the engine writes that far)
     e->rPitch = ((size_t)e->wmb * 16 + 255) & ~(size_t)255;
     e->rLuma = (e->rPitch * (((size_t)e->hmb * 16 + 31) & ~(size_t)31) + 255) & ~(size_t)255;
     e->rSlot = (e->rLuma + e->rPitch * (((size_t)e->hmb * 8 + 31) & ~(size_t)31) + 0xffff) & ~(size_t)0xffff;
+    if (hevc) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
     int slots = e->cfg.num_refs + 1;
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
@@ -96,8 +101,27 @@ static H264Params hdr_params(const Enc *e)
         .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = 0, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
 }
 
+// ENC_HEVC_OFF=ts,cqd,sao,amp,sis: experiment switches (T6.05), applied to the headers and the engine setup alike
+static int hevc_off(const char *k) { const char *v = getenv("ENC_HEVC_OFF"); return v && strstr(v, k) != NULL; }
+
+static HevcParams hevc_params(const Enc *e)
+{
+    return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
+        .max_dec_pic_buffering = e->cfg.num_refs + 1 < 2 ? 2 : e->cfg.num_refs + 1, .sps_rps_negative = e->cfg.num_refs,
+        .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
+        .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
+        .no_ts = hevc_off("ts"), .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
+        .sis = hevc_off("sis") };
+}
+
 size_t enc_headers(Enc *e, uint8_t *out)
 {
+    if (e->cfg.codec == ENC_HEVC) {
+        HevcParams hp = hevc_params(e);
+        size_t n = hevc_write_vps(&hp, out);
+        n += hevc_write_sps(&hp, out + n);
+        return n + hevc_write_pps(&hp, out + n);
+    }
     H264Params hp = hdr_params(e);
     size_t n = h264_write_sps(&hp, out);
     return n + h264_write_pps(&hp, out + n);
@@ -156,6 +180,107 @@ static void setup_md(nvenc_h264_md_control_s *md, bool p)
     md->luma_residual_zero_eval = p ? 2 : 0;
 }
 
+// HEVC controls: the values nullmoth's libnvenc_hevc uses (docs/traces/vttest-hevc-256x128-controls.txt, T6.03/T6.05);
+// IDR and P pictures use the same ME, MD and quant controls.
+static void setup_me_hevc(nvenc_h264_me_control_s *me)
+{
+    me->refinement_mode = 1; me->refine_on_search_enable = 1; me->fps_mvcost = 1; me->sps_mvcost = 1; me->sps_cost_func = 1;
+    nvenc_h264_me_hint_cfg_s *h = &me->predsrc;
+    h->self_temporal_stamp_l0 = 1; h->self_temporal_stamp_l1 = 1; h->self_temporal_search = 1; h->self_temporal_enable = 1;
+    h->self_spatial_search = 1; h->self_spatial_enable = 1;
+    h->const_mv_stamp_l0 = 2; h->const_mv_stamp_l1 = 2; h->const_mv_search = 1; h->const_mv_enable = 1;
+    h->stamp_refidx1_stamp = 3; h->stamp_refidx2_stamp = 3; h->stamp_refidx3_stamp = 3;
+    nvenc_h264_me_stamp_s *sh = &me->shape0;
+    sh[0].bitmask[0] = 0xff0c0c00; sh[0].bitmask[1] = 0xc0c; sh[0].hor_adjust = 1;
+    sh[1].bitmask[0] = 0x1e1e0c00; sh[1].bitmask[1] = 0xc; sh[1].hor_adjust = 1; sh[1].ver_adjust = 1;
+    sh[2].bitmask[0] = 0xff0c0c00; sh[2].bitmask[1] = 0xc0c; sh[2].hor_adjust = 1;
+    sh[3].bitmask[0] = 0x1e0c0000; sh[3].bitmask[1] = 0xc; sh[3].hor_adjust = 1;
+    me->partDecisionMadeByFPP = 1; me->penalty_factor_FPP = 15; me->spatial_hint_pattern = 6; me->temporal_hint_pattern = 4;
+    me->Cu16partDecisionMadeByFPP = 1; me->fbm_op_winner_num_p_frame = 1; me->fbm_op_winner_num_b_frame_l0 = 1;
+    me->fbm_op_winner_num_b_frame_l1 = 1; me->fbm_select_best_cu32_parttype_num = 3; me->sps_evaluate_merge_cand_num = 3;
+    me->fps_quad_thresh_hold = 50; me->external_hint_order = 1; me->coloc_hint_order = 1;
+    me->hint_type0 = 0; me->hint_type1 = 1; me->hint_type2 = 2; me->hint_type3 = 3; me->hint_type4 = 4;
+}
+
+static void setup_md_hevc(nvenc_h265_md_control_s *md)
+{
+    md->h265_intra_luma4x4_mode_enable = md->h265_intra_luma8x8_mode_enable = 0x55555557;
+    md->h265_intra_luma16x16_mode_enable = md->h265_intra_luma32x32_mode_enable = 0x55555557;
+    md->h265_intra_luma_mode_enable_leftbits = 0xb6d;
+    md->cu16x16_part_2Nx2N_enable = 1; md->cu16x16_part_2NxN_enable = 1; md->cu16x16_part_Nx2N_enable = 1; md->cu16x16_part_NxN_enable = 1;
+    md->cu32x32_part_2Nx2N_enable = 1; md->cu32x32_part_2NxN_enable = 1; md->cu32x32_part_Nx2N_enable = 1;
+    md->cu32x32_part_2NxnU_enable = 1; md->cu32x32_part_2NxnD_enable = 1; md->cu32x32_part_nLx2N_enable = 1; md->cu32x32_part_nRx2N_enable = 1;
+    md->intra_mode_4x4_enable = 1; md->intra_mode_8x8_enable = 1; md->intra_mode_16x16_enable = 1; md->intra_mode_32x32_enable = 1;
+    md->h265_intra_chroma_mode_enable = 0x1f;
+    md->tusize_4x4_enable = 1; md->tusize_8x8_enable = 1; md->tusize_16x16_enable = 1; md->tusize_32x32_enable = 1;
+    md->pskip_enable = 1; md->mv_cost_enable = 1; md->ip_search_mode = 7; md->tu_search_num_cu16 = 2; md->tu_search_num_cu32 = 1;
+    md->intra_ssd_cnt_4x4 = 1; md->intra_ssd_cnt_8x8 = 1; md->intra_ssd_cnt_16x16 = 1; md->intra_ssd_cnt_32x32 = 1;
+}
+
+static void setup_q_hevc(nvenc_h265_quant_control_s *q)
+{
+    q->qpp_run_vector_4x4 = 0x56b; q->qpp_run_vector_8x8[0] = 0xaaff; q->qpp_run_vector_8x8[1] = 0xffaa; q->qpp_run_vector_8x8[2] = 0xf;
+    q->qpp_luma8x8_cost = 15; q->qpp_luma16x16_cost = 15; q->qpp_chroma_cost = 15;
+}
+
+// the H.265 picture setup (nvenc_h265_drv_pic_setup_s, 1024 bytes) and its controls
+static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
+{
+    int W = e->cfg.width, H = e->cfg.height;
+    nvenc_h265_drv_pic_setup_s *ps = setup->cpu;
+    ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
+    nvenc_h265_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
+        .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
+    nvenc_h265_surface_cfg_s rc = ic; rc.sfc_pitch = rc.sfc_pitch_chroma = (unsigned short)e->rPitch;
+    // nullmoth's sets the field offsets of the reference/output surfaces to half a plane (unused in frame mode)
+    rc.luma_bot_offset = (unsigned)(e->rLuma / 2 / 256); rc.chroma_bot_offset = (unsigned)(e->rLuma / 4 / 256);
+    ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
+    nvenc_h265_sps_data_s *sp = &ps->sps_data;
+    sp->chroma_format_idc = 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = 1; sp->max_cu_size = 2;
+    sp->min_tu_size = 0; sp->max_tu_size = 3; sp->max_transform_depth_inter = 3; sp->max_transform_depth_intra = 3;
+    HevcParams hp = hevc_params(e);
+    sp->amp_enabled_flag = !hp.no_amp; sp->num_short_term_ref_pic_sets = 1; sp->sample_adaptive_offset_enabled_flag = !hp.no_sao;
+    sp->strong_intra_smoothing_enabled_flag = hp.sis ? 1 : 0;
+    nvenc_h265_pps_data_s *pp = &ps->pps_data;   // matches hevc_write_pps()
+    pp->num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1); pp->transform_skip_enabled_flag = !hp.no_ts;
+    pp->pps_loop_filter_across_slices_enabled_flag = 1; pp->cu_qp_delta_enabled_flag = !hp.no_cqd; pp->cabac_init_present_flag = 1;
+    pp->sign_data_hiding_enabled_flag = !hp.no_sdh;
+    nvenc_h265_rc_s *r = &ps->rate_control;
+    r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
+    for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
+    r->framerate = e->cfg.fps; r->gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
+
+    int ctbW = (W + 31) / 32, ctbH = (H + 31) / 32, ctbs = ctbW * ctbH, lg = 0;
+    while ((1 << lg) < ctbs) lg++;
+    nvenc_h265_pic_control_s *pc = &ps->pic_control;
+    memset(pc->l0, -2, sizeof pc->l0); memset(pc->l1, -2, sizeof pc->l1);
+    memset(pc->poc_entry_l0, -1, sizeof pc->poc_entry_l0); memset(pc->poc_entry_l1, -1, sizeof pc->poc_entry_l1);
+    pc->pic_output_flag = 1;
+    pc->slice_control_offset = OFF_SLICE; pc->me_control_offset = OFF_ME; pc->md_control_offset = OFF_MD; pc->q_control_offset = OFF_Q;
+    pc->hist_buf_size = (unsigned)e->hist.size; pc->bitstream_buf_size = (unsigned)bs->size;
+    pc->pic_type = idr ? 3 : 0; pc->ref_pic_flag = 1; pc->slice_mode = 0;
+    pc->codec = 5; pc->ceil_log2_pic_size_in_ctbs = (unsigned)lg; pc->sao_luma_mode = hp.no_sao ? 0 : 31; pc->sao_chroma_mode = hp.no_sao ? 0 : 31;
+    pc->nal_unit_type = idr ? 19 : 1; pc->nuh_temporal_id_plus1 = 1; pc->e4byteStartCode = 1;
+    pc->qpfifo = 1; pc->enable_source_image_padding = 1; pc->strips_in_frame = 1; pc->chroma_skip_threshold_4x4 = 8;
+    pc->pic_order_cnt_lsb = (unsigned short)(e->sinceIdr & 0xff);
+    if (!idr) {   // inline short-term RPS: the references, most recent first, one POC apart (T6.07)
+        nvenc_h265_strps_s *rps = &pc->short_term_rps;
+        rps->num_negative_pics = (short)nRefs;
+        for (int i = 0; i < nRefs; i++) {
+            pc->l0[i] = (char)(2 * e->slotOf[i]); pc->temp_dist_l0[i] = (char)(i + 1); pc->poc_entry_l0[i] = (char)i;
+            rps->delta_poc_s0_minus1[i] = 0; rps->used_by_curr_pic_s0_flag |= (unsigned short)(1u << i);
+        }
+        pc->dist_scale_factor[0][0] = 256; pc->same_poc[0] = 1;
+    }
+    nvenc_h265_slice_control_s *sc = (void *)((NvU8 *)setup->cpu + OFF_SLICE);
+    pc->num_forced_slices_minus1 = 0;
+    sc->num_ctus = (unsigned)ctbs; sc->qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc->slice_type = idr ? 2 : 1;
+    sc->slice_loop_filter_across_slices_enabled_flag = 1; sc->slice_sao_luma_flag = !hp.no_sao; sc->slice_sao_chroma_flag = !hp.no_sao;
+    setup_me_hevc((void *)((NvU8 *)setup->cpu + OFF_ME));
+    setup_md_hevc((void *)((NvU8 *)setup->cpu + OFF_MD));
+    setup_q_hevc((void *)((NvU8 *)setup->cpu + OFF_Q));
+}
+
 int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
 {
     Chan *c = &e->chan;
@@ -170,6 +295,9 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
 
     // ---- picture setup ----
     memset(setup->cpu, 0, SETUP_SIZE);
+    bool hevc = e->cfg.codec == ENC_HEVC;
+    if (hevc) { setup_hevc(e, setup, bs, idr, nRefs); goto methods; }
+    {
     nvenc_h264_drv_pic_setup_s *ps = setup->cpu;
     ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
     nvenc_h264_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
@@ -223,26 +351,30 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
 
     setup_me((void *)((NvU8 *)setup->cpu + OFF_ME), !idr);
     setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr);
+    }
 
     // ---- methods ----
+methods:
     if (chan_push_used(c) > 0x8000) chan_rewind(c);
     NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot;
     NvU64 inVa = e->extInput ? e->extInput : in->gpu;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
-    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
-    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
+    // HEVC: application ID 3 and codec type 4 (not in clc9b7.h; seen in nullmoth's library, T6.03)
+    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, hevc ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H265 : (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
+    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, hevc ? 4u : NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
               DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     struct { NvU32 m; NvU64 a; } bm[] = {
         { NVC9B7_SET_IN_DRV_PIC_SETUP, setup->gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
-        { NVC9B7_SET_OUT_COLOC_DATA, e->coloc.gpu }, { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
+        { hevc ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc ? recOut : e->coloc.gpu },   // HEVC: no colocated data
+        { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
         { NVC9B7_SET_OUT_ENC_STATUS, status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, bs->gpu },
         { NVC9B7_SET_IN_CUR_PIC, inVa }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, inVa + e->lumaSz },
         { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, inVa + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
         { NVC9B7_SET_IN_RCDATA, e->rcdata.gpu } };
     for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
     if (!idr) {
-        chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));
+        if (!hevc) chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));
         chan_mthd(c, 0, NVC9B7_SET_IN_MEPRED_DATA, 1, (NvU32)(meIn->gpu >> 8));
         chan_mthd(c, 0, NVC9B7_SET_OUT_MEPRED_DATA, 1, (NvU32)(meOut->gpu >> 8));
         for (int i = 0; i < nRefs; i++) {

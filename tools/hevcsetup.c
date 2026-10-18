@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nvenc_drv.h"
+#include "nvencdump.h"
 
 static unsigned char A[32768], B[32768]; static int two;
 static char line[256];
@@ -81,6 +82,13 @@ int main(int argc, char **argv)
     struct { const char *n; unsigned off, size; } ctl[] = { { "me_control", c->me_control_offset, sizeof(nvenc_h264_me_control_s) },
         { "md_control", c->md_control_offset, sizeof(nvenc_h265_md_control_s) }, { "q_control", c->q_control_offset, sizeof(nvenc_h265_quant_control_s) },
         { "slice_control", c->slice_control_offset, sizeof(nvenc_h265_slice_control_s) } };
+    if (getenv("RAW") == NULL) {   // by field (scripts/structdump.py)
+        if (c->me_control_offset) { printf("me_control @0x%x:\n", c->me_control_offset); dump_nvenc_h264_me_control_s((void *)(A + c->me_control_offset), two ? (void *)(B + d->me_control_offset) : NULL, ""); }
+        if (c->md_control_offset) { printf("md_control @0x%x:\n", c->md_control_offset); dump_nvenc_h265_md_control_s((void *)(A + c->md_control_offset), two ? (void *)(B + d->md_control_offset) : NULL, ""); }
+        if (c->q_control_offset) { printf("q_control @0x%x:\n", c->q_control_offset); dump_nvenc_h265_quant_control_s((void *)(A + c->q_control_offset), two ? (void *)(B + d->q_control_offset) : NULL, ""); }
+        if (c->slice_control_offset) { printf("slice_control @0x%x:\n", c->slice_control_offset); dump_nvenc_h265_slice_control_s((void *)(A + c->slice_control_offset), two ? (void *)(B + d->slice_control_offset) : NULL, ""); }
+        return 0;
+    }
     for (int k = 0; k < 4; k++) {
         if (!ctl[k].off || ctl[k].off + ctl[k].size > sizeof A) { printf("%s: none\n", ctl[k].n); continue; }
         printf("%s @0x%x (%u B):", ctl[k].n, ctl[k].off, ctl[k].size);

@@ -1,7 +1,8 @@
 // hevchdr.h: HEVC VPS/SPS/PPS NAL units (ITU-T H.265 7.3.2.1-7.3.2.3), matching what we tell NVENC in
 // nvenc_h265_sps_data_s / nvenc_h265_pps_data_s, so the slice segments the engine writes decode against them.
 // Values follow what nullmoth's libnvenc_hevc writes (docs/reports/T6.03.md): Main profile, CTB 32, CB 16..32,
-// TB 4..32, AMP + SAO, one short-term RPS in the SPS (slices send their own), no temporal MVP.
+// TB 4..32, AMP + SAO, one short-term RPS in the SPS (slices send their own), no temporal MVP. Unlike nullmoth's, no
+// sign data hiding (no_sdh): NVENC does not apply it, and a PPS that signals it makes every residual decode wrong (T6.05).
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -16,6 +17,7 @@ typedef struct {
     int pic_init_qp;                // 26 + init_qp_minus26
     int vui;                        // write VUI: square pixels, BT.709 colour description
     int full_range;                 // VUI video_full_range_flag
+    int no_sdh, no_ts, no_cqd, no_sao, no_amp, sis;   // experiments (T6.05): coding tools off (sis: strong intra smoothing on)
 } HevcParams;
 
 int hevc_level_for(int width, int height);   // smallest Main-tier level for this size at 60 fps

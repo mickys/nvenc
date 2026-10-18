@@ -1,4 +1,4 @@
-// enc.h: an H.264 encode session on one NVENC engine: buffers, channel, picture setup per frame, IDR and P pictures,
+// enc.h: an H.264 or HEVC encode session on one NVENC engine: buffers, channel, picture setup per frame, IDR and P pictures,
 // rate control, slices. enc_encode() is synchronous; enc_submit()/enc_wait() keep up to `depth` frames in flight. Structures: NVIDIA open-gpu-doc
 // nvenc_drv.h / clc9b7.h; what the docs leave out is in docs/design.md ("M2 notes", "M3 notes").
 #pragma once
@@ -9,8 +9,11 @@
 #define ENC_MAX_SLICES 16
 #define ENC_MAX_DEPTH 3
 
+enum { ENC_H264 = 0, ENC_HEVC = 1 };
+
 typedef struct {
-    int width, height;              // display size; coded size is whole macroblocks
+    int codec;                      // ENC_H264 or ENC_HEVC
+    int width, height;              // display size; coded size is whole macroblocks (H.264) / 16-pixel CBs (HEVC)
     int qp_i, qp_p;                 // constant QP for I/IDR and P pictures
     int num_refs;                   // L0 reference frames, 1..ENC_MAX_REFS
     int engine;                     // 0 = NVENC0, 1 = NVENC1
@@ -59,7 +62,7 @@ typedef struct {
 
 int  enc_open(Enc *e, const EncConfig *cfg);                    // 0 = ok
 void enc_close(Enc *e);
-size_t enc_headers(Enc *e, uint8_t *out);                       // SPS + PPS, Annex B (~64 bytes)
+size_t enc_headers(Enc *e, uint8_t *out);                       // SPS + PPS (HEVC: VPS + SPS + PPS), Annex B (~64 / ~96 bytes)
 // copy an NV12 frame (pitch-linear planes) into the next frame's input surface (needs enc_inflight() < depth)
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride);
 // convert a BGRA frame (BT.709 video range) into the next frame's input surface
