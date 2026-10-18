@@ -16,6 +16,8 @@ typedef struct {
     int width, height;              // display size; coded size is whole macroblocks (H.264) / 16-pixel CBs (HEVC)
     int qp_i, qp_p;                 // constant QP for I/IDR and P pictures
     int num_refs;                   // L0 reference frames, 1..ENC_MAX_REFS
+    int dpb_extra;                  // extra pictures announced in the HEVC VPS/SPS decoded picture buffer size, 0..2
+                                    // (refs + 1 + 2 <= 6 = the smallest MaxDpbSize of any level)
     int engine;                     // 0 = NVENC0, 1 = NVENC1
     int idr_period;                 // 0 = only the first picture (and enc_encode(force_idr))
     int rc_mode;                    // SET_CONTROL_PARAMS RCMODE: 0 const QP, 1 VBR, 2 CBR, 17/18 MB-row VBR/CBR

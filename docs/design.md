@@ -167,6 +167,9 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
   `temp_dist_l0[i]` = POC distance (unused -1), `dist_scale_factor[td ref][tb ref]` = HEVC distScaleFactor (unused rows
   -1), **`same_poc` = 8x8 bit matrix, diagonal set** (0x201 for two refs; nullmoth's 1 only works with one), inline
   short-term RPS per P slice. 1-3 references work (T6.11).
+- **Announce spare DPB pictures**: with `max_dec_pic_buffering` = refs + 1, a hardware decoder (AMD Polaris, macOS
+  Sonoma) overwrote references still in use (ghosting on moving windows) while software decoders were bit-exact;
+  `libnvencvt` announces refs + 3 (T6.12).
 - Results: 4K QP 22/25 HEVC 30 Mbit/s at 50.2 dB vs H.264 52 Mbit/s at 48.7 dB, same encode time (~4.1 ms); CBR/VBR/
   low latency within 10 % of target; Parsec HEVC encode latency 4.4-5.3 ms at 4K.
 

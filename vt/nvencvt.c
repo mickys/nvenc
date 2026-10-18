@@ -217,15 +217,21 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 static void *completion(void *arg);
 static OSStatus open_encoder(State *s)
 {
-    // reference frames: ReferenceBufferCount if the client set it, else NVENCVT_REFS, else 1 (3 gave a Parsec client ghosting
-    // on moving windows, 2026-10-18, under investigation). Pictures that come
-    // back (window switching, blinking content) cost far less with more references: 1080p, three pictures cycling, HEVC:
+    // reference frames: ReferenceBufferCount if the client set it, else NVENCVT_REFS, else 3. Pictures that come back
+    // (window switching, blinking content) cost far less with more references: 1080p, three pictures cycling, HEVC:
     // 27.8 Mbit/s with one, 1.7 with three (T6.11); steady motion about -2 %, +0.1 ms per frame. No reordering, no added latency.
-    int refs = s->refs > 0 ? s->refs : getenv("NVENCVT_REFS") ? atoi(getenv("NVENCVT_REFS")) : 1;
+    int refs = s->refs > 0 ? s->refs : getenv("NVENCVT_REFS") ? atoi(getenv("NVENCVT_REFS")) : 3;
     { FILE *rf = fopen("/tmp/nvencvt.refs", "r"); int v = 0;   // diagnostics: overrides everything, read at each session start
       if (rf) { if (fscanf(rf, "%d", &v) == 1 && v > 0) refs = v; fclose(rf); } }
     refs = refs < 1 ? 1 : refs > ENC_MAX_REFS ? ENC_MAX_REFS : refs;
-    EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .fps = s->fps > 0 ? s->fps : 60,
+    // HEVC: announce 2 pictures more than the references need in the VPS/SPS DPB size. With exactly refs + 1, a hardware
+    // decoder (AMD Polaris through macOS Sonoma, Parsec client) overwrote references still in use: moving windows showed
+    // content ahead of the background (T6.12). NVENCVT_DPB_EXTRA or /tmp/nvencvt.dpb (0..2) override.
+    int dpb_extra = getenv("NVENCVT_DPB_EXTRA") ? atoi(getenv("NVENCVT_DPB_EXTRA")) : 2;
+    { FILE *df = fopen("/tmp/nvencvt.dpb", "r"); int v = 0;
+      if (df) { if (fscanf(df, "%d", &v) == 1 && v >= 0) dpb_extra = v; fclose(df); } }
+    dpb_extra = dpb_extra < 0 ? 0 : dpb_extra > 2 ? 2 : dpb_extra;
+    EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0 };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
@@ -256,7 +262,7 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s encoder open on NVENC%d: %dx%d refs %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", c.engine, c.width, c.height, c.num_refs,
+    LOG("%s encoder open on NVENC%d: %dx%d refs %d dpb+%d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", c.engine, c.width, c.height, c.num_refs, c.dpb_extra,
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;

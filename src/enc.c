@@ -108,7 +108,7 @@ static int hevc_off(const char *k) { const char *v = getenv("ENC_HEVC_OFF"); ret
 static HevcParams hevc_params(const Enc *e)
 {
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
-        .max_dec_pic_buffering = e->cfg.num_refs + 1 < 2 ? 2 : e->cfg.num_refs + 1, .sps_rps_negative = e->cfg.num_refs,
+        .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
         .no_ts = hevc_off("ts"), .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
