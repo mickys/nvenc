@@ -51,7 +51,7 @@ instead of nullmoth's.
 | M1 | "Hello NVENC": VA space, GPFIFO channel on NVENC0, NVC9B7 object, push buffer with NOP + semaphore release, doorbell | **done**: `tools/hello` — host and NVENC semaphores written ~12 µs after the doorbell, on NVENC0 and NVENC1 |
 | M2 | One H.264 IDR frame: block-linear input surface, picture setup, bitstream + status buffers, our SPS/PPS | **done** (2026-10-18): `tools/encode1`, 256x128 to 3840x2160 (and 3840x2025) decode at ≥ 45.8 dB luma, QP 26 |
 | M3 | P-frames: reference/reconstructed pictures, frame numbering, RC modes (CBR/VBR, low latency), slices | **done** (2026-10-18): `src/enc.c` + `tools/encodeN`; 60-120 frame streams with 1-3 refs, CBR within ±5 %, one-frame-VBV low latency, 1-16 slices |
-| M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | `vttest` and ffmpeg's `h264_videotoolbox` use it |
+| M4 | VideoToolbox encoder plugin: probe the encoder vtable black-box, implement start/encode/complete/properties | **done** (2026-10-18): `vt/nvencvt.c` → `libnvencvt.dylib`, registered by the Metal plugin (`NVMTL_NVENC_IMPL=nvenc`); `vttest` uses it (Parsec: pending a restart) |
 | M5 | GPU-resident input: IOSurface -> block-linear on the GPU; event-driven completion instead of spinning | Parsec 4K encode time well under today's ~9 ms |
 | M6 | Two sessions (NVENC0/1), HEVC | Sunshine-style double sessions; HEVC decodes |
 
@@ -116,3 +116,16 @@ with an RTX 4090 has not reproduced here in hundreds of encodes.
 - **Slices:** `slice_mode` 0 with one slice control per slice. `slice_mode` 1 hangs the engine. `max_slice_size`
   has no effect yet.
 - Speed: 1080p P-frames ~1.0 ms, 4K ~4 ms (doorbell to semaphore, spin wait).
+
+## M4 notes (details in docs/vt-encoder.md, docs/reports/T4.*)
+
+- The encoder plugin interface: factory `(codec, allocator, &obj)`, a CMBaseObject whose vtable's third pointer is a
+  **4-byte-packed** encoder class with startSession / encodeFrame / completeFrames / copySupportedPropertyDictionary;
+  properties via the CMBaseObject set/copyProperty; output with `VTEncoderSessionEmitEncodedFrame`.
+- `libnvencvt.dylib` asks for NV12 (VideoToolbox converts BGRA), opens `enc.c` on the first frame, emits AVCC samples
+  synchronously. AverageBitRate → MB-row CBR (2-frame VBV in real-time mode).
+- Each session opens its own RM client: `rm_open` must close the fds its connections are bound to (it didn't, and
+  sessions failed after 121), and CPU mappings are released NVK's way (`rm_unmap_cpu`).
+- In the plugin bundle the dylib needs a real ad-hoc signature (`codesign -f -s -`) before the bundle is re-signed.
+- Remaining CPU cost per frame: VideoToolbox's BGRA→NV12 conversion (when the app hands BGRA), our CPU tiling, and
+  the spin-wait. M5 removes the last two.

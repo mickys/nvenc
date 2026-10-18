@@ -50,8 +50,8 @@ The milestones of [design.md](design.md), split into small steps. Each step that
 | T4.05 | Encode frame: CVPixelBuffer (NV12/BGRA) -> CPU tiling into the input surface -> `enc.c` | the engine encodes frames from VideoToolbox | done |
 | T4.06 | Output: CMSampleBuffer with avcC format description (our SPS/PPS), AVCC length prefixes, keyframe attachments | `vttest` decodes the output | done |
 | T4.07 | Flush/complete frames, invalidate, error paths | clean session teardown, no leaks over 1000 sessions | done |
-| T4.08 | Register through the Metal plugin instead of nullmoth's factory, per process (existing knob) | Parsec and ffmpeg `h264_videotoolbox` use it | todo |
-| T4.09 | M4 notes, commit | committed | todo |
+| T4.08 | Register through the Metal plugin instead of nullmoth's factory, per process (existing knob) | Parsec and ffmpeg `h264_videotoolbox` use it | done (vttest through the plugin; Parsec waits for a parsecd restart) |
+| T4.09 | M4 notes, commit | committed | done |
 
 ## M5: GPU-resident input, event-driven completion
 
