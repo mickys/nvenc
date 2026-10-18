@@ -65,7 +65,7 @@ first.
 |---|---|---|---|
 | T5.01 | Measure the per-frame cost: CPU tiling vs engine (`tools/tilebench`) | numbers for 1080p and 4K | done |
 | T5.02 | Fast tiling: SSE/AVX2 tile writes (64x16 tiles), optionally split over threads | 4K tiling ≤ 1 ms | done |
-| T5.03 | Asynchronous encode: submit frame n and return; emit when the engine is done (output thread), so tiling of n+1 overlaps encoding of n | throughput limited by the engine, not CPU + engine | todo |
+| T5.03 | Asynchronous encode: submit frame n and return; emit when the engine is done (output thread), so tiling of n+1 overlaps encoding of n | throughput limited by the engine, not CPU + engine | done |
 | T5.04 | Event-driven completion: RM event / semaphore wake instead of spinning | encode thread sleeps while the engine works | done |
 | T5.05 | Measure Parsec 4K: time per frame inside our encoder (needs a parsecd restart: user) | well under ~9 ms | todo |
 | T5.06 | GPU swizzle (later): Metal compute pass from the IOSurface into NVENC's layout, memory shared with our RM client | no CPU pass over the frame | todo |

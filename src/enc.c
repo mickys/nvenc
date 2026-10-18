@@ -43,11 +43,15 @@ int enc_open(Enc *e, const EncConfig *cfg)
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
     size_t meSz = (mbs * 64 + 0xffff) & ~(size_t)0xffff;   // ME predictor data per MB (the reference client uses 4 MB at any size)
-    if (rm_mem_alloc(rm, &e->in, e->lumaSz + e->chromaSz + (64 << 10), 0x1000, true, true, true) ||
-        rm_mem_alloc(rm, &e->recon, e->rSlot * (size_t)slots, 0x10000, false, false, true) ||
-        rm_mem_alloc(rm, &e->setup, SETUP_SIZE, 0x1000, true, true, true) ||
-        rm_mem_alloc(rm, &e->bs, (mbs * 384 + (1 << 20) + 0xffff) & ~(size_t)0xffff, 0x1000, true, true, true) ||
-        rm_mem_alloc(rm, &e->status, 0x10000, 0x1000, true, true, true) ||
+    if (e->cfg.depth < 1) e->cfg.depth = 1;
+    if (e->cfg.depth > ENC_MAX_DEPTH) e->cfg.depth = ENC_MAX_DEPTH;
+    for (int d = 0; d < e->cfg.depth; d++)
+        if (rm_mem_alloc(rm, &e->in[d], e->lumaSz + e->chromaSz + (64 << 10), 0x1000, true, true, true) ||
+            rm_mem_alloc(rm, &e->setup[d], SETUP_SIZE, 0x1000, true, true, true) ||
+            rm_mem_alloc(rm, &e->bs[d], (mbs * 384 + (1 << 20) + 0xffff) & ~(size_t)0xffff, 0x1000, true, true, true) ||
+            rm_mem_alloc(rm, &e->status[d], 0x10000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
+        else memset(e->in[d].cpu, 0, e->in[d].size);
+    if (rm_mem_alloc(rm, &e->recon, e->rSlot * (size_t)slots, 0x10000, false, false, true) ||
         rm_mem_alloc(rm, &e->hist, histSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->coloc, (mbs * 64 + 0xffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[0], meSz, 0x1000, false, false, true) ||
@@ -55,7 +59,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
         rm_mem_alloc(rm, &e->rcproc, 0x10000, 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->rcdata, 0x10000, 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
-    memset(e->in.cpu, 0, e->in.size); memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
+    memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
     ((volatile NvU32 *)e->sem.cpu)[0] = 0;
     if (!e->cfg.fps) e->cfg.fps = 60;
     if (!e->cfg.vbv_bits) e->cfg.vbv_bits = e->cfg.bitrate;
@@ -76,9 +80,12 @@ void enc_close(Enc *e)
 {
     if (e->ev.h) rm_event_close(&e->rm, &e->ev);
     chan_destroy(&e->chan);
-    RmMem *m[] = { &e->in, &e->recon, &e->setup, &e->bs, &e->status, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem,
-                   &e->rcproc, &e->rcdata };
+    RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
+    for (int d = 0; d < ENC_MAX_DEPTH; d++) {
+        RmMem *pm[] = { &e->in[d], &e->setup[d], &e->bs[d], &e->status[d] };
+        for (int i = 0; i < 4; i++) if (pm[i]->hPhys) rm_mem_free(&e->rm, pm[i]);
+    }
     rm_close(&e->rm);
 }
 
@@ -98,8 +105,9 @@ size_t enc_headers(Enc *e, uint8_t *out)
 
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride)
 {
-    nvenc_in_tile_plane(e->in.cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
-    nvenc_in_tile_plane((uint8_t *)e->in.cpu + e->lumaSz, uv, uvStride, (size_t)e->cfg.width, (size_t)(e->cfg.height + 1) / 2, e->pitch);
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    nvenc_in_tile_plane(in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
+    nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)e->cfg.width, (size_t)(e->cfg.height + 1) / 2, e->pitch);
 }
 
 // ME control: predictor sources, search stamps and FBM settings as the reference client sets them (docs/traces,
@@ -142,19 +150,21 @@ static void setup_md(nvenc_h264_md_control_s *md, bool p)
     md->luma_residual_zero_eval = p ? 2 : 0;
 }
 
-int enc_encode(Enc *e, bool force_idr, EncFrame *out)
+int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
 {
-    memset(out, 0, sizeof *out);
     Chan *c = &e->chan;
-    int W = e->cfg.width, H = e->cfg.height;
-    bool idr = force_idr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period);
+    int W = e->cfg.width, H = e->cfg.height, ds = (int)(e->seq % (NvU32)e->cfg.depth);
+    RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
+    if (enc_inflight(e) >= e->cfg.depth) return -1;
+    bool idr = force_idr || e->forceIdr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period);
+    e->forceIdr = false;
     if (idr) { e->frame_num = 0; e->sinceIdr = 0; e->nRefs = 0; }
     int slot = e->nextSlot;                                   // where this picture's reconstruction goes
     int nRefs = idr ? 0 : e->nRefs;
 
     // ---- picture setup ----
-    memset(e->setup.cpu, 0, SETUP_SIZE);
-    nvenc_h264_drv_pic_setup_s *ps = e->setup.cpu;
+    memset(setup->cpu, 0, SETUP_SIZE);
+    nvenc_h264_drv_pic_setup_s *ps = setup->cpu;
     ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
     nvenc_h264_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
         .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
@@ -190,7 +200,7 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     for (int i = 0; i < nRefs; i++) { pc->l0[i] = (char)(2 * e->slotOf[i]); pc->temp_dist_l0[i] = (char)(i + 1); }   // field-indexed DPB slots
     pc->frame_num = (unsigned short)e->frame_num; pc->pic_order_cnt_lsb = (unsigned short)(2 * e->sinceIdr);
     pc->slice_control_offset = OFF_SLICE; pc->me_control_offset = OFF_ME; pc->md_control_offset = OFF_MD; pc->q_control_offset = OFF_Q;
-    pc->hist_buf_size = (unsigned)e->hist.size; pc->bitstream_buf_size = (unsigned)e->bs.size;
+    pc->hist_buf_size = (unsigned)e->hist.size; pc->bitstream_buf_size = (unsigned)bs->size;
     pc->pic_type = idr ? 3 : 0; pc->ref_pic_flag = 1; pc->cabac_zero_word_enable = 1; pc->e4byteStartCode = 1;
     pc->slice_mode = 0;   // 1 hangs the engine (T2.05e); one control with all MBs = one slice
 
@@ -198,15 +208,15 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     int nsl = e->cfg.slices < 1 ? 1 : e->cfg.slices > ENC_MAX_SLICES ? ENC_MAX_SLICES : e->cfg.slices;
     if (nsl > e->hmb) nsl = e->hmb;
     pc->num_forced_slices_minus1 = (unsigned char)(nsl - 1);
-    nvenc_h264_slice_control_s *sc = (void *)((NvU8 *)e->setup.cpu + OFF_SLICE);
+    nvenc_h264_slice_control_s *sc = (void *)((NvU8 *)setup->cpu + OFF_SLICE);
     for (int k = 0; k < nsl; k++) {
         int mb = ((k + 1) * e->hmb / nsl - k * e->hmb / nsl) * e->wmb;   // rows spread evenly
         sc[k].num_mb = (unsigned)mb; sc[k].qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc[k].qp_slice_min = 0; sc[k].qp_slice_max = 51;
         if (!idr) { sc[k].num_ref_idx_active_override_flag = 1; sc[k].num_ref_idx_l0_active_minus1 = (unsigned)(nRefs - 1); }
     }
 
-    setup_me((void *)((NvU8 *)e->setup.cpu + OFF_ME), !idr);
-    setup_md((void *)((NvU8 *)e->setup.cpu + OFF_MD), !idr);
+    setup_me((void *)((NvU8 *)setup->cpu + OFF_ME), !idr);
+    setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr);
 
     // ---- methods ----
     if (chan_push_used(c) > 0x8000) chan_rewind(c);
@@ -217,11 +227,11 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
               DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     struct { NvU32 m; NvU64 a; } bm[] = {
-        { NVC9B7_SET_IN_DRV_PIC_SETUP, e->setup.gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
+        { NVC9B7_SET_IN_DRV_PIC_SETUP, setup->gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
         { NVC9B7_SET_OUT_COLOC_DATA, e->coloc.gpu }, { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
-        { NVC9B7_SET_OUT_ENC_STATUS, e->status.gpu }, { NVC9B7_SET_OUT_BITSTREAM, e->bs.gpu },
-        { NVC9B7_SET_IN_CUR_PIC, e->in.gpu }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, e->in.gpu + e->lumaSz },
-        { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, e->in.gpu + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
+        { NVC9B7_SET_OUT_ENC_STATUS, status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, bs->gpu },
+        { NVC9B7_SET_IN_CUR_PIC, in->gpu }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, in->gpu + e->lumaSz },
+        { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, in->gpu + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
         { NVC9B7_SET_IN_RCDATA, e->rcdata.gpu } };
     for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
     if (!idr) {
@@ -246,35 +256,13 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
                   DRF_DEF(C56F, _SEM_EXECUTE, _OPERATION, _ACQ_CIRC_GEQ) | DRF_DEF(C56F, _SEM_EXECUTE, _PAYLOAD_SIZE, _32BIT));
         chan_mthd(c, 0, NVC56F_NON_STALL_INTERRUPT, 1, 0u);
     }
-    volatile NvU32 *sv = e->sem.cpu;
-    double t0 = now_ms(); chan_submit(c);
-    for (;;) {   // spin 50 us, then sleep on the event (re-checking the semaphore between reading and waiting on the count)
-        if (*sv == payload || chan_error(c)) break;
-        double el = now_ms() - t0;
-        if (el > 3000) break;
-        if (e->ev.h && el > 0.05) {
-            int64_t seen = rm_event_wait(&e->ev, 0, 0);
-            if (seen < 0) { rm_event_close(&e->rm, &e->ev); continue; }
-            if (*sv == payload) break;
-            rm_event_wait(&e->ev, (uint32_t)seen, 2000);
-        }
-    }
-    out->ms = now_ms() - t0;
+    memset(status->cpu, 0, 256);
+    e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = 2 * e->sinceIdr;
+    e->pend[ds].t0 = now_ms();
+    chan_submit(c);
+    *ticket = payload;
 
-    nvenc_pic_stat_s *st = e->status.cpu;
-    out->idr = idr; out->frame_num = e->frame_num; out->poc = 2 * e->sinceIdr;
-    out->bits = st->total_bit_count; out->ucode_error = st->ucode_error_status; out->avg_qp = st->avgQP;
-    out->intra_mbs = st->intra_mb_count; out->inter_mbs = st->inter_mb_count;
-    if (*sv != payload) {
-        fprintf(stderr, "enc: frame %u %s (notifier 0x%x info32 0x%x)\n", payload, chan_error(c) ? "engine error" : "timeout",
-                chan_error(c), ((volatile NvNotification *)c->notifier.cpu)[0].info32);
-        return -1;
-    }
-    // error_status is 2 on good frames too: judge by the microcode error and the bit count
-    if (st->ucode_error_status || !st->total_bit_count || st->total_bit_count / 8 >= e->bs.size) return -1;
-    out->data = (const uint8_t *)e->bs.cpu + st->bitstream_start_pos; out->size = st->total_bit_count / 8;
-
-    // DPB: this picture becomes the most recent reference; the oldest drops out past num_refs
+    // DPB (decided by submission order): this picture becomes the most recent reference; the oldest drops out past num_refs
     int keep = e->nRefs < e->cfg.num_refs ? e->nRefs : e->cfg.num_refs - 1;
     if (idr) keep = 0;
     memmove(e->slotOf + 1, e->slotOf, sizeof e->slotOf[0] * (size_t)keep);
@@ -286,4 +274,49 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
     e->frame_num = (e->frame_num + 1) % (1u << LOG2_MAX_FRAME_NUM);
     e->sinceIdr++;
     return 0;
+}
+
+int enc_wait(Enc *e, NvU32 ticket, EncFrame *out)
+{
+    memset(out, 0, sizeof *out);
+    Chan *c = &e->chan;
+    int ds = (int)((ticket - 1) % (NvU32)e->cfg.depth);
+    volatile NvU32 *sv = e->sem.cpu;
+    double t0 = e->pend[ds].t0;
+    // spin 50 us, then sleep on the event (re-checking the semaphore between reading and waiting on the count); later
+    // frames release higher payloads
+    for (;;) {
+        if ((int32_t)(*sv - ticket) >= 0 || chan_error(c)) break;
+        double el = now_ms() - t0;
+        if (el > 3000) break;
+        if (e->ev.h && el > 0.05) {
+            int64_t seen = rm_event_wait(&e->ev, 0, 0);
+            if ((int32_t)(*sv - ticket) >= 0) break;
+            if (seen >= 0) rm_event_wait(&e->ev, (uint32_t)seen, 2000);
+        }
+    }
+    out->ms = now_ms() - t0;
+    e->waited = ticket;
+
+    nvenc_pic_stat_s *st = e->status[ds].cpu;
+    out->idr = e->pend[ds].idr; out->frame_num = e->pend[ds].frame_num; out->poc = e->pend[ds].poc;
+    out->bits = st->total_bit_count; out->ucode_error = st->ucode_error_status; out->avg_qp = st->avgQP;
+    out->intra_mbs = st->intra_mb_count; out->inter_mbs = st->inter_mb_count;
+    if ((int32_t)(*sv - ticket) < 0) {
+        fprintf(stderr, "enc: frame %u %s (notifier 0x%x info32 0x%x)\n", ticket, chan_error(c) ? "engine error" : "timeout",
+                chan_error(c), ((volatile NvNotification *)c->notifier.cpu)[0].info32);
+        e->forceIdr = true;
+        return -1;
+    }
+    // error_status is 2 on good frames too: judge by the microcode error and the bit count
+    if (st->ucode_error_status || !st->total_bit_count || st->total_bit_count / 8 >= e->bs[ds].size) { e->forceIdr = true; return -1; }
+    out->data = (const uint8_t *)e->bs[ds].cpu + st->bitstream_start_pos; out->size = st->total_bit_count / 8;
+    return 0;
+}
+
+int enc_encode(Enc *e, bool force_idr, EncFrame *out)
+{
+    NvU32 t;
+    if (enc_submit(e, force_idr, &t)) { memset(out, 0, sizeof *out); return -1; }
+    return enc_wait(e, t, out);
 }

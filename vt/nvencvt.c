@@ -53,6 +53,11 @@ typedef struct {
     int bitrate, maxKeyInterval, fps, quality;
     bool realTime;
     unsigned frames;
+    // frames in flight: encodeFrame submits, the completion thread waits (in order) and emits
+    struct { VTEncoderFrameRef frame; CMTime pts, dur; NvU32 ticket; bool ok; } q[ENC_MAX_DEPTH];
+    unsigned qh, qt, depth;
+    pthread_t thread; bool threadOn, stop;
+    pthread_cond_t cv;
 } State;
 
 static State *state(VTVideoEncoderRef e) { return *(State **)CMBaseObjectGetDerivedStorage(e); }
@@ -159,6 +164,7 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
     return noErr;
 }
 
+static void *completion(void *arg);
 static OSStatus open_encoder(State *s)
 {
     EncConfig c = { .width = s->width, .height = s->height, .num_refs = 1, .fps = s->fps > 0 ? s->fps : 60,
@@ -170,7 +176,9 @@ static OSStatus open_encoder(State *s)
         c.rc_mode = 18; c.bitrate = s->bitrate; c.max_bitrate = s->bitrate;
         c.vbv_bits = s->realTime ? s->bitrate / c.fps * 2 : s->bitrate;
     }
+    c.depth = getenv("NVENCVT_DEPTH") ? atoi(getenv("NVENCVT_DEPTH")) : 2;   // frames in flight
     if (enc_open(&s->enc, &c)) { enc_close(&s->enc); return kVTVideoEncoderMalfunctionErr; }
+    s->depth = (unsigned)s->enc.cfg.depth;
     uint8_t hdr[256]; size_t n = enc_headers(&s->enc, hdr);
     // SPS and PPS from the Annex B header block
     const uint8_t *ps[2]; size_t pl[2]; int cnt = 0;
@@ -182,8 +190,66 @@ static OSStatus open_encoder(State *s)
         c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
     s->opened = true;
+    s->stop = false;
+    s->threadOn = pthread_create(&s->thread, NULL, completion, s) == 0;
+    if (!s->threadOn) { enc_close(&s->enc); s->opened = false; return kVTVideoEncoderMalfunctionErr; }
     return noErr;
 }
+
+static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, const EncFrame *fr, OSStatus err)
+{
+    if (err) { VTEncoderSessionEmitEncodedFrame(s->session, frame, err, 0, NULL); return; }
+    // Annex B (4-byte start codes) -> AVCC (4-byte big-endian lengths), same size
+    uint8_t *buf = malloc(fr->size);
+    memcpy(buf, fr->data, fr->size);
+    size_t start = SIZE_MAX;
+    for (size_t i = 0; i + 4 <= fr->size; i++) {
+        if (!buf[i] && !buf[i + 1] && !buf[i + 2] && buf[i + 3] == 1) {
+            if (start != SIZE_MAX) { uint32_t l = (uint32_t)(i - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
+            start = i; i += 3;
+        }
+    }
+    if (start != SIZE_MAX) { uint32_t l = (uint32_t)(fr->size - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
+    CMBlockBufferRef bb = NULL; CMSampleBufferRef sb = NULL;
+    OSStatus st = CMBlockBufferCreateWithMemoryBlock(NULL, buf, fr->size, kCFAllocatorMalloc, NULL, 0, fr->size, 0, &bb);
+    CMSampleTimingInfo ti = { .duration = dur, .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
+    size_t sz = fr->size;
+    if (!st) st = CMSampleBufferCreateReady(NULL, bb, s->fmt, 1, 1, &ti, 1, &sz, &sb);
+    if (!st) {
+        CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, true);
+        CFMutableDictionaryRef a = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
+        CFDictionarySetValue(a, kCMSampleAttachmentKey_NotSync, fr->idr ? kCFBooleanFalse : kCFBooleanTrue);
+        CFDictionarySetValue(a, kCMSampleAttachmentKey_DependsOnOthers, fr->idr ? kCFBooleanFalse : kCFBooleanTrue);
+    }
+    VTEncoderSessionEmitEncodedFrame(s->session, frame, st, 0, st ? NULL : sb);
+    if (sb) CFRelease(sb);
+    if (bb) CFRelease(bb);
+}
+
+static void *completion(void *arg)
+{
+    State *s = arg;
+    pthread_mutex_lock(&s->lock);
+    for (;;) {
+        while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->lock);
+        if (s->qh == s->qt) break;
+        unsigned i = s->qh % s->depth;
+        VTEncoderFrameRef frame = s->q[i].frame; CMTime pts = s->q[i].pts, dur = s->q[i].dur; NvU32 t = s->q[i].ticket; bool ok = s->q[i].ok;
+        pthread_mutex_unlock(&s->lock);
+        EncFrame fr; memset(&fr, 0, sizeof fr);
+        int rc = ok ? enc_wait(&s->enc, t, &fr) : -1;
+        if (rc) LOG("frame %u: encode failed (ucode error %u)", t, fr.ucode_error);
+        else if (gLog && (t <= 3 || fr.idr)) LOG("frame %u %s: %zu bytes, %.3f ms, avgQP %u", t, fr.idr ? "IDR" : "P", fr.size, fr.ms, fr.avg_qp);
+        emit(s, frame, pts, dur, &fr, rc ? kVTVideoEncoderMalfunctionErr : noErr);   // fr.data stays valid until qh moves on
+        pthread_mutex_lock(&s->lock);
+        s->qh++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+static void drain(State *s) { while (s->qh != s->qt) pthread_cond_wait(&s->cv, &s->lock); }   // lock held
 
 static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVImageBufferRef img, CMTime pts, CMTime dur,
                               CFDictionaryRef props, VTEncodeInfoFlags *infoOut)
@@ -201,59 +267,41 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTPixelTransferNotSupportedErr, 0, NULL);
         return noErr;
     }
+    while (s->qt - s->qh >= s->depth) pthread_cond_wait(&s->cv, &s->lock);   // a free input slot
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
                   CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
     CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     bool forceIdr = false;
     if (props) { CFTypeRef k = CFDictionaryGetValue(props, kVTEncodeFrameOptionKey_ForceKeyFrame); forceIdr = k && CFGetTypeID(k) == CFBooleanGetTypeID() && CFBooleanGetValue(k); }
-    EncFrame fr;
-    if (enc_encode(&s->enc, forceIdr, &fr)) {
-        LOG("frame %u: encode failed (ucode error %u)", s->frames, fr.ucode_error);
-        pthread_mutex_unlock(&s->lock);
-        VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL);
-        return noErr;
-    }
-    // Annex B (4-byte start codes) -> AVCC (4-byte big-endian lengths), same size
-    uint8_t *buf = malloc(fr.size);
-    memcpy(buf, fr.data, fr.size);
-    size_t start = SIZE_MAX;
-    for (size_t i = 0; i + 4 <= fr.size; i++) {
-        if (!buf[i] && !buf[i + 1] && !buf[i + 2] && buf[i + 3] == 1) {
-            if (start != SIZE_MAX) { uint32_t l = (uint32_t)(i - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
-            start = i; i += 3;
-        }
-    }
-    if (start != SIZE_MAX) { uint32_t l = (uint32_t)(fr.size - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
-    s->frames++;
+    unsigned i = s->qt % s->depth;
+    s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur;
+    s->q[i].ok = enc_submit(&s->enc, forceIdr, &s->q[i].ticket) == 0;
+    s->qt++; s->frames++;
+    pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->lock);
-
-    CMBlockBufferRef bb = NULL; CMSampleBufferRef sb = NULL;
-    st = CMBlockBufferCreateWithMemoryBlock(NULL, buf, fr.size, kCFAllocatorMalloc, NULL, 0, fr.size, 0, &bb);
-    CMSampleTimingInfo ti = { .duration = dur, .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
-    size_t sz = fr.size;
-    if (!st) st = CMSampleBufferCreateReady(NULL, bb, s->fmt, 1, 1, &ti, 1, &sz, &sb);
-    if (!st) {
-        CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, true);
-        CFMutableDictionaryRef a = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
-        CFDictionarySetValue(a, kCMSampleAttachmentKey_NotSync, fr.idr ? kCFBooleanFalse : kCFBooleanTrue);
-        CFDictionarySetValue(a, kCMSampleAttachmentKey_DependsOnOthers, fr.idr ? kCFBooleanFalse : kCFBooleanTrue);
-    }
-    if (gLog && (s->frames <= 3 || fr.idr)) LOG("frame %u %s: %zu bytes, %.3f ms, avgQP %u", s->frames - 1, fr.idr ? "IDR" : "P", fr.size, fr.ms, fr.avg_qp);
-    if (infoOut) *infoOut = 0;
-    VTEncoderSessionEmitEncodedFrame(s->session, frame, st, 0, st ? NULL : sb);
-    if (sb) CFRelease(sb);
-    if (bb) CFRelease(bb);
+    if (infoOut) *infoOut = kVTEncodeInfo_Asynchronous;
     return noErr;
 }
 
-static OSStatus e_completeFrames(VTVideoEncoderRef e, CMTime until) { (void)e; (void)until; return noErr; }   // synchronous
+static OSStatus e_completeFrames(VTVideoEncoderRef e, CMTime until)
+{
+    (void)until;
+    State *s = state(e);
+    pthread_mutex_lock(&s->lock); drain(s); pthread_mutex_unlock(&s->lock);
+    return noErr;
+}
 static OSStatus e_copySupported(VTVideoEncoderRef e, CFDictionaryRef *out) { (void)e; *out = CFRetain(supported()); return noErr; }
 
 static OSStatus b_invalidate(CMBaseObjectRef o)
 {
     State *s = state(o);
     pthread_mutex_lock(&s->lock);
+    if (s->threadOn) {
+        drain(s); s->stop = true; pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->lock); pthread_join(s->thread, NULL); pthread_mutex_lock(&s->lock);
+        s->threadOn = false;
+    }
     if (s->opened) { enc_close(&s->enc); s->opened = false; }
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }
     LOG("invalidate after %u frames", s->frames);
@@ -265,7 +313,7 @@ static void b_finalize(CMBaseObjectRef o)
     State *s = state(o);
     if (!s) return;
     b_invalidate(o);
-    pthread_mutex_destroy(&s->lock);
+    pthread_mutex_destroy(&s->lock); pthread_cond_destroy(&s->cv);
     free(s); *(State **)CMBaseObjectGetDerivedStorage(o) = NULL;
 }
 static CFStringRef b_desc(CMBaseObjectRef o) { (void)o; return CFSTR("nvenc H.264 encoder"); }
@@ -283,7 +331,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_CreateInstance(FourCharC
     OSStatus st = CMDerivedObjectCreate(al, &gVT.base, VTVideoEncoderGetClassID(), &obj);
     if (st) return st;
     State *s = calloc(1, sizeof *s);
-    pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
     *(State **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
     LOG("instance %p", obj);
