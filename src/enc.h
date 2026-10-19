@@ -75,6 +75,7 @@ typedef struct {
 int  enc_open(Enc *e, const EncConfig *cfg);                    // 0 = ok
 void enc_close(Enc *e);
 size_t enc_headers(Enc *e, uint8_t *out);                       // SPS + PPS (HEVC: VPS + SPS + PPS), Annex B (~64 / ~96 bytes)
+size_t enc_av1_config(Enc *e, uint8_t *out);                   // AV1: the sequence header OBU (for av1C; < 32 bytes)
 // copy an NV12 frame (pitch-linear planes) into the next frame's input surface (needs enc_inflight() < depth)
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride);
 // copy a 16-bit 4:2:0 frame (P010-style: 10 bits in the high bits of each 16-bit sample) into a 10-bit session's input

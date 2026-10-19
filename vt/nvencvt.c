@@ -6,6 +6,7 @@
 // above nullmoth's 1000), NVENCVT_NO_REGISTER, NVENCVT_LOG, NVENCVT_DEPTH, NVENCVT_ENGINE, NVENCVT_STATS=<file> (or touch
 // /tmp/nvencvt.stats: statistics every 2 s to /tmp/nvencvt-stats.log, also in apps that get no environment).
 #include "enc.h"
+#include "av1hdr.h"
 #include "rm.h"
 #include "ctrl/ctrl0080/ctrl0080gpu.h"
 #include "clc9b7.h"
@@ -56,6 +57,8 @@ typedef struct { CMBaseVTable base; const EncoderClass *encoderClass; } EncoderV
 
 #define ENCODER_ID "org.nvenc.videoencoder.avc"
 #define ENCODER_ID_HEVC "org.nvenc.videoencoder.hevc"
+#define ENCODER_ID_AV1 "org.nvenc.videoencoder.av1"
+enum { CODEC_AV1 = 0x61763031 };   // 'av01' (kCMVideoCodecType_AV1)
 static bool gLog;
 static FILE *gLogF;   // NVENCVT_LOG: stderr; flag file /tmp/nvencvt.log (apps started by launchd): /tmp/nvencvt-<pid>.log
 #define LOG(...) do { if (gLog) { FILE *lf_ = gLogF ? gLogF : stderr; fprintf(lf_, "nvencvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
@@ -65,6 +68,7 @@ typedef struct {
     VTEncoderSessionRef session;
     int width, height;
     bool hevc;                      // hvc1 session (else avc1)
+    bool av1;                       // av01 session (M12, T12.05)
     bool ten;                       // HEVC Main 10 (ProfileLevel HEVC_Main10_*): 10-bit input, 10-bit stream
     int h264Profile;                // ProfileLevel asked for: 66 Baseline, 77 Main, 100 High; 0 = not set (High)
     int entropy;                    // H264EntropyMode asked for: 0 CAVLC, 1 CABAC, -1 not set
@@ -209,7 +213,7 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) { if (v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) LOG("frame reordering requested: not supported, no B-frames"); }
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !profile_ok(s, v)) st = kVTPropertyNotSupportedErr;
-    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->hevc) {
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->hevc && !s->av1) {
         char pr[64] = ""; CFStringGetCString(v, pr, sizeof pr, kCFStringEncodingUTF8);
         s->h264Profile = strstr(pr, "Baseline") ? 66 : strstr(pr, "High") ? 100 : 77;
     }
@@ -243,9 +247,9 @@ static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRe
     else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) { n = s->enc.cfg.num_refs ? s->enc.cfg.num_refs : (s->refs ? s->refs : ENC_MAX_REFS); v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) v = CFRetain(s->realTime ? kCFBooleanTrue : kCFBooleanFalse);
     else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) v = CFRetain(kCFBooleanFalse);
-    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->av1) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
                                                                              : h264_high(s) ? kVTProfileLevel_H264_High_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel);
-    else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc) v = CFRetain(h264_cabac(s) ? kVTH264EntropyMode_CABAC : kVTH264EntropyMode_CAVLC);
+    else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc && !s->av1) v = CFRetain(h264_cabac(s) ? kVTH264EntropyMode_CABAC : kVTH264EntropyMode_CAVLC);
     else if (CFEqual(key, kVTCompressionPropertyKey_NumberOfPendingFrames)) { n = 0; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder)) v = CFRetain(kCFBooleanTrue);
     else { if (gLog) { char k[128]; CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); LOG("copy %s: not available", k); } return kCMBaseObjectError_ValueNotAvailable; }
@@ -263,6 +267,11 @@ static OSStatus set_pixel_attrs(State *s)
     // through Metal on its serial queue, 20+ ms per 4K frame and frames queued behind it, T6.14)
     if (s->ten) { f[0] = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange; f[1] = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; f[2] = kCVPixelFormatType_ARGB2101010LEPacked; }
     int nf = 3;
+    if (s->av1) {   // AV1: 8 or 10-bit, decided by the first frame (VideoToolbox converts only buffers in none of these)
+        f[0] = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; f[1] = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange; f[2] = kCVPixelFormatType_32BGRA;
+        f[3] = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange; f[4] = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; f[5] = kCVPixelFormatType_ARGB2101010LEPacked;
+        nf = 6;
+    }
     if (access("/tmp/nvencvt.anyfmt", F_OK) == 0) {   // diagnostics: offer every format a capture source might deliver, log what comes
         int all[] = { kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
                       kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_32BGRA,
@@ -309,12 +318,14 @@ static OSStatus open_encoder(State *s)
     { FILE *df = fopen("/tmp/nvencvt.dpb", "r"); int v = 0;
       if (df) { if (fscanf(df, "%d", &v) == 1 && v >= 0) dpb_extra = v; fclose(df); } }
     dpb_extra = dpb_extra < 0 ? 0 : dpb_extra > 2 ? 2 : dpb_extra;
-    EncConfig c = { .codec = s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
+    if (s->av1) refs = 1;   // AV1: one reference (LAST), as NVIDIA's driver in low-latency mode (enc.c)
+    EncConfig c = { .codec = s->av1 ? ENC_AV1 : s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange,
                     .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s) };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
+    if (s->av1) { c.qp_i = qp * 4 - 12; c.qp_p = c.qp_i + 20; }   // AV1 quantizer indices (0..255): 23 -> 80 / 100, the driver's pair
     if (s->bitrate > 0) {
         c.rc_mode = 18; c.bitrate = s->bitrate; c.max_bitrate = s->bitrate;
         c.vbv_bits = s->realTime ? s->bitrate / c.fps * 2 : s->bitrate;
@@ -332,7 +343,22 @@ static OSStatus open_encoder(State *s)
         return kVTVideoEncoderMalfunctionErr;
     }
     s->depth = (unsigned)s->enc.cfg.depth;
-    uint8_t hdr[256]; size_t n = enc_headers(&s->enc, hdr);
+    uint8_t hdr[256]; size_t n = s->av1 ? 0 : enc_headers(&s->enc, hdr);
+    if (s->av1) {   // av1C (AV1 Codec ISO Media File Format Binding 2.3): 4 bytes, then the sequence header OBU
+        uint8_t cfg[64] = { 0x81, (uint8_t)av1_level_for(s->width, s->height), (uint8_t)((s->ten ? 0x40 : 0) | 0x0c), 0 };
+        const size_t cn = 4 + enc_av1_config(&s->enc, cfg + 4);
+        CFDataRef d = CFDataCreate(NULL, cfg, (CFIndex)cn);
+        const void *ak[] = { CFSTR("av1C") }, *av[] = { d };
+        CFDictionaryRef atoms = CFDictionaryCreate(NULL, ak, av, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        const void *ek[] = { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, kCMFormatDescriptionExtension_FullRangeVideo }, *ev[] = { atoms, s->fullRange ? kCFBooleanTrue : kCFBooleanFalse };
+        CFDictionaryRef ext = CFDictionaryCreate(NULL, ek, ev, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        OSStatus st = CMVideoFormatDescriptionCreate(NULL, CODEC_AV1, s->width, s->height, ext, &s->fmt);
+        CFRelease(ext); CFRelease(atoms); CFRelease(d);
+        LOG("AV1%s encoder open on NVENC%d: %dx%d range %s rc_mode %d bitrate %d vbv %d q %d/%d idr_period %d fps %d -> fmt %d", s->ten ? " 10-bit" : "", c.engine,
+            c.width, c.height, c.full_range ? "full" : "video", c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
+        if (st) { enc_close(&s->enc); return st; }
+        goto opened;
+    }
     // the parameter sets (H.264: SPS + PPS, HEVC: VPS + SPS + PPS) from the Annex B header block
     const uint8_t *ps[3]; size_t pl[3]; int cnt = 0, want = s->hevc ? 3 : 2;
     for (size_t i = 0; i + 4 <= n && cnt < want; i++)
@@ -344,6 +370,7 @@ static OSStatus open_encoder(State *s)
     LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s profile %d cabac %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video", s->hevc ? 0 : c.h264_profile, s->hevc ? 0 : (int)c.cabac,
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
+opened:
     s->opened = true;
     s->stop = false;
     const char *sf = getenv("NVENCVT_STATS");
@@ -357,21 +384,23 @@ static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, cons
 {
     if (err) { VTEncoderSessionEmitEncodedFrame(s->session, frame, err, 0, NULL); return; }
     if (s->dumpEs) { fwrite(fr->data, 1, fr->size, s->dumpEs); fflush(s->dumpEs); }
-    // Annex B (4-byte start codes) -> AVCC (4-byte big-endian lengths), same size
+    // AV1: the temporal unit without its temporal delimiter (ISOBMFF samples carry none); else Annex B (4-byte start
+    // codes) -> AVCC (4-byte big-endian lengths), same size
+    const size_t skip = s->av1 && fr->size >= 2 && fr->data[0] == 0x12 && fr->data[1] == 0 ? 2 : 0;
     uint8_t *buf = malloc(fr->size);
-    memcpy(buf, fr->data, fr->size);
+    memcpy(buf, fr->data + skip, fr->size - skip);
     size_t start = SIZE_MAX;
-    for (size_t i = 0; i + 4 <= fr->size; i++) {
+    for (size_t i = 0; !s->av1 && i + 4 <= fr->size; i++) {
         if (!buf[i] && !buf[i + 1] && !buf[i + 2] && buf[i + 3] == 1) {
             if (start != SIZE_MAX) { uint32_t l = (uint32_t)(i - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
             start = i; i += 3;
         }
     }
-    if (start != SIZE_MAX) { uint32_t l = (uint32_t)(fr->size - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
+    if (!s->av1 && start != SIZE_MAX) { uint32_t l = (uint32_t)(fr->size - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
     CMBlockBufferRef bb = NULL; CMSampleBufferRef sb = NULL;
-    OSStatus st = CMBlockBufferCreateWithMemoryBlock(NULL, buf, fr->size, kCFAllocatorMalloc, NULL, 0, fr->size, 0, &bb);
+    OSStatus st = CMBlockBufferCreateWithMemoryBlock(NULL, buf, fr->size, kCFAllocatorMalloc, NULL, 0, fr->size - skip, 0, &bb);
     CMSampleTimingInfo ti = { .duration = dur, .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
-    size_t sz = fr->size;
+    size_t sz = fr->size - skip;
     if (!st) st = CMSampleBufferCreateReady(NULL, bb, s->fmt, 1, 1, &ti, 1, &sz, &sb);
     if (!st) {
         CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, true);
@@ -422,6 +451,8 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     // VUI; BGRA and l10r are converted by us to video range, and 420v / x420 are video range (T7.01)
     if (!s->opened) { OSType p0 = CVPixelBufferGetPixelFormatType(img);
         s->fullRange = p0 == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; }
+    if (!s->opened && s->av1) { OSType p0 = CVPixelBufferGetPixelFormatType(img);   // AV1: 10-bit when the input is
+        s->ten = p0 == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange || p0 == kCVPixelFormatType_ARGB2101010LEPacked; }
     if (!s->opened && !s->failed && (st = open_encoder(s))) s->failed = true;
     if (s->failed) { pthread_mutex_unlock(&s->lock); VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL); return kVTVideoEncoderMalfunctionErr; }
     OSType pf = CVPixelBufferGetPixelFormatType(img);
@@ -530,17 +561,17 @@ static const EncoderVTable gVT = { .base = { NULL, &gBase }, .encoderClass = &gE
 
 __attribute__((visibility("default"))) OSStatus NVEncVT_CreateInstance(FourCharCode codec, CFAllocatorRef al, VTVideoEncoderRef *out)
 {
-    if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC) return kVTCouldNotFindVideoEncoderErr;
+    if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC && codec != CODEC_AV1) return kVTCouldNotFindVideoEncoderErr;
     CMBaseObjectRef obj = NULL;
     OSStatus st = CMDerivedObjectCreate(al, &gVT.base, VTVideoEncoderGetClassID(), &obj);
     if (st) return st;
     State *s = calloc(1, sizeof *s);
     s->entropy = -1;
     pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
-    s->hevc = codec == kCMVideoCodecType_HEVC;
+    s->hevc = codec == kCMVideoCodecType_HEVC; s->av1 = codec == CODEC_AV1;
     *(State **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
-    LOG("instance %p (%s)", obj, s->hevc ? "hvc1" : "avc1");
+    LOG("instance %p (%s)", obj, s->av1 ? "av01" : s->hevc ? "hvc1" : "avc1");
     return noErr;
 }
 
@@ -567,7 +598,8 @@ static OSStatus register_one(FourCharCode codec, CFStringRef id, CFStringRef nam
     const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("CMClassImplementationName"), CFSTR("VTRating"), CFSTR("VTIsHardwareAccelerated"),
                         kVTVideoEncoderList_SupportedSelectionProperties };
     const void *v[] = { id, name, r, kCFBooleanTrue, sel };
-    CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    // AV1: no profile list (Main, 8 / 10-bit, is all there is)
+    CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, codec == CODEC_AV1 ? 4 : 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     OSStatus st = VTRegisterVideoEncoderWithInfo(codec, info, (void *)NVEncVT_CreateInstance);
     CFRelease(info); CFRelease(sel); CFRelease(r);
     return st;
@@ -705,20 +737,23 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
         return kVTCouldNotFindVideoEncoderErr;
     }
     // "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.7.0": codec, the card, this project and its version (git describe)
-    char nameAvc[160], nameHevc[160];
+    char nameAvc[160], nameHevc[160], nameAv1[160];
     const char *ver = NVENC_VERSION[0] == 'v' ? NVENC_VERSION + 1 : NVENC_VERSION;
     snprintf(nameAvc, sizeof nameAvc, "NVENC - H.264 - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
     snprintf(nameHevc, sizeof nameHevc, "NVENC - HEVC - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
+    snprintf(nameAv1, sizeof nameAv1, "NVENC - AV1 - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
     CFStringRef na = CFStringCreateWithCString(NULL, nameAvc, kCFStringEncodingUTF8), nh = CFStringCreateWithCString(NULL, nameHevc, kCFStringEncodingUTF8);
     OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), na, rating);
     OSStatus sh = getenv("NVENCVT_NO_HEVC") ? kVTCouldNotFindVideoEncoderErr
                 : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), nh, rating);
-    CFRelease(na); CFRelease(nh);
-    LOG("registered %s -> %d, %s -> %d (rating %d)", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, rating);
-    static const char *const ids[] = { ENCODER_ID, ENCODER_ID_HEVC };
-    const char *const names[] = { nameAvc, nameHevc };
-    static const char *const codecs[] = { "H.264", "HEVC" };
-    rename_encoders(ids, names, codecs, sh ? 1 : 2);
+    CFStringRef n1 = CFStringCreateWithCString(NULL, nameAv1, kCFStringEncodingUTF8);
+    OSStatus s1 = getenv("NVENCVT_NO_AV1") ? kVTCouldNotFindVideoEncoderErr : register_one(CODEC_AV1, CFSTR(ENCODER_ID_AV1), n1, rating);
+    CFRelease(na); CFRelease(nh); CFRelease(n1);
+    LOG("registered %s -> %d, %s -> %d, %s -> %d (rating %d)", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, ENCODER_ID_AV1, (int)s1, rating);
+    const char *ids[3] = { ENCODER_ID }, *names[3] = { nameAvc }, *codecs[3] = { "H.264" }; int nreg = 1;
+    if (!sh) { ids[nreg] = ENCODER_ID_HEVC; names[nreg] = nameHevc; codecs[nreg++] = "HEVC"; }
+    if (!s1) { ids[nreg] = ENCODER_ID_AV1; names[nreg] = nameAv1; codecs[nreg++] = "AV1"; }
+    rename_encoders(ids, names, codecs, nreg);
     extern OSStatus NVDecVT_Register(int rating);   // vt/nvencvt_dec.c: the H.264 decoder (NVDEC), same rating
     NVDecVT_Register(rating);
     return st;

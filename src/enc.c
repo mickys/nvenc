@@ -653,14 +653,20 @@ execute:
 // plane, TX_MODE_SELECT; inter frames: switchable interpolation filters, reference_select, CDFs from LAST (primary
 // reference 0) and saved at the end of the frame. Reference slots = reconstruction slots; every reference index names the
 // previous frame (LAST).
+static Av1SeqParams av1_seq(const Enc *e)
+{
+    return (Av1SeqParams){ .width = e->cfg.width, .height = e->cfg.height, .bit_depth = e->cfg.bit_depth, .full_range = e->cfg.full_range,
+                           .enable_cdef = true, .enable_restoration = true };
+}
+size_t enc_av1_config(Enc *e, uint8_t *out) { Av1SeqParams sp = av1_seq(e); return av1_write_sequence_header(&sp, out); }
+
 static int av1_assemble(Enc *e, int ds, EncFrame *out)
 {
     const NvU8 *sb = e->status[ds].cpu;
     const nvenc_av1_pic_stat_s *st = (const void *)sb;
     const NvU32 *ts = (const NvU32 *)(sb + 0x100);                 // tile statistics (tile_stat_offset 0x100): offset, size
     const bool key = e->pend[ds].idr;
-    Av1SeqParams sp = { .width = e->cfg.width, .height = e->cfg.height, .bit_depth = e->cfg.bit_depth, .full_range = e->cfg.full_range,
-                        .enable_cdef = true, .enable_restoration = true };
+    Av1SeqParams sp = av1_seq(e);
     const int lf = st->loop_filter_level;
     Av1FrameParams fp = { .frame_type = key ? 0 : 1, .order_hint = (int)e->pend[ds].poc, .refresh_frame_flags = 1 << e->pend[ds].slot,
         .primary_ref_frame = key ? 7 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
