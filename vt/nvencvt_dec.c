@@ -1,13 +1,14 @@
-// nvencvt_dec.c (M8, T8.06; M9-M11): the H.264, HEVC, VP9 and AV1 decoders in libnvencvt, as VideoToolbox decoder plugins.
+// nvencvt_dec.c (M8, T8.06; M9-M11, M14): the H.264, HEVC, VP9, AV1 and MPEG-1/2 decoders in libnvencvt, as VideoToolbox decoder plugins.
 // Interface: Apple's SPI declarations published in WebKit (vendor/webkit-spi/VTVideoDecoderSPI.h, CMBaseObjectSPI.h); the
 // three class slots that header leaves "TBD" are given the shapes their names suggest and log every call. Decoding:
-// src/dec.c (H.264), src/hevcdec.c (HEVC), src/vp9dec.c (VP9) and src/av1dec.c (AV1) on NVDEC.
+// src/dec.c (H.264), src/hevcdec.c (HEVC), src/vp9dec.c (VP9), src/av1dec.c (AV1) and src/mpeg2dec.c (MPEG-1/2) on NVDEC.
 // Registered by NVEncVT_Register next to the encoders (NVENCVT_NO_DEC=1 leaves it out), so every way the encoder gets
 // into a process (NullMoth's NVMTL_NVENCVT hook, nvenc-run) brings the decoder too.
 #include "dec.h"
 #include "vp9dec.h"
 #include "av1dec.h"
 #include "hevcdec.h"
+#include "mpeg2dec.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
@@ -54,6 +55,9 @@ typedef struct { CMBaseVTable base; const DecoderClass *decoderClass; } DecoderV
 #define DECODER_ID_VP9 "org.nvenc.videodecoder.vp9"
 #define DECODER_ID_AV1 "org.nvenc.videodecoder.av1"
 #define DECODER_ID_HEVC "org.nvenc.videodecoder.hevc"
+#define DECODER_ID_MPEG2 "org.nvenc.videodecoder.mpeg2"
+#define DECODER_ID_MPEG1 "org.nvenc.videodecoder.mpeg1"
+static bool is_mpeg12(FourCharCode c) { return c == kCMVideoCodecType_MPEG2Video || c == kCMVideoCodecType_MPEG1Video; }
 enum { CODEC_VP9 = 0x76703039, CODEC_AV1 = 0x61763031 };   // 'vp09', 'av01' (kCMVideoCodecType_VP9 / _AV1)
 static bool gDLog; static FILE *gDLogF;
 #define DLOG(...) do { if (gDLog) { FILE *lf_ = gDLogF ? gDLogF : stderr; fprintf(lf_, "nvdecvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
@@ -67,6 +71,7 @@ typedef struct {
     Rm *vrm; Vp9Dec *vp9;           // VP9: on the heap, so that the next session can take them over (park_vp9)
     Av1Dec *av1;                    // AV1: likewise (with vrm)
     HevcDec *hevc;                  // HEVC (with rm)
+    Mpeg2Dec *m2;                   // MPEG-1/2 (with rm)
     int nalLen, w, h;
     OSType pf;                      // output pixel format (VP9: depends on the bit depth)
     CFDictionaryRef colour;         // colour attachments for the output (from the format description)
@@ -163,6 +168,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
         if (s->codec == CODEC_VP9) { park_vp9(s->vrm, s->vp9); s->vrm = NULL; s->vp9 = NULL; }
         else if (s->codec == CODEC_AV1) { park_av1(s->vrm, s->av1); s->vrm = NULL; s->av1 = NULL; }
         else if (s->codec == kCMVideoCodecType_HEVC) { hevcdec_close(s->hevc); free(s->hevc); s->hevc = NULL; rm_close(&s->rm); }
+        else if (is_mpeg12(s->codec)) { mpeg2dec_close(s->m2); free(s->m2); s->m2 = NULL; rm_close(&s->rm); }
         else { h264dec_close(&s->dec); rm_close(&s->rm); }
         s->opened = false;
     }
@@ -184,7 +190,8 @@ static CFStringRef b_desc(CMBaseObjectRef o)
 {
     const FourCharCode c = dstate(o)->codec;
     return c == CODEC_VP9 ? CFSTR("nvenc VP9 decoder (NVDEC)") : c == CODEC_AV1 ? CFSTR("nvenc AV1 decoder (NVDEC)") :
-           c == kCMVideoCodecType_HEVC ? CFSTR("nvenc HEVC decoder (NVDEC)") : CFSTR("nvenc H.264 decoder (NVDEC)");
+           c == kCMVideoCodecType_HEVC ? CFSTR("nvenc HEVC decoder (NVDEC)") : is_mpeg12(c) ? CFSTR("nvenc MPEG-1/2 decoder (NVDEC)") :
+           CFSTR("nvenc H.264 decoder (NVDEC)");
 }
 static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef al, void *out)
 {
@@ -313,6 +320,25 @@ static OSStatus start_hevc(DState *s, VTVideoDecoderSession session, CMVideoForm
     return set_output(s, session, fmt, pf, full);
 }
 
+// MPEG-1/2 (M14): sized from the format description (NVDEC: up to 4080x4080, 4:2:0); the sequence header normally
+// travels in the samples, else (or until then) a default sequence of that size is assumed
+static OSStatus start_mpeg2(DState *s, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt)
+{
+    const CMVideoDimensions dm = CMVideoFormatDescriptionGetDimensions(fmt);
+    if (gDLog) { CFDictionaryRef ex = CMFormatDescriptionGetExtensions(fmt); CFStringRef ds = ex ? CFCopyDescription(ex) : NULL; char b[1024] = "(none)";
+                 if (ds) { CFStringGetCString(ds, b, sizeof b, kCFStringEncodingUTF8); CFRelease(ds); } for (char *c = b; *c; c++) if (*c == '\n') *c = ' ';
+                 DLOG("startSession: MPEG-%d %dx%d, extensions %s", s->codec == kCMVideoCodecType_MPEG1Video ? 1 : 2, dm.width, dm.height, b); }
+    if (dm.width <= 0 || dm.height <= 0 || dm.width > 4080 || dm.height > 4080) return kVTVideoDecoderUnsupportedDataFormatErr;
+    s->w = dm.width; s->h = dm.height;
+    if (!(s->m2 = calloc(1, sizeof *s->m2)) || rm_open(&s->rm) || rm_va_init(&s->rm) || mpeg2dec_open(s->m2, &s->rm, (unsigned)dm.width, (unsigned)dm.height)) {
+        DLOG("startSession: NVDEC session failed"); free(s->m2); s->m2 = NULL; return kVTVideoDecoderMalfunctionErr;
+    }
+    mpeg2dec_default_sequence(s->m2, dm.width, dm.height, s->codec == kCMVideoCodecType_MPEG1Video);
+    s->m2->haveSeq = false;   // a sequence header in the stream replaces it; mpeg2dec_unit falls back to it below
+    s->opened = true;
+    return set_output(s, session, fmt, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, false);
+}
+
 static OSStatus d_startSession(VTVideoDecoderRef o, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt)
 {
     DState *s = dstate(o);
@@ -321,6 +347,7 @@ static OSStatus d_startSession(VTVideoDecoderRef o, VTVideoDecoderSession sessio
     if (s->codec == CODEC_VP9) { OSStatus r = start_vp9(s, session, fmt); pthread_mutex_unlock(&s->lock); return r; }
     if (s->codec == CODEC_AV1) { OSStatus r = start_av1(s, session, fmt); pthread_mutex_unlock(&s->lock); return r; }
     if (s->codec == kCMVideoCodecType_HEVC) { OSStatus r = start_hevc(s, session, fmt); pthread_mutex_unlock(&s->lock); return r; }
+    if (is_mpeg12(s->codec)) { OSStatus r = start_mpeg2(s, session, fmt); pthread_mutex_unlock(&s->lock); return r; }
     size_t count = 0; int nalLen = 4;
     OSStatus st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, NULL, NULL, &count, &nalLen);
     if (st || !count) { DLOG("startSession: no H.264 parameter sets (%d)", (int)st); pthread_mutex_unlock(&s->lock); return kVTVideoDecoderBadDataErr; }
@@ -544,6 +571,46 @@ static OSStatus decode_hevc(DState *s, VTVideoDecoderFrame frame, const uint8_t 
     return res;
 }
 
+// MPEG-1/2: one sample is one coded frame (a frame picture or both fields), emitted in decode order like H.264's; a B
+// picture without both anchors (broken link at the start) is reported dropped
+static OSStatus decode_mpeg2(DState *s, VTVideoDecoderFrame frame, const uint8_t *p, size_t len)
+{
+    Mpeg2Dec *d = s->m2; int r = 0; OSStatus res = noErr;
+    size_t pos = 0; int code; const uint8_t *data; size_t n; int units = 0, first = -1;
+    while (r >= 0 && mpeg2_next_unit(p, len, &pos, &code, &data, &n)) {
+        if (first < 0) first = code;
+        units++;
+        if (code == 0x00 && !d->haveSeq) { d->haveSeq = true; DLOG("no sequence header before the first picture: default sequence %dx%d", d->seq.width, d->seq.height); }
+        const int q = mpeg2dec_unit(d, code, data, n); if (q) r = q;
+    }
+    if (r >= 0) { const int q = mpeg2dec_flush(d); if (q) r = q; }
+    if (r < 0) res = kVTVideoDecoderBadDataErr;
+    CVPixelBufferRef pb = NULL; const bool out = !res && r == 1;
+    if (out) {
+        s->tEngine += d->engine_ms; double tp = nowms();
+        const OSStatus cst = output_buffer(s, (unsigned)d->cur_w, (unsigned)d->cur_h, &pb);
+        if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
+        else {
+            double tc = nowms(); s->tPool += tc - tp;
+            CVPixelBufferLockBaseAddress(pb, 0);
+            mpeg2dec_read_nv12(d, d->cur_surf, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+                               CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1), (unsigned)d->cur_w, (unsigned)d->cur_h);
+            CVPixelBufferUnlockBaseAddress(pb, 0);
+            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
+            s->tCopy += nowms() - tc;
+        }
+        mpeg2dec_release(d, d->cur_surf);
+        s->frames++;
+    }
+    if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes, %d units (first 0x%02x) -> %d, picture %d (%c), status 0x%x, %.2f ms", frame, len, units,
+                                              first & 0xff, (int)res, r, " IPBD"[d->cur_type & 7], d->err_status, d->engine_ms);
+    const double te = nowms();
+    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && !out) ? kVTDecodeInfo_FrameDropped : 0, pb);
+    if (pb) CVPixelBufferRelease(pb);
+    s->tEmit += nowms() - te;
+    return res;
+}
+
 static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CMSampleBufferRef sb, VTDecodeFrameFlags flags, VTDecodeInfoFlags *info)
 {
     DState *s = dstate(o); (void)flags;
@@ -559,8 +626,9 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
         if (s->tmpCap < len) { free(s->tmp); s->tmp = malloc(len); s->tmpCap = s->tmp ? len : 0; }
         if (!s->tmp || CMBlockBufferCopyDataBytes(bb, 0, len, s->tmp)) res = kVTVideoDecoderBadDataErr; else p = (char *)s->tmp;
     }
-    if (s->codec == CODEC_VP9 || s->codec == CODEC_AV1 || s->codec == kCMVideoCodecType_HEVC) {
+    if (s->codec == CODEC_VP9 || s->codec == CODEC_AV1 || s->codec == kCMVideoCodecType_HEVC || is_mpeg12(s->codec)) {
         res = res ? res : s->codec == CODEC_AV1 ? decode_av1(s, frame, (const uint8_t *)p, len) :
+                          is_mpeg12(s->codec) ? decode_mpeg2(s, frame, (const uint8_t *)p, len) :
                           s->codec == kCMVideoCodecType_HEVC ? decode_hevc(s, frame, (const uint8_t *)p, len) : decode_vp9(s, frame, (const uint8_t *)p, len);
         if (res) s->errors++;
         s->tLast = nowms(); s->tIn += s->tLast - tA;
@@ -659,7 +727,7 @@ static const DecoderVTable gDVT = { .base = { NULL, &gDBase }, .decoderClass = &
 
 __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharCode codec, CFAllocatorRef al, VTVideoDecoderRef *out)
 {
-    if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC && codec != CODEC_VP9 && codec != CODEC_AV1) return kVTCouldNotFindVideoDecoderErr;
+    if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC && codec != CODEC_VP9 && codec != CODEC_AV1 && !is_mpeg12(codec)) return kVTCouldNotFindVideoDecoderErr;
     CMBaseObjectRef obj = NULL;
     OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
     if (st) return st;
@@ -668,7 +736,8 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     s->codec = codec;
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
-    DLOG("instance %p (%s)", obj, codec == CODEC_VP9 ? "vp09" : codec == CODEC_AV1 ? "av01" : codec == kCMVideoCodecType_HEVC ? "hvc1" : "avc1");
+    DLOG("instance %p (%s)", obj, codec == CODEC_VP9 ? "vp09" : codec == CODEC_AV1 ? "av01" : codec == kCMVideoCodecType_HEVC ? "hvc1" :
+         codec == kCMVideoCodecType_MPEG2Video ? "mp2v" : codec == kCMVideoCodecType_MPEG1Video ? "mp1v" : "avc1");
     return noErr;
 }
 
@@ -718,6 +787,19 @@ OSStatus NVDecVT_Register(int rating)
         typedef void (*SuppFn)(CMVideoCodecType);
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_AV1); DLOG("opted in to AV1 decoding for this process"); }
+    }
+    if (!getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 (M14): above Apple's software decoders
+        const struct { FourCharCode c; const char *id, *name; } m[] = {
+            { kCMVideoCodecType_MPEG2Video, DECODER_ID_MPEG2, "NVDEC - MPEG-2 - mickys/nvenc" },
+            { kCMVideoCodecType_MPEG1Video, DECODER_ID_MPEG1, "NVDEC - MPEG-1 - mickys/nvenc" } };
+        for (int i = 0; i < 2; i++) {
+            CFStringRef cid = CFStringCreateWithCString(NULL, m[i].id, kCFStringEncodingUTF8), cn = CFStringCreateWithCString(NULL, m[i].name, kCFStringEncodingUTF8);
+            const void *vm[] = { cid, cn, nr, kCFBooleanTrue };
+            CFDictionaryRef im = CFDictionaryCreate(NULL, k, vm, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            OSStatus sm = reg(m[i].c, im, (void *)NVDecVT_CreateInstance);
+            CFRelease(im); CFRelease(cid); CFRelease(cn);
+            DLOG("registered %s -> %d (rating %d)", m[i].id, (int)sm, rating);
+        }
     }
     CFRelease(nr);
     return st;
