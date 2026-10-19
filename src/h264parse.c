@@ -164,6 +164,7 @@ int h264_parse_sps(H264Params *p, const uint8_t *nal, size_t len)
     int ux = cat == 0 ? 1 : (cat == 3 ? 1 : 2), uy = (cat == 0 ? 1 : (cat == 1 ? 2 : 1)) * (2 - s.frame_mbs_only_flag);
     s.width = 16 * (s.pic_width_in_mbs_minus1 + 1) - ux * (s.crop_left + s.crop_right);
     s.height = 16 * (s.pic_height_in_map_units_minus1 + 1) * (2 - s.frame_mbs_only_flag) - uy * (s.crop_top + s.crop_bottom);
+    s.crop_x0 = ux * s.crop_left; s.crop_y0 = uy * s.crop_top;
     if (!s.bitstream_restriction_flag) s.max_dec_frame_buffering = s.max_num_reorder_frames = 16;
     s.valid = true;
     p->sps[s.sps_id] = s;
@@ -180,7 +181,10 @@ int h264_parse_pps(H264Params *p, const uint8_t *nal, size_t len)
     const H264Sps *s = &p->sps[q.sps_id];
     q.entropy_coding_mode_flag = (int)u1(&r); q.bottom_field_pic_order_in_frame_present_flag = (int)u1(&r);
     q.num_slice_groups_minus1 = (int)ue(&r);
-    if (q.num_slice_groups_minus1) return -1;                         // FMO (Baseline/Extended only) is not supported
+    if (q.num_slice_groups_minus1) {   // FMO (Baseline / Extended): NVDEC's setup has no slice groups. The PPS is kept marked,
+        p->pps[q.pps_id] = q; p->pps[q.pps_id].valid = 1;   // so its slices fail instead of decoding with an older PPS
+        return -1;
+    }
     q.num_ref_idx_l0_default_active_minus1 = (int)ue(&r); q.num_ref_idx_l1_default_active_minus1 = (int)ue(&r);
     q.weighted_pred_flag = (int)u1(&r); q.weighted_bipred_idc = (int)u(&r, 2);
     q.pic_init_qp_minus26 = se(&r); q.pic_init_qs_minus26 = se(&r); q.chroma_qp_index_offset = se(&r);
@@ -213,6 +217,7 @@ int h264_parse_slice_header(const H264Params *p, const uint8_t *nal, size_t len,
     o->nal_ref_idc = nal[0] >> 5 & 3; o->nal_unit_type = nal[0] & 31; o->idr = o->nal_unit_type == H264_NAL_IDR;
     o->first_mb_in_slice = (int)ue(&r); o->slice_type = (int)(ue(&r) % 5); o->pps_id = (int)ue(&r);
     if (o->pps_id > 255 || !p->pps[o->pps_id].valid) return -1;
+    if (p->pps[o->pps_id].num_slice_groups_minus1) return -2;          // FMO: not decodable on NVDEC
     const H264Pps *q = &p->pps[o->pps_id]; const H264Sps *s = &p->sps[q->sps_id];
     if (!s->valid) return -1;
     if (s->separate_colour_plane_flag) o->colour_plane_id = (int)u(&r, 2);
@@ -318,4 +323,16 @@ void h264_poc(H264PocState *st, const H264Sps *s, const H264Slice *sl, int *top,
         st->prev_frame_num = sl->has_mmco5 ? 0 : sl->frame_num;
     }
     *top = t; *bottom = b;
+}
+
+bool h264_new_picture(const H264Params *p, const H264Slice *a, const H264Slice *b)
+{
+    if (a->frame_num != b->frame_num || a->pps_id != b->pps_id || a->field_pic_flag != b->field_pic_flag) return true;
+    if (a->field_pic_flag && a->bottom_field_flag != b->bottom_field_flag) return true;
+    if ((a->nal_ref_idc == 0) != (b->nal_ref_idc == 0) || a->idr != b->idr) return true;
+    if (a->idr && b->idr && a->idr_pic_id != b->idr_pic_id) return true;
+    const H264Sps *s = &p->sps[p->pps[b->pps_id].sps_id];
+    if (s->pic_order_cnt_type == 0 && (a->pic_order_cnt_lsb != b->pic_order_cnt_lsb || a->delta_pic_order_cnt_bottom != b->delta_pic_order_cnt_bottom)) return true;
+    if (s->pic_order_cnt_type == 1 && (a->delta_pic_order_cnt[0] != b->delta_pic_order_cnt[0] || a->delta_pic_order_cnt[1] != b->delta_pic_order_cnt[1])) return true;
+    return false;
 }

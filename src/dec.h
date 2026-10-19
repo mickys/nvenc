@@ -23,9 +23,12 @@ typedef struct {
     RmMem setup, bs, offs, status, coloc, hist, mbhist, sem;
     RmMem luma[DEC_SURFACES], chroma[DEC_SURFACES];
     bool busy[DEC_SURFACES];        // held by the caller until h264dec_release (decoded, not yet output)
+    int x0[DEC_SURFACES], y0[DEC_SURFACES];   // each surface's crop origin (applied by the read functions)
     DecRef dpb[16]; int ndpb;
     H264Params params; H264PocState poc;
     int max_long_term_frame_idx;    // -1 = no long-term frame indices
+    int prev_ref_frame_num;         // PrevRefFrameNum (7.4.3), -1 before the first picture
+    int last_ref_surf, last_top, last_bot;   // the newest real reference (non-existing frames point at it)
     NvU32 semval;
     // the picture just decoded
     int cur_surf, cur_top, cur_bot, cur_w, cur_h;
@@ -33,7 +36,7 @@ typedef struct {
     double engine_ms;
     bool verbose;
     // the access unit being collected (slices with start codes, as NVDEC reads them)
-    uint8_t *au; size_t auCap, auN; NvU32 auOff[1024]; int auSlices; H264Slice auFirst;
+    uint8_t *au; size_t auCap, auN; NvU32 auOff[1024]; int auSlices; H264Slice auFirst, auLast;
 } H264Dec;
 
 int  h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH);

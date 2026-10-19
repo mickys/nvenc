@@ -34,18 +34,21 @@ int main(int argc, char **argv)
     FILE *rf = fopen(argv[ai + 1], "rb"); if (!rf) { perror(argv[ai + 1]); return 1; }
 
     // pass 1: display order
-    static H264Params p; H264PocState st = { 0 }; int period = -1, W = 0, H = 0;
+    static H264Params p; H264PocState st = { 0 }; int period = -1, W = 0, H = 0; H264Slice prev; bool havePrev = false;
     size_t pos = 0; const uint8_t *nal; size_t len;
     while (h264_next_annexb(in, n, &pos, &nal, &len)) {
         int t = nal[0] & 31; H264Slice s;
         if (t == H264_NAL_SPS) h264_parse_sps(&p, nal, len);
         else if (t == H264_NAL_PPS) h264_parse_pps(&p, nal, len);
-        else if ((t == H264_NAL_SLICE || t == H264_NAL_IDR) && !h264_parse_slice_header(&p, nal, len, &s) && s.first_mb_in_slice == 0) {
+        else if ((t == H264_NAL_SLICE || t == H264_NAL_IDR) && !h264_parse_slice_header(&p, nal, len, &s) && !s.redundant_pic_cnt &&
+                 (!havePrev || h264_new_picture(&p, &prev, &s)) && (havePrev = true, prev = s, true)) {
             const H264Sps *sps = &p.sps[p.pps[s.pps_id].sps_id];
             if (!W) { W = (sps->pic_width_in_mbs_minus1 + 1) * 16; H = (sps->pic_height_in_map_units_minus1 + 1) * 16 * (2 - sps->frame_mbs_only_flag); }
             int top, bot; h264_poc(&st, sps, &s, &top, &bot);
-            if (s.idr) period++;
-            if (gNP < 100000) gPics[gNP++] = (Pic){ top < bot ? top : bot, period, 0 };
+            // an IDR picture, or one with memory_management_control_operation 5, starts a new period: every earlier picture
+            // is output first (C.4.4) and the MMCO 5 picture's POC becomes relative to itself (8.2.1)
+            if (s.idr || s.has_mmco5) period++;
+            if (gNP < 100000) gPics[gNP++] = (Pic){ s.has_mmco5 ? 0 : (top < bot ? top : bot), period, 0 };
         }
     }
     static Pic *ord[100000]; for (int i = 0; i < gNP; i++) ord[i] = &gPics[i];

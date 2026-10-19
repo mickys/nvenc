@@ -26,6 +26,7 @@ typedef struct {
     int vui_present, video_full_range_flag, colour_primaries, transfer_characteristics, matrix_coefficients;
     int bitstream_restriction_flag, max_num_reorder_frames, max_dec_frame_buffering;
     int width, height;                                // luma samples after cropping
+    int crop_x0, crop_y0;           // the cropped picture's origin in luma samples (frame_crop_left / top_offset)
 } H264Sps;
 
 typedef struct {
@@ -74,3 +75,6 @@ void h264_poc(H264PocState *st, const H264Sps *sps, const H264Slice *s, int *top
 
 // Zig-zag (frame scan) to raster position, for the scaling matrices NVDEC takes in raster order.
 extern const uint8_t h264_zigzag4x4[16], h264_zigzag8x8[64];
+// 7.4.1.2.4: does this slice start a new primary coded picture after prev? (Arbitrary slice order puts slices with
+// first_mb_in_slice != 0 first, so first_mb_in_slice == 0 alone is not enough.)
+bool h264_new_picture(const H264Params *p, const H264Slice *prev, const H264Slice *cur);

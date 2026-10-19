@@ -16,7 +16,7 @@ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &
 int h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
 {
     memset(d, 0, sizeof *d);
-    d->rm = rm; d->maxW = (maxW + 15) & ~15u; d->maxH = (maxH + 15) & ~15u; d->max_long_term_frame_idx = -1;
+    d->rm = rm; d->maxW = (maxW + 15) & ~15u; d->maxH = (maxH + 15) & ~15u; d->max_long_term_frame_idx = -1; d->prev_ref_frame_num = -1; d->last_ref_surf = -1;
     d->pitch = ((size_t)d->maxW + 63) & ~(size_t)63;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
     if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "dec: channel failed\n"); return -1; }
@@ -51,20 +51,27 @@ void h264dec_release(H264Dec *d, int surf) { if (surf >= 0 && surf < DEC_SURFACE
 
 void h264dec_read_nv12(H264Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
 {
-    nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w, h, d->pitch);
-    nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, w, h / 2, d->pitch);
+    const unsigned x0 = (unsigned)d->x0[surf], y0 = (unsigned)d->y0[surf];
+    if (!x0 && !y0) {
+        nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w, h, d->pitch);
+        nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, w, h / 2, d->pitch);
+        return;
+    }
+    // cropped on the left / top (rare): sample by sample
+    for (unsigned r = 0; r < h; r++) for (unsigned x = 0; x < w; x++)
+        y[r * ystride + x] = ((const uint8_t *)d->luma[surf].cpu)[nvenc_in_offset(x0 + x, y0 + r, d->pitch)];
+    for (unsigned r = 0; r < h / 2; r++) for (unsigned x = 0; x < w; x++)
+        uv[r * uvstride + x] = ((const uint8_t *)d->chroma[surf].cpu)[nvenc_in_offset((x0 & ~1u) + x, y0 / 2 + r, d->pitch)];
 }
 
 void h264dec_read_i420(H264Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h)
 {
     const uint8_t *L = d->luma[surf].cpu, *C = d->chroma[surf].cpu;
     uint8_t *u = dst + (size_t)w * h, *v = u + (size_t)w * h / 4;
-    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x += 16) {
-        unsigned n = w - x < 16 ? w - x : 16;
-        memcpy(dst + (size_t)y * w + x, L + nvenc_in_offset(x, y, d->pitch), n);
-    }
+    const unsigned x0 = (unsigned)d->x0[surf], y0 = (unsigned)d->y0[surf];
+    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) dst[(size_t)y * w + x] = L[nvenc_in_offset(x0 + x, y0 + y, d->pitch)];
     for (unsigned y = 0; y < h / 2; y++) for (unsigned x = 0; x < w; x++) {
-        uint8_t c = C[nvenc_in_offset(x, y, d->pitch)];
+        uint8_t c = C[nvenc_in_offset((x0 & ~1u) + x, y0 / 2 + y, d->pitch)];
         if (x & 1) v[(size_t)y * (w / 2) + x / 2] = c; else u[(size_t)y * (w / 2) + x / 2] = c;
     }
 }
@@ -141,6 +148,20 @@ static int decode_pending(H264Dec *d)
     const unsigned wmb = (unsigned)sps->pic_width_in_mbs_minus1 + 1, hmb = (unsigned)(sps->pic_height_in_map_units_minus1 + 1) * (2u - (unsigned)sps->frame_mbs_only_flag);
     if (wmb * 16 > d->maxW || hmb * 16 > d->maxH) { fprintf(stderr, "dec: %ux%u is larger than the session (%ux%u)\n", wmb * 16, hmb * 16, d->maxW, d->maxH); return -1; }
     if (sl->field_pic_flag) { fprintf(stderr, "dec: field pictures are not supported yet\n"); return -1; }
+    // gaps in frame_num (8.2.5.2): each missing frame_num becomes a "non-existing" short-term reference frame, marked
+    // by the sliding window, so that later sliding windows, picture numbers (MMCO) and the default reference lists match;
+    // it is never used for prediction and points at the newest real reference's surface
+    if (!sl->idr && d->prev_ref_frame_num >= 0 && d->last_ref_surf >= 0) {
+        const int maxfn = max_frame_num(sps);
+        int fn = (d->prev_ref_frame_num + 1) % maxfn;
+        if (sl->frame_num != d->prev_ref_frame_num && sl->frame_num != fn) {
+            if (d->verbose) printf("  dec: frame_num gap %d -> %d%s\n", d->prev_ref_frame_num, sl->frame_num, sps->gaps_in_frame_num_value_allowed_flag ? "" : " (not allowed by the SPS)");
+            for (int k = 0; fn != sl->frame_num && k < maxfn; fn = (fn + 1) % maxfn, k++) {
+                H264Slice ne = { 0 }; ne.frame_num = fn; ne.nal_ref_idc = 1;
+                mark(d, sps, &ne, d->last_ref_surf, d->last_top, d->last_bot);
+            }
+        }
+    }
     int top, bot; h264_poc(&d->poc, sps, sl, &top, &bot);
     // a free surface: not held by the caller, not a reference
     int surf = -1;
@@ -235,7 +256,9 @@ static int decode_pending(H264Dec *d)
         printf("  dec: surf %2d %c frame_num %3d POC %4d refs %d -> %u MBs ok, %u err, status 0x%x, %.2f ms\n", surf, "PBIps"[sl->slice_type],
                sl->frame_num, top, nref, d->mbs_ok, d->mbs_err, d->err_status, d->engine_ms);
     mark(d, sps, sl, surf, top, bot);
+    if (sl->nal_ref_idc) { d->prev_ref_frame_num = sl->has_mmco5 ? 0 : sl->frame_num; d->last_ref_surf = surf; d->last_top = top; d->last_bot = bot; }
     d->busy[surf] = true; d->cur_surf = surf; d->cur_top = top; d->cur_bot = bot; d->cur_w = sps->width; d->cur_h = sps->height;
+    d->x0[surf] = sps->crop_x0; d->y0[surf] = sps->crop_y0;
     d->auN = 0; d->auSlices = 0;
     return 1;
 }
@@ -248,11 +271,16 @@ int h264dec_nal(H264Dec *d, const uint8_t *nal, size_t len)
     const int t = nal[0] & 31;
     if (t == H264_NAL_SLICE || t == H264_NAL_IDR) {
         H264Slice s;
-        if (h264_parse_slice_header(&d->params, nal, len, &s)) { fprintf(stderr, "dec: slice header parse failed\n"); return -1; }
+        const int pr = h264_parse_slice_header(&d->params, nal, len, &s);
+        if (pr == -2) { fprintf(stderr, "dec: slice groups (FMO) are not supported by NVDEC\n"); return -1; }
+        if (pr) { fprintf(stderr, "dec: slice header parse failed\n"); return -1; }
+        if (s.slice_type == 3 || s.slice_type == 4) { fprintf(stderr, "dec: SP / SI slices (Extended profile) are not supported by NVDEC\n"); return -1; }
         int r = 0;
-        if (d->auSlices && s.first_mb_in_slice == 0) r = decode_pending(d);   // a new picture starts
+        if (s.redundant_pic_cnt > 0) return 0;                  // redundant slices: the primary picture is complete without them
+        if (d->auSlices && h264_new_picture(&d->params, &d->auLast, &s)) r = decode_pending(d);   // a new picture starts (7.4.1.2.4)
         if (r < 0) return r;
         if (!d->auSlices) d->auFirst = s;
+        d->auLast = s;
         if (d->auSlices >= 1024 || d->auN + len + 3 > d->auCap) { fprintf(stderr, "dec: access unit too large\n"); return -1; }
         d->auOff[d->auSlices++] = (NvU32)d->auN;
         d->au[d->auN++] = 0; d->au[d->auN++] = 0; d->au[d->auN++] = 1; memcpy(d->au + d->auN, nal, len); d->auN += len;
