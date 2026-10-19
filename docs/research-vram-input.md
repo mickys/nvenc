@@ -318,3 +318,50 @@ Same WindowServer session, Safari motion test, 3158x1816 layer, switched with `/
 3158x1740, 1920x1080 and 333x211, over 100 rounds. With the defaults installed, the limit in this test is now the
 producer: WebKit paints the animation on the CPU at ~180 % CPU, because its GPU process can't load the plugin
 (see above).
+
+## Driver 2.3.7: is the fork's surface-in still worth it? (2026-10-19)
+
+NullMoth's plugin against the fork's (GPU upload + keep uploaded surfaces mapped), Safari `motion.html` (full-window CSS
+gradient animation), RTX 4090, macOS 26.7.1, PAT fix, BAR1 4 GB. `vm/tahoe/bench/desk-ab.sh` (dev VM) installs each
+plugin, logs out and in so WindowServer loads it, quits OBS/Parsec/Terminal (OBS's preview alone keeps ~30 display
+transactions/s going), opens Safari in a fixed window and samples 3 x 20 s with `desk-run.sh` / `desk-sample.sh`.
+Release builds alternate stock, ours, stock, ours; the diagnostic build switches `/tmp/nvmtl-surfin-mode` in one session
+and reports the cost per upload. Raw: `notes/desk-ab-20261019-0417.log`, `-0434.log`, `-0439.log`.
+
+| window (pixels) | plugin | display transactions/s | WindowServer user / system | WebKit GPU process | per upload |
+|---|---|---|---|---|---|
+| 3200x1800 | NullMoth 2.3.7 (2 x 3 samples) | 34.9-40.2 (avg 38.6) | 45 % / 14 % | 222 % | 6.7-7.6 ms (diag, mode 0) |
+| 3200x1800 | fork (2 x 3 samples) | 39.6-42.4 (avg 41.1) | 33 % / 22 % | 199 % | 6.3-6.6 ms (diag, mode 3) |
+| 3840x2110 | NullMoth 2.3.7 | 20.8-21.2 | 33 % / 40 % | 469 % | 19.4-19.7 ms |
+| 3840x2110 | fork | 33.7-34.5 | 29 % / 26 % | 265 % | 7.8-7.9 ms |
+| 3840x2110 | GPU upload only (mode 2) | 32.8-33.9 | 28 % / 28 % | 285 % | 7.7 ms |
+| 3840x2110 | keep mapped only (mode 1) | 31.2-32.3 | 40 % / 18 % | 294 % | 8.5-8.8 ms |
+
+- **Up to about 3200x1800 the fork's plugin is barely better on 2.3.7** (+6 % display rate, a few points less
+  WindowServer CPU). NullMoth's own copy got much faster than in 2.3.6 (15.0 → ~7 ms per upload for this window), which
+  closed most of the gap measured then.
+- **A full-screen 4K window is where it still matters:** NullMoth's CPU copy takes ~19.7 ms per upload (nearly 3x the
+  smaller window for 1.4x the pixels: the pages are faulted in again every frame), the display falls to ~21 updates/s,
+  and WebKit's GPU process spends ~470 % of a core. The fork's plugin: 7.8 ms, ~34 updates/s (+63 %), WebKit ~265 %.
+- **Either part alone gives most of it** (GPU upload 33.4/s, keep mapped 31.8/s, both 34/s). GPU upload holds no extra
+  memory and takes the most user CPU off WindowServer; keeping surfaces mapped retains up to 384 MB of client surfaces
+  in WindowServer.
+- Display rates are compositor updates (`debug.nvaccel_iop_ok`), not Safari's frame rate. The idle desktop is 0 in all
+  variants.
+
+### Smaller windows: 1920x1080 and 1280x720 pixels (minimal patch 4868217, 2026-10-19)
+
+Same harness, release builds, Safari window 960x540 / 640x360 pt on the HiDPI 3840x2160@50 desktop (the upload a
+full-screen window makes on a 1080p / 720p display). Raw: `notes/desk-ab-20261019-0603.log`, `-0608.log`.
+
+| window (pixels) | plugin | updates/s | WindowServer user / system | WebKit GPU process |
+|---|---|---|---|---|
+| 1920x1080 | NullMoth 2.3.7 | 50.0 (the 50 Hz cap) | 24-25 % / 6 % | 91 % |
+| 1920x1080 | + patch | 50.0 | 22 % / 11 % | 88 % |
+| 1280x720 | NullMoth 2.3.7 | 50.0 | 25-26 % / 8 % | 44 % |
+| 1280x720 | + patch | 50.0 | 22 % / 11 % | 42 % |
+
+No difference at these sizes: both hold the display rate, and WindowServer's total CPU is within a few points (the
+patch moves some of it from user to system time). The gain is specific to large (4K-class) CPU-drawn windows. A
+native 1080p@60 desktop would lift the 50 Hz cap; NVRMFB only offers rasters at or above the firmware's (4K here),
+hence the fork-only `nvfbsmall=1` experiment.
