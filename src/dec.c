@@ -10,9 +10,6 @@
 #include "clc9b0.h"
 #include "nvdec_drv.h"
 
-// pending access unit (slices of one picture, with start codes, as NVDEC reads them)
-static uint8_t gBs[32 << 20]; static size_t gBsN; static NvU32 gOff[1024]; static int gNSlices; static H264Slice gFirst;
-
 static NvU32 hi(NvU64 a) { return (NvU32)(a >> 8); }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
@@ -24,9 +21,11 @@ int h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
     if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "dec: channel failed\n"); return -1; }
     const size_t mbs = (size_t)(d->maxW / 16) * (d->maxH / 16);
+    d->auCap = (size_t)d->maxW * d->maxH * 2 > (4u << 20) ? (size_t)d->maxW * d->maxH * 2 : (4u << 20);
+    if (!(d->au = malloc(d->auCap))) return -1;
     const size_t luma = nvenc_in_plane_size(d->pitch, d->maxH) + 65536, chroma = nvenc_in_plane_size(d->pitch, d->maxH / 2) + 65536;
     struct { RmMem *m; size_t size; } b[] = {
-        { &d->setup, 0x10000 }, { &d->bs, sizeof gBs + 0x10000 }, { &d->offs, 0x2000 }, { &d->status, 0x1000 },
+        { &d->setup, 0x10000 }, { &d->bs, d->auCap + 0x10000 }, { &d->offs, 0x2000 }, { &d->status, 0x1000 },
         { &d->coloc, mbs * 256 * DEC_SURFACES }, { &d->hist, 8u << 20 }, { &d->mbhist, 8u << 20 }, { &d->sem, 0x1000 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++)
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "dec: alloc failed\n"); return -1; }
@@ -35,7 +34,7 @@ int h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
             rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "dec: surface alloc failed\n"); return -1; }
     memset(d->coloc.cpu, 0, d->coloc.size); memset(d->hist.cpu, 0, d->hist.size); memset(d->mbhist.cpu, 0, d->mbhist.size);
     chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
-    gBsN = 0; gNSlices = 0;
+    d->auN = 0; d->auSlices = 0;
     return 0;
 }
 
@@ -45,6 +44,7 @@ void h264dec_close(H264Dec *d)
     RmMem *m[] = { &d->setup, &d->bs, &d->offs, &d->status, &d->coloc, &d->hist, &d->mbhist, &d->sem };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) rm_mem_free(d->rm, m[i]);
     for (int i = 0; i < DEC_SURFACES; i++) { rm_mem_free(d->rm, &d->luma[i]); rm_mem_free(d->rm, &d->chroma[i]); }
+    free(d->au); d->au = NULL;
 }
 
 void h264dec_release(H264Dec *d, int surf) { if (surf >= 0 && surf < DEC_SURFACES) d->busy[surf] = false; }
@@ -135,8 +135,8 @@ static void mark(H264Dec *d, const H264Sps *s, const H264Slice *sl, int surf, in
 // ---- one access unit ----
 static int decode_pending(H264Dec *d)
 {
-    if (!gNSlices) return 0;
-    const H264Slice *sl = &gFirst;
+    if (!d->auSlices) return 0;
+    const H264Slice *sl = &d->auFirst;
     const H264Pps *pps = &d->params.pps[sl->pps_id]; const H264Sps *sps = &d->params.sps[pps->sps_id];
     const unsigned wmb = (unsigned)sps->pic_width_in_mbs_minus1 + 1, hmb = (unsigned)(sps->pic_height_in_map_units_minus1 + 1) * (2u - (unsigned)sps->frame_mbs_only_flag);
     if (wmb * 16 > d->maxW || hmb * 16 > d->maxH) { fprintf(stderr, "dec: %ux%u is larger than the session (%ux%u)\n", wmb * 16, hmb * 16, d->maxW, d->maxH); return -1; }
@@ -153,11 +153,11 @@ static int decode_pending(H264Dec *d)
 
     // end of picture: eos[] + explicitEOSPresentFlag (T8.03)
     static const uint8_t eos[16] = { 0, 0, 1, 0x0b, 0, 0, 1, 0x0b };
-    memcpy(d->bs.cpu, gBs, gBsN);
-    memcpy(d->offs.cpu, gOff, sizeof(NvU32) * (size_t)gNSlices);
+    memcpy(d->bs.cpu, d->au, d->auN);
+    memcpy(d->offs.cpu, d->auOff, sizeof(NvU32) * (size_t)d->auSlices);
     nvdec_h264_pic_s *ps = d->setup.cpu; memset(ps, 0, sizeof *ps);
     memcpy(ps->eos, eos, 16); ps->explicitEOSPresentFlag = 1;
-    ps->stream_len = (unsigned)gBsN; ps->slice_count = (unsigned)gNSlices;
+    ps->stream_len = (unsigned)d->auN; ps->slice_count = (unsigned)d->auSlices;
     ps->mbhist_buffer_size = (unsigned)d->mbhist.size;
     ps->log2_max_pic_order_cnt_lsb_minus4 = sps->log2_max_pic_order_cnt_lsb_minus4;
     ps->delta_pic_order_always_zero_flag = sps->delta_pic_order_always_zero_flag;
@@ -236,7 +236,7 @@ static int decode_pending(H264Dec *d)
                sl->frame_num, top, nref, d->mbs_ok, d->mbs_err, d->err_status, d->engine_ms);
     mark(d, sps, sl, surf, top, bot);
     d->busy[surf] = true; d->cur_surf = surf; d->cur_top = top; d->cur_bot = bot; d->cur_w = sps->width; d->cur_h = sps->height;
-    gBsN = 0; gNSlices = 0;
+    d->auN = 0; d->auSlices = 0;
     return 1;
 }
 
@@ -250,12 +250,12 @@ int h264dec_nal(H264Dec *d, const uint8_t *nal, size_t len)
         H264Slice s;
         if (h264_parse_slice_header(&d->params, nal, len, &s)) { fprintf(stderr, "dec: slice header parse failed\n"); return -1; }
         int r = 0;
-        if (gNSlices && s.first_mb_in_slice == 0) r = decode_pending(d);   // a new picture starts
+        if (d->auSlices && s.first_mb_in_slice == 0) r = decode_pending(d);   // a new picture starts
         if (r < 0) return r;
-        if (!gNSlices) gFirst = s;
-        if (gNSlices >= 1024 || gBsN + len + 3 > sizeof gBs) { fprintf(stderr, "dec: access unit too large\n"); return -1; }
-        gOff[gNSlices++] = (NvU32)gBsN;
-        gBs[gBsN++] = 0; gBs[gBsN++] = 0; gBs[gBsN++] = 1; memcpy(gBs + gBsN, nal, len); gBsN += len;
+        if (!d->auSlices) d->auFirst = s;
+        if (d->auSlices >= 1024 || d->auN + len + 3 > d->auCap) { fprintf(stderr, "dec: access unit too large\n"); return -1; }
+        d->auOff[d->auSlices++] = (NvU32)d->auN;
+        d->au[d->auN++] = 0; d->au[d->auN++] = 0; d->au[d->auN++] = 1; memcpy(d->au + d->auN, nal, len); d->auN += len;
         return r;
     }
     // any other NAL unit before a picture's slices ends the previous picture

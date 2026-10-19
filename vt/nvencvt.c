@@ -719,6 +719,8 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     const char *const names[] = { nameAvc, nameHevc };
     static const char *const codecs[] = { "H.264", "HEVC" };
     rename_encoders(ids, names, codecs, sh ? 1 : 2);
+    extern OSStatus NVDecVT_Register(int rating);   // vt/nvencvt_dec.c: the H.264 decoder (NVDEC), same rating
+    NVDecVT_Register(rating);
     return st;
 }
 

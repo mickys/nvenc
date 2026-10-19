@@ -87,7 +87,26 @@ int main(int argc, char **argv)
         if (!rs) printf("  software decoder: %d frames in %.1f ms (%.0f fps), using hardware %d, error %d\n", s.n, s.ms, s.n * 1000.0 / s.ms, hwS, (int)s.err);
         if (!rh && !rs && h.n && s.n) {
             int n = h.n < s.n ? h.n : s.n; double sum = 0, mn = 99;
-            for (int i = 0; i < n; i++) { double p = psnr((__bridge CVPixelBufferRef)h.frames[i], (__bridge CVPixelBufferRef)s.frames[i]); sum += p; if (p < mn) mn = p; }
+            for (int i = 0; i < n; i++) {
+                double p = psnr((__bridge CVPixelBufferRef)h.frames[i], (__bridge CVPixelBufferRef)s.frames[i]); sum += p; if (p < mn) mn = p;
+                if (getenv("VTDECODE_DUMP") && i == atoi(getenv("VTDECODE_DUMP"))) {   // both outputs of frame i as NV12 (tight)
+                    for (int w = 0; w < 2; w++) {
+                        CVPixelBufferRef pbx = (__bridge CVPixelBufferRef)(w ? s.frames[i] : h.frames[i]);
+                        CVPixelBufferLockBaseAddress(pbx, kCVPixelBufferLock_ReadOnly);
+                        char fn[64]; snprintf(fn, sizeof fn, "/tmp/vtdecode-%s-%d.nv12", w ? "sw" : "hw", i); FILE *df = fopen(fn, "wb");
+                        size_t W = CVPixelBufferGetWidth(pbx), H = CVPixelBufferGetHeight(pbx);
+                        for (int pl = 0; pl < 2; pl++) { const uint8_t *b0 = CVPixelBufferGetBaseAddressOfPlane(pbx, pl); size_t st = CVPixelBufferGetBytesPerRowOfPlane(pbx, pl);
+                            for (size_t r = 0; r < (pl ? H / 2 : H); r++) fwrite(b0 + r * st, 1, W, df); }
+                        fclose(df); CVPixelBufferUnlockBaseAddress(pbx, kCVPixelBufferLock_ReadOnly);
+                    }
+                }
+                if (p < 99 && getenv("VTDECODE_V")) {
+                    CVPixelBufferRef a = (__bridge CVPixelBufferRef)h.frames[i], b = (__bridge CVPixelBufferRef)s.frames[i];
+                    printf("  frame %d: %.2f dB; hw %zux%zu stride %zu, sw %zux%zu stride %zu, pts hw %.3f sw %.3f\n", i, p,
+                           CVPixelBufferGetWidth(a), CVPixelBufferGetHeight(a), CVPixelBufferGetBytesPerRowOfPlane(a, 0),
+                           CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b), CVPixelBufferGetBytesPerRowOfPlane(b, 0), 0.0, 0.0);
+                }
+            }
             printf("RESULT hw=%d frames=%d/%d psnr_hw_vs_sw avg %.2f min %.2f dB (99 = identical)\n", hwH, h.n, (int)samples.count, sum / n, mn);
         } else printf("RESULT hw=0 (no hardware decode)\n");
     }

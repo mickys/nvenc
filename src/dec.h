@@ -32,6 +32,8 @@ typedef struct {
     unsigned mbs_ok, mbs_err, err_status;
     double engine_ms;
     bool verbose;
+    // the access unit being collected (slices with start codes, as NVDEC reads them)
+    uint8_t *au; size_t auCap, auN; NvU32 auOff[1024]; int auSlices; H264Slice auFirst;
 } H264Dec;
 
 int  h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH);
