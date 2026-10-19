@@ -73,6 +73,7 @@ typedef struct {
     int h264Profile;                // ProfileLevel asked for: 66 Baseline, 77 Main, 100 High; 0 = not set (High)
     int entropy;                    // H264EntropyMode asked for: 0 CAVLC, 1 CABAC, -1 not set
     bool fullRange;                 // input 420f / xf20 (full range, encoded as is): VUI video_full_range_flag (T7.01)
+    bool c444;                      // first frame 444v / 444f (or x444 / xf44 for HEVC Main 10): 4:4:4 stream (M13)
     bool opened, failed;
     int engine;
     Enc enc;
@@ -271,6 +272,9 @@ static OSStatus set_pixel_attrs(State *s)
         f[0] = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; f[1] = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange; f[2] = kCVPixelFormatType_32BGRA;
         f[3] = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange; f[4] = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; f[5] = kCVPixelFormatType_ARGB2101010LEPacked;
         nf = 6;
+    } else {   // 4:4:4 when the input is (M13): H.264 High 4:4:4 Predictive 8-bit, HEVC Main 4:4:4 (10)
+        f[nf++] = s->ten ? kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange;
+        f[nf++] = s->ten ? kCVPixelFormatType_444YpCbCr10BiPlanarFullRange : kCVPixelFormatType_444YpCbCr8BiPlanarFullRange;
     }
     if (access("/tmp/nvencvt.anyfmt", F_OK) == 0) {   // diagnostics: offer every format a capture source might deliver, log what comes
         int all[] = { kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
@@ -321,7 +325,7 @@ static OSStatus open_encoder(State *s)
     if (s->av1) refs = 1;   // AV1: one reference (LAST), as NVIDIA's driver in low-latency mode (enc.c)
     EncConfig c = { .codec = s->av1 ? ENC_AV1 : s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange,
-                    .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s) };
+                    .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s), .chroma444 = s->c444 };
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
@@ -367,7 +371,7 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s profile %d cabac %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video", s->hevc ? 0 : c.h264_profile, s->hevc ? 0 : (int)c.cabac,
+    LOG("%s%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s profile %d cabac %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", s->c444 ? " 4:4:4" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video", s->hevc ? 0 : s->enc.cfg.chroma444 ? 244 : c.h264_profile, s->hevc ? 0 : (int)s->enc.cfg.cabac,
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
     if (st) { enc_close(&s->enc); return st; }
 opened:
@@ -450,7 +454,10 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     // the stream's range follows the first frame: full-range YCbCr (420f, xf20) is encoded as it is and signalled in the
     // VUI; BGRA and l10r are converted by us to video range, and 420v / x420 are video range (T7.01)
     if (!s->opened) { OSType p0 = CVPixelBufferGetPixelFormatType(img);
-        s->fullRange = p0 == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange; }
+        s->fullRange = p0 == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
+                       p0 == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange || p0 == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+        s->c444 = !s->av1 && (p0 == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange || p0 == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange ||
+                              (s->ten && (p0 == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange || p0 == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange))); }
     if (!s->opened && s->av1) { OSType p0 = CVPixelBufferGetPixelFormatType(img);   // AV1: 10-bit when the input is
         s->ten = p0 == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange || p0 == kCVPixelFormatType_ARGB2101010LEPacked; }
     if (!s->opened && !s->failed && (st = open_encoder(s))) s->failed = true;
@@ -459,8 +466,11 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     bool bgra = pf == kCVPixelFormatType_32BGRA;
     bool p010 = pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
     bool l10r = pf == kCVPixelFormatType_ARGB2101010LEPacked;
-    if ((pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && !bgra && !((p010 || l10r) && s->ten)) ||
-        (bgra && s->ten) ||
+    bool nv24 = pf == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange || pf == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange;
+    bool x444 = pf == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange || pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    if (s->c444 ? !(s->ten ? x444 : nv24) :   // a 4:4:4 session takes only its own format, a 4:2:0 one none of them
+        ((pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && !bgra && !((p010 || l10r) && s->ten)) ||
+         (bgra && s->ten)) ||
         (int)CVPixelBufferGetWidth(img) < s->width || (int)CVPixelBufferGetHeight(img) < s->height) {
         { OSType be = CFSwapInt32HostToBig(pf); LOG("unexpected pixel buffer %.4s %zux%zu", (char *)&be, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img)); }
         pthread_mutex_unlock(&s->lock);
@@ -476,7 +486,7 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     if (!s->dumpEs && (s->frames % 30) == 0 && access("/tmp/nvencvt.dump", F_OK) == 0) {   // start a dump (diagnostics)
         char p[128]; snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.es", (int)getpid()); s->dumpEs = fopen(p, "wb");
-        snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.nv12", (int)getpid()); s->dumpYuv = bgra || p010 || l10r ? NULL : fopen(p, "wb");
+        snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.nv12", (int)getpid()); s->dumpYuv = bgra || p010 || l10r || s->c444 ? NULL : fopen(p, "wb");
         s->dumpYuvLeft = 30; s->dumpIdr = true;
         if (s->dumpEs) { uint8_t h[256]; size_t n = enc_headers(&s->enc, h); fwrite(h, 1, n, s->dumpEs); }
         LOG("dump started (%dx%d, %s)", s->width, s->height, bgra ? "BGRA: stream only" : "NV12");
@@ -489,7 +499,11 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         }
         if (--s->dumpYuvLeft == 0) { fclose(s->dumpYuv); s->dumpYuv = NULL; }
     }
-    if (l10r) enc_load_l10r(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
+    if (nv24) enc_load_nv24(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                            CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    else if (x444) enc_load_x444(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                                 CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    else if (l10r) enc_load_l10r(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
     else if (p010) enc_load_p010(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
                             CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
     else if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));

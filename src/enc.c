@@ -31,6 +31,9 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->cfg = *cfg;
     if (e->cfg.num_refs < 1) e->cfg.num_refs = 1;
     if (e->cfg.num_refs > ENC_MAX_REFS) e->cfg.num_refs = ENC_MAX_REFS;
+    // H.264 4:4:4: the engine's CABAC coder only knows 4:2:0 (broken IDRs, then an engine exception, RM error 0x2f on P
+    // frames); CAVLC 4:4:4 is correct (M13 T13.02)
+    if (cfg->codec == ENC_H264 && cfg->chroma444) e->cfg.cabac = false;
     int W = cfg->width, H = cfg->height;
     e->wmb = (W + 15) / 16; e->hmb = (H + 15) / 16;
     Rm *rm = &e->rm; rm->verbose = cfg->verbose;
@@ -50,13 +53,13 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->pitch = ((size_t)e->wmb * 16 + 63) & ~(size_t)63;
     e->lumaSz = (nvenc_in_plane_size(e->pitch * e->bps, inRows) + 255) & ~(size_t)255;
     e->chromaSz = nvenc_in_plane_size(e->pitch * e->bps, inRows / 2);
-    if (hevc && cfg->chroma444) e->chromaSz = 2 * e->lumaSz;   // 4:4:4: two full-size planes (or one interleaved plane twice as wide)
+    if (cfg->chroma444 && !av1) e->chromaSz = 2 * e->lumaSz;   // 4:4:4: two full-size planes (or one interleaved plane twice as wide)
     // reconstructed pictures: block-linear block_height 2, rows rounded up to 32 (the engine writes that far)
     e->rPitch = ((size_t)e->wmb * 16 + 255) & ~(size_t)255;
     const size_t rRows = av1 ? (((size_t)H + 63) & ~(size_t)63) : (((size_t)e->hmb * 16 + 31) & ~(size_t)31);
     e->rLuma = (e->rPitch * e->bps * rRows + 255) & ~(size_t)255;
     e->rSlot = (e->rLuma + e->rPitch * e->bps * (av1 ? rRows / 2 : (((size_t)e->hmb * 8 + 31) & ~(size_t)31)) + 0xffff) & ~(size_t)0xffff;
-    if (hevc && cfg->chroma444) e->rSlot = (3 * e->rLuma + 0xffff) & ~(size_t)0xffff;   // 4:4:4: chroma twice the luma plane
+    if (cfg->chroma444 && !av1) e->rSlot = (3 * e->rLuma + 0xffff) & ~(size_t)0xffff;   // 4:4:4: chroma twice the luma plane
     if (hevc || av1) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
     int slots = e->cfg.num_refs + 1;
     size_t mbs = (size_t)e->wmb * e->hmb;
@@ -133,9 +136,9 @@ void enc_close(Enc *e)
 
 static H264Params hdr_params(const Enc *e)
 {
-    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51,
+    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51, .chroma444 = e->cfg.chroma444,
         .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = 2, .num_ref_frames = e->cfg.num_refs,
-        .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
+        .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100 || e->cfg.chroma444, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
 }
 
 // ENC_HEVC_OFF=ts,cqd,sao,amp,sis: experiment switches (T6.05), applied to the headers and the engine setup alike
@@ -222,6 +225,14 @@ void enc_load_nv24(Enc *e, const uint8_t *y, size_t ys, const uint8_t *uv, size_
     RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
     nvenc_in_tile_plane(in->cpu, y, ys, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
     nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, uv, uvs, 2 * (size_t)e->cfg.width, (size_t)e->cfg.height, 2 * e->pitch);
+}
+
+// x444 / xf44: 16-bit samples (10 bits high) in two planes, the chroma plane Cb Cr interleaved: HEVC Main 4:4:4 10
+void enc_load_x444(Enc *e, const uint16_t *y, size_t ys, const uint16_t *uv, size_t uvs)
+{
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    load_16(e, in->cpu, y, ys, (size_t)e->cfg.width, (size_t)e->cfg.height);
+    nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, (const uint8_t *)uv, uvs, 4 * (size_t)e->cfg.width, (size_t)e->cfg.height, 4 * e->pitch);
 }
 
 void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride)
@@ -555,15 +566,16 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     nvenc_h264_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
         .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
     nvenc_h264_surface_cfg_s rc = ic; rc.sfc_pitch = rc.sfc_pitch_chroma = (unsigned short)e->rPitch;
+    if (e->cfg.chroma444) { ic.sfc_pitch_chroma = (unsigned short)(2 * e->pitch); rc.sfc_pitch_chroma = (unsigned short)(2 * e->rPitch); }   // as HEVC 4:4:4
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;   // plane offsets 0: each plane has its own method
     H264Params hp = hdr_params(e);
-    ps->sps_data.profile_idc = (unsigned)hp.profile_idc; ps->sps_data.level_idc = (unsigned)hp.level_idc; ps->sps_data.chroma_format_idc = 1;
+    ps->sps_data.profile_idc = (unsigned)hp.profile_idc; ps->sps_data.level_idc = (unsigned)hp.level_idc; ps->sps_data.chroma_format_idc = e->cfg.chroma444 ? 3 : 1;
     ps->sps_data.pic_order_cnt_type = 2; ps->sps_data.log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4;
     ps->sps_data.frame_mbs_only = 1;
     ps->pps_data.num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1);
     ps->pps_data.deblocking_filter_control_present_flag = 1;
     // High / CABAC as nullmoth's libnvenc_h264 sets them (profile_idc, entropy and 8x8 transform flags; T7.02)
-    ps->pps_data.entropy_coding_mode_flag = e->cfg.cabac; ps->pps_data.transform_8x8_mode_flag = e->cfg.h264_profile == 100;
+    ps->pps_data.entropy_coding_mode_flag = e->cfg.cabac; ps->pps_data.transform_8x8_mode_flag = e->cfg.h264_profile == 100 || e->cfg.chroma444;
     nvenc_h264_rc_s *r = &ps->rate_control;
     r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
     for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
@@ -604,7 +616,7 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     }
 
     setup_me((void *)((NvU8 *)setup->cpu + OFF_ME), !idr);
-    setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr, e->cfg.h264_profile == 100);
+    setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr, e->cfg.h264_profile == 100 || e->cfg.chroma444);
     }
 
     // ---- methods ----

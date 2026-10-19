@@ -28,7 +28,8 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
     put(&b, (unsigned)p->level_idc, 8);
     ue(&b, 0);                                         // seq_parameter_set_id
     if (p->profile_idc >= 100) {
-        ue(&b, 1);                                     // chroma_format_idc 4:2:0
+        ue(&b, p->chroma444 ? 3 : 1);                  // chroma_format_idc 4:4:4 / 4:2:0
+        if (p->chroma444) put(&b, 0, 1);               // separate_colour_plane_flag
         ue(&b, 0); ue(&b, 0);                          // bit depth luma/chroma - 8
         put(&b, 0, 1);                                 // qpprime_y_zero_transform_bypass
         put(&b, 0, 1);                                 // seq_scaling_matrix_present
@@ -42,7 +43,8 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
     ue(&b, (unsigned)hmb - 1);                         // frame_mbs_only: map units = macroblocks
     put(&b, 1, 1);                                     // frame_mbs_only_flag
     put(&b, 1, 1);                                     // direct_8x8_inference
-    int cr = (wmb * 16 - p->width) / 2, cb = (hmb * 16 - p->height) / 2;   // 4:2:0 crop units are 2 pixels
+    const int cu = p->chroma444 ? 1 : 2;               // crop units: 2 pixels in 4:2:0, 1 in 4:4:4
+    int cr = (wmb * 16 - p->width) / cu, cb = (hmb * 16 - p->height) / cu;
     put(&b, cr || cb ? 1 : 0, 1);
     if (cr || cb) { ue(&b, 0); ue(&b, (unsigned)cr); ue(&b, 0); ue(&b, (unsigned)cb); }
     put(&b, p->vui ? 1 : 0, 1);                        // vui_parameters_present

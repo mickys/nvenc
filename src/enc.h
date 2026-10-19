@@ -28,9 +28,9 @@ typedef struct {
     bool spin;                      // wait for the engine by spinning only (default: spin 50 us, then sleep on the NVENC event)
     int depth;                      // frames in flight with enc_submit (1..ENC_MAX_DEPTH, default 1)
     int h264_profile;               // H.264: 77 Main (default) or 100 High (adds the 8x8 transform and 8x8 intra modes)
-    bool cabac;                     // H.264: CABAC entropy coding (else CAVLC)
+    bool cabac;                     // H.264: CABAC entropy coding (else CAVLC; always CAVLC in 4:4:4)
     int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
-    bool chroma444;                 // HEVC: 4:4:4 (Main 4:4:4; enc_load_yuv444)
+    bool chroma444;                 // HEVC Main 4:4:4 / H.264 High 4:4:4 Predictive (enc_load_yuv444 / enc_load_nv24)
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;
@@ -85,6 +85,8 @@ void enc_load_p010(Enc *e, const uint16_t *y, size_t yStride, const uint16_t *uv
 void enc_load_yuv444(Enc *e, const uint8_t *y, size_t ys, const uint8_t *u, size_t us, const uint8_t *v, size_t vs);
 // copy a biplanar 8-bit 4:4:4 frame (Cb Cr interleaved at full width, CoreVideo 444v / 444f) into a 4:4:4 session's input
 void enc_load_nv24(Enc *e, const uint8_t *y, size_t ys, const uint8_t *uv, size_t uvs);
+// HEVC Main 4:4:4 10: x444 / xf44 (16-bit samples, 10 bits high; Cb Cr interleaved in the second plane)
+void enc_load_x444(Enc *e, const uint16_t *y, size_t ys, const uint16_t *uv, size_t uvs);
 // convert an l10r frame (ARGB2101010 LE, ScreenCaptureKit's 10-bit format) into a 10-bit session's input (BT.709 video range)
 void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride);
 // convert a BGRA frame (BT.709 video range) into the next frame's input surface
