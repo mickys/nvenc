@@ -1,11 +1,12 @@
 // nvencvt_dec.c (M8, T8.06; M10, T10.04): the H.264 and VP9 decoders in libnvencvt, as VideoToolbox decoder plugins.
 // Interface: Apple's SPI declarations published in WebKit (vendor/webkit-spi/VTVideoDecoderSPI.h, CMBaseObjectSPI.h); the
 // three class slots that header leaves "TBD" are given the shapes their names suggest and log every call. Decoding:
-// src/dec.c (H.264) and src/vp9dec.c (VP9) on NVDEC.
+// src/dec.c (H.264), src/vp9dec.c (VP9) and src/av1dec.c (AV1) on NVDEC.
 // Registered by NVEncVT_Register next to the encoders (NVENCVT_NO_DEC=1 leaves it out), so every way the encoder gets
 // into a process (NullMoth's NVMTL_NVENCVT hook, nvenc-run) brings the decoder too.
 #include "dec.h"
 #include "vp9dec.h"
+#include "av1dec.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
@@ -50,7 +51,8 @@ typedef struct { CMBaseVTable base; const DecoderClass *decoderClass; } DecoderV
 
 #define DECODER_ID "org.nvenc.videodecoder.avc"
 #define DECODER_ID_VP9 "org.nvenc.videodecoder.vp9"
-enum { CODEC_VP9 = 0x76703039 };   // 'vp09' (kCMVideoCodecType_VP9)
+#define DECODER_ID_AV1 "org.nvenc.videodecoder.av1"
+enum { CODEC_VP9 = 0x76703039, CODEC_AV1 = 0x61763031 };   // 'vp09', 'av01' (kCMVideoCodecType_VP9 / _AV1)
 static bool gDLog; static FILE *gDLogF;
 #define DLOG(...) do { if (gDLog) { FILE *lf_ = gDLogF ? gDLogF : stderr; fprintf(lf_, "nvdecvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
 
@@ -61,6 +63,7 @@ typedef struct {
     FourCharCode codec;
     Rm rm; H264Dec dec; bool opened;
     Rm *vrm; Vp9Dec *vp9;           // VP9: on the heap, so that the next session can take them over (park_vp9)
+    Av1Dec *av1;                    // AV1: likewise (with vrm)
     int nalLen, w, h;
     OSType pf;                      // output pixel format (VP9: depends on the bit depth)
     CFDictionaryRef colour;         // colour attachments for the output (from the format description)
@@ -97,6 +100,37 @@ static void park_vp9(Rm *rm, Vp9Dec *d)
     });
 }
 
+// AV1 the same way, without growing: a session is sized for the sequence header's largest frame
+static Rm *gParkRmA; static Av1Dec *gParkA; static unsigned gParkGenA;
+static void free_av1(Rm *rm, Av1Dec *d) { if (d) { av1dec_close(d); free(d); } if (rm) { rm_close(rm); free(rm); } }
+static void park_av1(Rm *rm, Av1Dec *d)
+{
+    pthread_mutex_lock(&gParkLock);
+    Rm *orm = gParkRmA; Av1Dec *od = gParkA;
+    gParkRmA = rm; gParkA = d; const unsigned gen = ++gParkGenA;
+    pthread_mutex_unlock(&gParkLock);
+    free_av1(orm, od);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        pthread_mutex_lock(&gParkLock);
+        Rm *r = NULL; Av1Dec *x = NULL;
+        if (gParkGenA == gen) { r = gParkRmA; x = gParkA; gParkRmA = NULL; gParkA = NULL; }
+        pthread_mutex_unlock(&gParkLock);
+        free_av1(r, x);
+    });
+}
+static int open_av1(DState *s, unsigned w, unsigned h, int depth)
+{
+    pthread_mutex_lock(&gParkLock);
+    Rm *prm = NULL; Av1Dec *pd = NULL;
+    if (gParkA && gParkA->bit_depth == depth && gParkA->maxW >= w && gParkA->maxH >= h) { prm = gParkRmA; pd = gParkA; gParkRmA = NULL; gParkA = NULL; gParkGenA++; }
+    pthread_mutex_unlock(&gParkLock);
+    if (pd) { s->vrm = prm; s->av1 = pd; DLOG("startSession: took over the previous session's stream"); return 0; }
+    Rm *rm = calloc(1, sizeof *rm); Av1Dec *d = calloc(1, sizeof *d);
+    if (!rm || !d || rm_open(rm) || rm_va_init(rm) || av1dec_open(d, rm, w, h, depth)) { free(d); if (rm) { rm_close(rm); free(rm); } return -1; }
+    s->vrm = rm; s->av1 = d;
+    return 0;
+}
+
 // A decoder for a new session: the parked one if it fits (or a larger one that takes over its stream), else a new one.
 static int open_vp9(DState *s, unsigned w, unsigned h, int depth)
 {
@@ -124,6 +158,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     pthread_mutex_lock(&s->lock);
     if (s->opened) {
         if (s->codec == CODEC_VP9) { park_vp9(s->vrm, s->vp9); s->vrm = NULL; s->vp9 = NULL; }
+        else if (s->codec == CODEC_AV1) { park_av1(s->vrm, s->av1); s->vrm = NULL; s->av1 = NULL; }
         else { h264dec_close(&s->dec); rm_close(&s->rm); }
         s->opened = false;
     }
@@ -141,7 +176,11 @@ static void b_finalize(CMBaseObjectRef o)
     b_invalidate(o); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
     *(DState **)CMBaseObjectGetDerivedStorage(o) = NULL;
 }
-static CFStringRef b_desc(CMBaseObjectRef o) { return dstate(o)->codec == CODEC_VP9 ? CFSTR("nvenc VP9 decoder (NVDEC)") : CFSTR("nvenc H.264 decoder (NVDEC)"); }
+static CFStringRef b_desc(CMBaseObjectRef o)
+{
+    const FourCharCode c = dstate(o)->codec;
+    return c == CODEC_VP9 ? CFSTR("nvenc VP9 decoder (NVDEC)") : c == CODEC_AV1 ? CFSTR("nvenc AV1 decoder (NVDEC)") : CFSTR("nvenc H.264 decoder (NVDEC)");
+}
 static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef al, void *out)
 {
     (void)o; (void)al;
@@ -186,12 +225,54 @@ static OSStatus start_vp9(DState *s, VTVideoDecoderSession session, CMVideoForma
     return set_output(s, session, fmt, pf, full);
 }
 
+// AV1: the av1C atom (AV1 Codec ISO Media File Format Binding: marker/version, profile/level, tier, high_bitdepth,
+// twelve_bit, monochrome, subsampling, ..., then the configuration OBUs, normally the sequence header), whose sequence
+// header the decoder reads first: it gives the largest frame size, which the session is sized for
+static OSStatus start_av1(DState *s, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt)
+{
+    const CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fmt);
+    CFDictionaryRef atoms = CMFormatDescriptionGetExtension(fmt, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+    CFDataRef av1c = atoms && CFGetTypeID(atoms) == CFDictionaryGetTypeID() ? CFDictionaryGetValue(atoms, CFSTR("av1C")) : NULL;
+    int depth = 8; unsigned W = (unsigned)dim.width, H = (unsigned)dim.height; bool full = false, ok = true;
+    const uint8_t *cfg = NULL; size_t cfgN = 0;
+    if (av1c && CFGetTypeID(av1c) == CFDataGetTypeID() && CFDataGetLength(av1c) >= 4) {
+        const uint8_t *b = CFDataGetBytePtr(av1c);
+        const int high = (b[2] >> 6) & 1, twelve = (b[2] >> 5) & 1, ssx = (b[2] >> 3) & 1, ssy = (b[2] >> 2) & 1, mono = (b[2] >> 4) & 1;
+        depth = twelve ? 12 : high ? 10 : 8;
+        ok = (ssx && ssy) || mono;
+        cfg = b + 4; cfgN = (size_t)CFDataGetLength(av1c) - 4;
+        // the sequence header: largest frame size and colour range
+        for (size_t pos = 0; pos < cfgN;) {
+            Av1Obu o; if (av1_obu(cfg + pos, cfgN - pos, &o)) break;
+            Av1Seq sq;
+            if (o.type == AV1_OBU_SEQUENCE_HEADER && !av1_parse_sequence_header(&sq, cfg + pos + o.header_len, o.payload_len)) {
+                if ((unsigned)sq.max_frame_width_minus_1 + 1 > W) W = (unsigned)sq.max_frame_width_minus_1 + 1;
+                if ((unsigned)sq.max_frame_height_minus_1 + 1 > H) H = (unsigned)sq.max_frame_height_minus_1 + 1;
+                full = sq.color_range;
+            }
+            pos += o.header_len + o.payload_len;
+        }
+    }
+    ok = ok && (depth == 8 || depth == 10) && W <= 8192 && H <= 8192 && dim.width >= 128 && dim.height >= 128;
+    DLOG("startSession: AV1 %dx%d (largest %ux%u), %d-bit, %s range%s%s", dim.width, dim.height, W, H, depth, full ? "full" : "video",
+         av1c ? "" : " (no av1C: assumed)", ok ? "" : " - NOT SUPPORTED");
+    if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
+    s->w = dim.width; s->h = dim.height;
+    if (open_av1(s, W, H, depth)) { DLOG("startSession: NVDEC session failed"); return kVTVideoDecoderMalfunctionErr; }
+    s->opened = true;
+    if (cfgN) av1dec_tu(s->av1, cfg, cfgN);   // the sequence header (samples may leave it out)
+    const OSType pf = depth == 8 ? (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+                                 : (full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange);
+    return set_output(s, session, fmt, pf, full);
+}
+
 static OSStatus d_startSession(VTVideoDecoderRef o, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt)
 {
     DState *s = dstate(o);
     pthread_mutex_lock(&s->lock);
     s->session = session; s->fmt = (CMVideoFormatDescriptionRef)CFRetain(fmt);
     if (s->codec == CODEC_VP9) { OSStatus r = start_vp9(s, session, fmt); pthread_mutex_unlock(&s->lock); return r; }
+    if (s->codec == CODEC_AV1) { OSStatus r = start_av1(s, session, fmt); pthread_mutex_unlock(&s->lock); return r; }
     size_t count = 0; int nalLen = 4;
     OSStatus st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, NULL, NULL, &count, &nalLen);
     if (st || !count) { DLOG("startSession: no H.264 parameter sets (%d)", (int)st); pthread_mutex_unlock(&s->lock); return kVTVideoDecoderBadDataErr; }
@@ -269,6 +350,28 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     return noErr;
 }
 
+// A buffer for the picture: from the session's pool, or for a frame of another size (VP9 / AV1 resizing) one made with
+// the pool's attributes but its own size (the pool's Width / Height keys would win over CVPixelBufferCreate's arguments)
+static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRef *pb)
+{
+    if (!getenv("NVDEC_KEEPSIZE") && ((int)w != s->w || (int)h != s->h)) {
+        // a new frame size: give VideoToolbox pixel buffer attributes of that size (else it converts each picture to the
+        // old size for clients like ffmpeg that keep their session across the change: AV1 after a new sequence header)
+        DLOG("frame size %dx%d -> %ux%u: new pixel buffer attributes", s->w, s->h, w, h);
+        s->w = (int)w; s->h = (int)h;
+        set_output(s, s->session, s->fmt, s->pf, s->pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || s->pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
+    }
+    CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(s->session);
+    if (pool && (int)w == s->w && (int)h == s->h) return CVPixelBufferPoolCreatePixelBuffer(NULL, pool, pb);
+    CFDictionaryRef pa = pool ? CVPixelBufferPoolGetPixelBufferAttributes(pool) : NULL;
+    CFMutableDictionaryRef a = pa ? CFDictionaryCreateMutableCopy(NULL, 0, pa)
+                                  : CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionaryRemoveValue(a, kCVPixelBufferWidthKey); CFDictionaryRemoveValue(a, kCVPixelBufferHeightKey);
+    const OSStatus r = CVPixelBufferCreate(NULL, w, h, s->pf, a, pb);
+    CFRelease(a);
+    return r;
+}
+
 // VP9: one sample is one chunk (in MP4 / WebM a superframe: hidden frames, then the one shown frame); emits the shown
 // picture. A sample that shows nothing emits the frame it decoded: ffmpeg splits superframes and feeds hidden frames one
 // by one, keeps each returned picture as that frame and shows it itself on show_existing_frame (T10.04; reporting such a
@@ -288,13 +391,7 @@ static OSStatus decode_vp9(DState *s, VTVideoDecoderFrame frame, const uint8_t *
     if (!res && shown >= 0) {
         const unsigned w = s->vp9->w[shown], h = s->vp9->h[shown];
         double tp = nowms();
-        CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(s->session);
-        OSStatus cst = -1;
-        if (pool && (int)w == s->w && (int)h == s->h) cst = CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb);
-        else {   // a resized frame: same attributes, its own size
-            CFDictionaryRef pa = pool ? CVPixelBufferPoolGetPixelBufferAttributes(pool) : NULL;
-            cst = CVPixelBufferCreate(NULL, w, h, s->pf, pa, &pb);
-        }
+        const OSStatus cst = output_buffer(s, w, h, &pb);
         if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
         else {
             double tc = nowms(); s->tPool += tc - tp;
@@ -317,6 +414,48 @@ static OSStatus decode_vp9(DState *s, VTVideoDecoderFrame frame, const uint8_t *
     return res;
 }
 
+// AV1: one sample is one temporal unit (OBUs; in MP4 one shown frame, hidden frames before it). As with VP9, a sample
+// that shows nothing emits the frame it decoded (ffmpeg feeds frames one by one).
+static OSStatus decode_av1(DState *s, VTVideoDecoderFrame frame, const uint8_t *p, size_t len)
+{
+    OSStatus res = noErr; int shown = -1;
+    const int r = av1dec_tu(s->av1, p, len);
+    if (r < 0) res = kVTVideoDecoderBadDataErr;
+    else {
+        s->tEngine += s->av1->engine_ms;
+        if (r == 1) shown = s->av1->cur_surf;
+        else if (s->av1->dec_surf >= 0) {   // a hidden frame: what its show_existing_frame will show (with its film grain)
+            shown = s->av1->twin[s->av1->dec_surf] >= 0 ? s->av1->twin[s->av1->dec_surf] : s->av1->dec_surf;
+            s->av1->busy[shown] = true;
+        }
+    }
+    CVPixelBufferRef pb = NULL;
+    if (!res && shown >= 0) {
+        const unsigned w = s->av1->w[shown], h = s->av1->h[shown];
+        double tp = nowms();
+        const OSStatus cst = output_buffer(s, w, h, &pb);
+        if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
+        else {
+            double tc = nowms(); s->tPool += tc - tp;
+            CVPixelBufferLockBaseAddress(pb, 0);
+            av1dec_read_nv12(s->av1, shown, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+                             CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1), w, h);
+            CVPixelBufferUnlockBaseAddress(pb, 0);
+            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
+            s->tCopy += nowms() - tc;
+        }
+        av1dec_release(s->av1, shown);
+        s->frames++;
+    }
+    if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes -> %d, shown %d, status 0x%x, %.2f ms", frame, len, (int)res, shown,
+                                              s->av1->err_status, s->av1->engine_ms);
+    const double te = nowms();
+    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && shown < 0) ? kVTDecodeInfo_FrameDropped : 0, pb);
+    if (pb) CVPixelBufferRelease(pb);
+    s->tEmit += nowms() - te;
+    return res;
+}
+
 static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CMSampleBufferRef sb, VTDecodeFrameFlags flags, VTDecodeInfoFlags *info)
 {
     DState *s = dstate(o); (void)flags;
@@ -332,8 +471,8 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
         if (s->tmpCap < len) { free(s->tmp); s->tmp = malloc(len); s->tmpCap = s->tmp ? len : 0; }
         if (!s->tmp || CMBlockBufferCopyDataBytes(bb, 0, len, s->tmp)) res = kVTVideoDecoderBadDataErr; else p = (char *)s->tmp;
     }
-    if (s->codec == CODEC_VP9) {
-        res = res ? res : decode_vp9(s, frame, (const uint8_t *)p, len);
+    if (s->codec == CODEC_VP9 || s->codec == CODEC_AV1) {
+        res = res ? res : s->codec == CODEC_AV1 ? decode_av1(s, frame, (const uint8_t *)p, len) : decode_vp9(s, frame, (const uint8_t *)p, len);
         if (res) s->errors++;
         s->tLast = nowms(); s->tIn += s->tLast - tA;
         pthread_mutex_unlock(&s->lock);
@@ -431,7 +570,7 @@ static const DecoderVTable gDVT = { .base = { NULL, &gDBase }, .decoderClass = &
 
 __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharCode codec, CFAllocatorRef al, VTVideoDecoderRef *out)
 {
-    if (codec != kCMVideoCodecType_H264 && codec != CODEC_VP9) return kVTCouldNotFindVideoDecoderErr;
+    if (codec != kCMVideoCodecType_H264 && codec != CODEC_VP9 && codec != CODEC_AV1) return kVTCouldNotFindVideoDecoderErr;
     CMBaseObjectRef obj = NULL;
     OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
     if (st) return st;
@@ -440,7 +579,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     s->codec = codec;
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
-    DLOG("instance %p (%s)", obj, codec == CODEC_VP9 ? "vp09" : "avc1");
+    DLOG("instance %p (%s)", obj, codec == CODEC_VP9 ? "vp09" : codec == CODEC_AV1 ? "av01" : "avc1");
     return noErr;
 }
 
@@ -473,6 +612,16 @@ OSStatus NVDecVT_Register(int rating)
         typedef void (*SuppFn)(CMVideoCodecType);
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_VP9); DLOG("opted in to VP9 decoding for this process"); }
+    }
+    if (!getenv("NVENCVT_NO_AV1DEC")) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
+        const void *va[] = { CFSTR(DECODER_ID_AV1), CFSTR("NVDEC - AV1 - mickys/nvenc"), nr, kCFBooleanTrue };
+        CFDictionaryRef ia = CFDictionaryCreate(NULL, k, va, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        OSStatus sa = reg(CODEC_AV1, ia, (void *)NVDecVT_CreateInstance);
+        CFRelease(ia);
+        DLOG("registered %s -> %d (rating %d)", DECODER_ID_AV1, (int)sa, rating);
+        typedef void (*SuppFn)(CMVideoCodecType);
+        SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
+        if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_AV1); DLOG("opted in to AV1 decoding for this process"); }
     }
     CFRelease(nr);
     return st;

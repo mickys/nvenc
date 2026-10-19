@@ -551,6 +551,7 @@ static int decode_frame(Av1Dec *d)
         bool ref = false; for (int i = 0; i < 8; i++) if (d->ref[i] == k) ref = true;
         if (!ref) d->twin[k] = -1;
     }
+    d->dec_surf = surf;
     if (disp >= 0) { d->w[disp] = d->w[surf]; d->h[disp] = d->h[surf]; }
     if (!f->show_frame) { if (disp >= 0) d->twin[surf] = disp; return 0; }
     if (disp >= 0) surf = disp;
@@ -567,7 +568,18 @@ int av1dec_tu(Av1Dec *d, const uint8_t *buf, size_t n)
         d->st.temporal_id = o.temporal_id; d->st.spatial_id = o.spatial_id;
         const uint8_t *tg = NULL; size_t tgn = 0;
         if (o.type == AV1_OBU_SEQUENCE_HEADER) {
-            if (av1_parse_sequence_header(&d->st.seq, pl, o.payload_len)) return -1;
+            Av1Seq sq;
+            if (av1_parse_sequence_header(&sq, pl, o.payload_len)) return -1;
+            // a new sequence with larger frames or another bit depth starts with a key frame: reallocate for it
+            const unsigned W = (unsigned)sq.max_frame_width_minus_1 + 1, H = (unsigned)sq.max_frame_height_minus_1 + 1;
+            if (W > d->maxW || H > d->maxH || sq.bit_depth != d->bit_depth) {
+                Rm *rm = d->rm; const bool v = d->verbose;
+                for (int i = 0; i < AV1_SURFACES; i++) if (d->busy[i]) { fprintf(stderr, "av1dec: new sequence while pictures are held\n"); return -1; }
+                av1dec_close(d);
+                if (av1dec_open(d, rm, W > d->maxW ? W : d->maxW, H > d->maxH ? H : d->maxH, sq.bit_depth)) return -1;
+                d->verbose = v;
+            }
+            d->st.seq = sq;
         } else if (o.type == AV1_OBU_FRAME_HEADER || o.type == AV1_OBU_FRAME) {
             if (d->have_hdr && o.type == AV1_OBU_FRAME_HEADER) { pos += o.header_len + o.payload_len; continue; }   // a copy
             size_t hb;
@@ -579,7 +591,7 @@ int av1dec_tu(Av1Dec *d, const uint8_t *buf, size_t n)
                     for (int i = 0; i < 8; i++) { if (i != d->f.frame_to_show_map_idx) memcpy(d->cdf[i].cpu, d->cdf[d->f.frame_to_show_map_idx].cpu, d->cdf_size); d->ref[i] = sfc; }
                 av1_end_frame(&d->st, &d->f);
                 if (shown) av1dec_release(d, d->cur_surf);
-                int out = sfc;
+                int out = sfc; d->dec_surf = -1;
                 if (d->twin[sfc] >= 0) { out = d->twin[sfc]; d->twin[sfc] = -1; }   // its film-grain output
                 d->busy[out] = true; d->cur_surf = out; d->cur_w = (int)d->w[out]; d->cur_h = (int)d->h[out]; shown = 1;
             } else {

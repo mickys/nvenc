@@ -51,6 +51,7 @@ int main(int argc, char **argv)
         free(buf);
     }
     fseek(fp, 32, SEEK_SET);
+    if (getenv("AV1_SMALL")) { W = ih[12] | ih[13] << 8; H = ih[14] | ih[15] << 8; }   // start at the first size (as VideoToolbox does)
     Rm rm = { 0 }; if (rm_open(&rm) || rm_va_init(&rm)) { fprintf(stderr, "RM failed\n"); return 1; }
     static Av1Dec d; if (av1dec_open(&d, &rm, W, H, bd)) return 1;
     d.verbose = verbose; gB = d.bps; gBD = bd;
