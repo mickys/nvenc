@@ -35,6 +35,7 @@ int main(int argc, char **argv)
 
     // pass 1: display order
     static H264Params p; H264PocState st = { 0 }; int period = -1, W = 0, H = 0; H264Slice prev; bool havePrev = false;
+    bool pfValid = false; int pfPar = 0, pfFn = -1;   // a first field waiting for its second
     size_t pos = 0; const uint8_t *nal; size_t len;
     while (h264_next_annexb(in, n, &pos, &nal, &len)) {
         int t = nal[0] & 31; H264Slice s;
@@ -47,8 +48,13 @@ int main(int argc, char **argv)
             int top, bot; h264_poc(&st, sps, &s, &top, &bot);
             // an IDR picture, or one with memory_management_control_operation 5, starts a new period: every earlier picture
             // is output first (C.4.4) and the MMCO 5 picture's POC becomes relative to itself (8.2.1)
+            // the second field of a pair belongs to its first field's frame (opposite parity, same frame_num)
+            const bool second = s.field_pic_flag && pfValid && pfPar != s.bottom_field_flag && pfFn == s.frame_num;
+            const int poc = s.has_mmco5 ? 0 : s.field_pic_flag ? (s.bottom_field_flag ? bot : top) : (top < bot ? top : bot);
+            pfValid = s.field_pic_flag && !second; pfPar = s.bottom_field_flag; pfFn = s.frame_num;
+            if (second) { if (gNP && poc < gPics[gNP - 1].poc) gPics[gNP - 1].poc = poc; continue; }
             if (s.idr || s.has_mmco5) period++;
-            if (gNP < 100000) gPics[gNP++] = (Pic){ s.has_mmco5 ? 0 : (top < bot ? top : bot), period, 0 };
+            if (gNP < 100000) gPics[gNP++] = (Pic){ poc, period, 0 };
         }
     }
     static Pic *ord[100000]; for (int i = 0; i < gNP; i++) ord[i] = &gPics[i];
@@ -62,12 +68,12 @@ int main(int argc, char **argv)
     int done = 0, exact = 0, first_bad = -1; double worst = 99, eng = 0; size_t fs = 0; uint8_t *ref = NULL, *out = NULL;
     const double t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e6;
     pos = 0;
-    for (;;) {
+    for (bool end = false; !end;) {
         int r;
         if (h264_next_annexb(in, n, &pos, &nal, &len)) r = h264dec_nal(&d, nal, len);
-        else { r = h264dec_flush(&d); if (r == 0) break; }
+        else { r = h264dec_flush(&d); end = true; }
         if (r < 0) { printf("decode error at picture %d\n", done); break; }
-        if (r == 0) continue;
+        while (h264dec_pop(&d)) {
         const unsigned w = (unsigned)d.cur_w, h = (unsigned)d.cur_h;
         if (!fs) { fs = (size_t)w * h * 3 / 2; ref = malloc(fs); out = malloc(fs); }
         eng += d.engine_ms;
@@ -91,6 +97,7 @@ int main(int argc, char **argv)
                                                         done, disp, ps >= 99 ? "exact" : "DIFF", ps, d.mbs_ok, d.mbs_err, d.err_status);
         h264dec_release(&d, d.cur_surf);
         done++;
+        }
     }
     const double t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e6;
     printf("RESULT %d of %d pictures decoded, %d bit-exact, first difference at %d, worst %.2f dB; engine %.2f ms/picture (%.0f fps), NV12 out %.2f ms/picture, total %.1f ms\n",

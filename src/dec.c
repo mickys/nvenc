@@ -76,67 +76,117 @@ void h264dec_read_i420(H264Dec *d, int surf, uint8_t *dst, unsigned w, unsigned 
     }
 }
 
-// ---- decoded reference picture marking (8.2.5) ----
+// ---- decoded reference picture marking (8.2.5), per field ----
 static int max_frame_num(const H264Sps *s) { return 1 << (s->log2_max_frame_num_minus4 + 4); }
-static int pic_num(const H264Dec *d, const DecRef *r, int cur_fn, int maxfn) { (void)d; return r->frame_num > cur_fn ? r->frame_num - maxfn : r->frame_num; }
+static int fnwrap(const DecRef *r, int cur_fn, int maxfn) { return r->frame_num > cur_fn ? r->frame_num - maxfn : r->frame_num; }
+static void upd(DecRef *r) { r->ref = (r->mark[0] == 2 || r->mark[1] == 2) ? 2 : (r->mark[0] || r->mark[1]) ? 1 : 0; }
+static void unmark_long(DecRef *r) { for (int p = 0; p < 2; p++) if (r->mark[p] == 2) r->mark[p] = 0; upd(r); }
 // A reference keeps its dpb[] slot for as long as it is a reference: the co-located data of a picture names its
 // references by slot, so moving entries broke temporal direct prediction (T8.04). Empty slots have ref 0; ndpb is the
 // number of slots in use up to the highest one.
 static void trim(H264Dec *d) { while (d->ndpb > 0 && !d->dpb[d->ndpb - 1].ref) d->ndpb--; }
 
+// after decoding a reference picture (frame or field): MMCO / sliding window, then the picture itself
 static void mark(H264Dec *d, const H264Sps *s, const H264Slice *sl, int surf, int top, int bot)
 {
     if (!sl->nal_ref_idc) return;
-    const int maxfn = max_frame_num(s), cur = sl->frame_num;
-    DecRef me = { surf, sl->frame_num, 0, top, bot, 1 };
+    const bool field = sl->field_pic_flag; const int par = sl->bottom_field_flag;
+    const int maxfn = max_frame_num(s), cur = sl->frame_num, cpn = field ? 2 * cur + 1 : cur;
+    int me = -1;                                                // the frame store of the current picture's first field
+    if (field && !sl->nonexist_marker) for (int i = 0; i < d->ndpb; i++)
+        if (d->dpb[i].ref && !d->dpb[i].nonexist && d->dpb[i].surf == surf && d->dpb[i].frame_num == cur) me = i;
+    int curMark = 1, curLt = 0, fn = cur;
     if (sl->idr) {
-        for (int i = 0; i < d->ndpb; i++) d->dpb[i].ref = 0;
-        if (sl->long_term_reference_flag) { me.ref = 2; me.long_term_frame_idx = 0; d->max_long_term_frame_idx = 0; }
-        else d->max_long_term_frame_idx = -1;
+        if (me < 0) { for (int i = 0; i < d->ndpb; i++) { d->dpb[i].mark[0] = d->dpb[i].mark[1] = 0; upd(&d->dpb[i]); } }
+        if (sl->long_term_reference_flag) { curMark = 2; curLt = 0; d->max_long_term_frame_idx = 0; }
+        else if (me < 0) d->max_long_term_frame_idx = -1;
     } else if (sl->adaptive_ref_pic_marking_mode_flag) {
         for (int k = 0; k < sl->n_mmco; k++) {
             const H264Mmco *m = &sl->mmco[k];
             if (m->op == 1 || m->op == 3) {                     // picNumX = CurrPicNum - (difference_of_pic_nums_minus1 + 1)
-                int x = cur - (m->difference_of_pic_nums_minus1 + 1);
-                for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].ref == 1 && pic_num(d, &d->dpb[i], cur, maxfn) == x) {
-                    if (m->op == 1) d->dpb[i].ref = 0;
-                    else {
-                        for (int j = 0; j < d->ndpb; j++) if (j != i && d->dpb[j].ref == 2 && d->dpb[j].long_term_frame_idx == m->long_term_frame_idx) d->dpb[j].ref = 0;
-                        d->dpb[i].ref = 2; d->dpb[i].long_term_frame_idx = m->long_term_frame_idx;
+                const int x = cpn - (m->difference_of_pic_nums_minus1 + 1);
+                for (int i = 0; i < d->ndpb; i++) {
+                    DecRef *r = &d->dpb[i]; const int w = fnwrap(r, cur, maxfn);
+                    for (int p = 0; p < 2; p++) {
+                        // frames: frames / pairs with both fields short-term, PicNum = FrameNumWrap; fields: each field,
+                        // PicNum = 2 FrameNumWrap + 1 (same parity) or 2 FrameNumWrap (opposite parity)
+                        const bool hit = field ? (r->mark[p] == 1 && (p == par ? 2 * w + 1 : 2 * w) == x)
+                                               : (p == 0 && r->mark[0] == 1 && r->mark[1] == 1 && w == x);
+                        if (!hit) continue;
+                        if (m->op == 1) { if (field) r->mark[p] = 0; else r->mark[0] = r->mark[1] = 0; }
+                        else {
+                            for (int j = 0; j < d->ndpb; j++) if (j != i && d->dpb[j].ref == 2 && d->dpb[j].long_term_frame_idx == m->long_term_frame_idx) unmark_long(&d->dpb[j]);
+                            if (r->ref == 2 && r->long_term_frame_idx != m->long_term_frame_idx) unmark_long(r);
+                            if (field) r->mark[p] = 2; else r->mark[0] = r->mark[1] = 2;
+                            r->long_term_frame_idx = m->long_term_frame_idx;
+                        }
+                        upd(r);
                     }
-                    break;
                 }
-            } else if (m->op == 2) {
-                for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].ref == 2 && d->dpb[i].long_term_frame_idx == m->long_term_pic_num) d->dpb[i].ref = 0;
+            } else if (m->op == 2) {                            // LongTermPicNum = LongTermFrameIdx (frames), 2 x + 1 / 2 x (fields)
+                for (int i = 0; i < d->ndpb; i++) {
+                    DecRef *r = &d->dpb[i]; const int lt = r->long_term_frame_idx;
+                    if (!field) { if (r->mark[0] == 2 && r->mark[1] == 2 && lt == m->long_term_pic_num) { r->mark[0] = r->mark[1] = 0; upd(r); } }
+                    else for (int p = 0; p < 2; p++) if (r->mark[p] == 2 && (p == par ? 2 * lt + 1 : 2 * lt) == m->long_term_pic_num) { r->mark[p] = 0; upd(r); }
+                }
             } else if (m->op == 4) {
                 d->max_long_term_frame_idx = m->max_long_term_frame_idx_plus1 - 1;
-                for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].ref == 2 && d->dpb[i].long_term_frame_idx > d->max_long_term_frame_idx) d->dpb[i].ref = 0;
+                for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].ref == 2 && d->dpb[i].long_term_frame_idx > d->max_long_term_frame_idx) unmark_long(&d->dpb[i]);
             } else if (m->op == 5) {
-                for (int i = 0; i < d->ndpb; i++) d->dpb[i].ref = 0;
-                d->max_long_term_frame_idx = -1;
-                me.frame_num = 0;                               // the current picture becomes frame_num 0, POC relative to itself
-                int mn = top < bot ? top : bot; me.top_poc = top - mn; me.bot_poc = bot - mn;
+                for (int i = 0; i < d->ndpb; i++) { d->dpb[i].mark[0] = d->dpb[i].mark[1] = 0; upd(&d->dpb[i]); }
+                d->max_long_term_frame_idx = -1; me = -1;
+                fn = 0;                                         // the current picture becomes frame_num 0, POC relative to itself
+                const int mn = field ? (par ? bot : top) : (top < bot ? top : bot); top -= mn; bot -= mn;
             } else if (m->op == 6) {
-                for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].ref == 2 && d->dpb[i].long_term_frame_idx == m->long_term_frame_idx) d->dpb[i].ref = 0;
-                me.ref = 2; me.long_term_frame_idx = m->long_term_frame_idx;
+                for (int i = 0; i < d->ndpb; i++) if (i != me && d->dpb[i].ref == 2 && d->dpb[i].long_term_frame_idx == m->long_term_frame_idx) unmark_long(&d->dpb[i]);
+                curMark = 2; curLt = m->long_term_frame_idx;
             }
         }
-    } else {                                                    // sliding window (8.2.5.3)
+    } else if (me < 0) {                                        // sliding window (8.2.5.3), not for the second field of a pair
         int ns = 0, nl = 0;
-        for (int i = 0; i < d->ndpb; i++) { if (d->dpb[i].ref == 1) ns++; else if (d->dpb[i].ref == 2) nl++; }
-        int maxref = s->max_num_ref_frames > 0 ? s->max_num_ref_frames : 1;
+        for (int i = 0; i < d->ndpb; i++) { const DecRef *r = &d->dpb[i]; if (r->mark[0] == 1 || r->mark[1] == 1) ns++; else if (r->ref) nl++; }
+        const int maxref = s->max_num_ref_frames > 0 ? s->max_num_ref_frames : 1;
         if (ns + nl >= maxref && ns > 0) {
             int best = -1, bw = 0;
-            for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].ref == 1) {
-                int w = pic_num(d, &d->dpb[i], cur, maxfn);
+            for (int i = 0; i < d->ndpb; i++) if (d->dpb[i].mark[0] == 1 || d->dpb[i].mark[1] == 1) {
+                const int w = fnwrap(&d->dpb[i], cur, maxfn);
                 if (best < 0 || w < bw) { best = i; bw = w; }
             }
-            d->dpb[best].ref = 0;
+            DecRef *r = &d->dpb[best]; for (int p = 0; p < 2; p++) if (r->mark[p] == 1) r->mark[p] = 0; upd(r);
         }
     }
-    int slot = 0; while (slot < d->ndpb && d->dpb[slot].ref) slot++;
-    if (slot < 16) { d->dpb[slot] = me; if (slot == d->ndpb) d->ndpb++; }
+    if (me >= 0) {                                              // the second field joins its first field's frame store
+        DecRef *r = &d->dpb[me]; r->mark[par] = curMark; if (curMark == 2) r->long_term_frame_idx = curLt;
+        if (par) r->bot_poc = bot; else r->top_poc = top;
+        upd(r);
+    } else {
+        DecRef n = { .surf = surf, .frame_num = fn, .long_term_frame_idx = curLt, .top_poc = top, .bot_poc = bot, .fields = field, .nonexist = sl->nonexist_marker };
+        if (field) n.mark[par] = curMark; else n.mark[0] = n.mark[1] = curMark;
+        upd(&n);
+        int slot = 0; while (slot < d->ndpb && d->dpb[slot].ref) slot++;
+        if (slot < 16) { d->dpb[slot] = n; if (slot == d->ndpb) d->ndpb++; }
+    }
     trim(d);
+}
+
+static void push_out(H264Dec *d, int surf, int top, int bot, int w, int h)
+{
+    if (d->nout < 4) d->out[d->nout++] = (DecOut){ surf, top, bot, w, h };
+}
+bool h264dec_pop(H264Dec *d)
+{
+    if (!d->nout) return false;
+    const DecOut o = d->out[0];
+    memmove(d->out, d->out + 1, sizeof d->out[0] * (size_t)--d->nout);
+    d->cur_surf = o.surf; d->cur_top = o.top; d->cur_bot = o.bot; d->cur_w = o.w; d->cur_h = o.h;
+    return true;
+}
+static int complete_field(H264Dec *d)   // a waiting first field without a second: a non-paired field, output as it is
+{
+    if (!d->fld.valid) return 0;
+    d->fld.valid = false;
+    push_out(d, d->fld.surf, d->fld.top, d->fld.bot, d->fld.w, d->fld.h);
+    return 1;
 }
 
 // ---- one access unit ----
@@ -147,24 +197,28 @@ static int decode_pending(H264Dec *d)
     const H264Pps *pps = &d->params.pps[sl->pps_id]; const H264Sps *sps = &d->params.sps[pps->sps_id];
     const unsigned wmb = (unsigned)sps->pic_width_in_mbs_minus1 + 1, hmb = (unsigned)(sps->pic_height_in_map_units_minus1 + 1) * (2u - (unsigned)sps->frame_mbs_only_flag);
     if (wmb * 16 > d->maxW || hmb * 16 > d->maxH) { fprintf(stderr, "dec: %ux%u is larger than the session (%ux%u)\n", wmb * 16, hmb * 16, d->maxW, d->maxH); return -1; }
-    if (sl->field_pic_flag) { fprintf(stderr, "dec: field pictures are not supported yet\n"); return -1; }
+    const bool field = sl->field_pic_flag; const int par = sl->bottom_field_flag;
+    // a field picture is the second field of the waiting first field when it has the opposite parity and the same
+    // frame_num (7.4.1.2.4 / 8.2.1); anything else completes the waiting field as a non-paired one
+    const bool second = field && d->fld.valid && d->fld.par != par && d->fld.frame_num == sl->frame_num && !(sl->idr && !d->fld.ref);
+    int done = second ? 0 : complete_field(d);
     // gaps in frame_num (8.2.5.2): each missing frame_num becomes a "non-existing" short-term reference frame, marked
     // by the sliding window, so that later sliding windows, picture numbers (MMCO) and the default reference lists match;
     // it is never used for prediction and points at the newest real reference's surface
-    if (!sl->idr && d->prev_ref_frame_num >= 0 && d->last_ref_surf >= 0) {
+    if (!sl->idr && !second && d->prev_ref_frame_num >= 0 && d->last_ref_surf >= 0) {
         const int maxfn = max_frame_num(sps);
         int fn = (d->prev_ref_frame_num + 1) % maxfn;
         if (sl->frame_num != d->prev_ref_frame_num && sl->frame_num != fn) {
             if (d->verbose) printf("  dec: frame_num gap %d -> %d%s\n", d->prev_ref_frame_num, sl->frame_num, sps->gaps_in_frame_num_value_allowed_flag ? "" : " (not allowed by the SPS)");
             for (int k = 0; fn != sl->frame_num && k < maxfn; fn = (fn + 1) % maxfn, k++) {
-                H264Slice ne = { 0 }; ne.frame_num = fn; ne.nal_ref_idc = 1;
+                H264Slice ne = { 0 }; ne.frame_num = fn; ne.nal_ref_idc = 1; ne.nonexist_marker = 1;
                 mark(d, sps, &ne, d->last_ref_surf, d->last_top, d->last_bot);
             }
         }
     }
     int top, bot; h264_poc(&d->poc, sps, sl, &top, &bot);
     // a free surface: not held by the caller, not a reference
-    int surf = -1;
+    int surf = second ? d->fld.surf : -1;
     for (int i = 0; i < DEC_SURFACES && surf < 0; i++) {
         bool used = d->busy[i];
         for (int k = 0; k < d->ndpb; k++) if (d->dpb[k].ref && d->dpb[k].surf == i) used = true;
@@ -194,7 +248,8 @@ static int decode_pending(H264Dec *d)
     ps->transform_8x8_mode_flag = pps->transform_8x8_mode_flag;
     ps->pitch_luma = ps->pitch_chroma = (unsigned)d->pitch;
     ps->HistBufferSize = (unsigned)(d->hist.size >> 8);
-    ps->MbaffFrameFlag = sps->mb_adaptive_frame_field_flag;
+    ps->MbaffFrameFlag = sps->mb_adaptive_frame_field_flag && !field;
+    ps->field_pic_flag = field; ps->bottom_field_flag = (unsigned)par; ps->second_field = second;
     ps->direct_8x8_inference_flag = sps->direct_8x8_inference_flag;
     ps->weighted_pred_flag = pps->weighted_pred_flag; ps->weighted_bipred_idc = pps->weighted_bipred_idc;
     ps->constrained_intra_pred_flag = pps->constrained_intra_pred_flag;
@@ -207,15 +262,18 @@ static int decode_pending(H264Dec *d)
     ps->second_chroma_qp_index_offset = pps->second_chroma_qp_index_offset;
     ps->CurrPicIdx = (unsigned)surf; ps->CurrColIdx = (unsigned)surf;
     ps->frame_num = (unsigned)sl->frame_num; ps->frame_surfaces = 1;
+    if (second) { if (par) top = d->fld.top; else bot = d->fld.bot; }   // the pair's other field
+    else if (field) { if (par) top = bot; else bot = top; }
     ps->CurrFieldOrderCnt[0] = top; ps->CurrFieldOrderCnt[1] = bot;
     int nref = 0;
     for (int i = 0; i < d->ndpb; i++) {                        // each reference in its own stable slot; empty slots stay zero
         const DecRef *r = &d->dpb[i]; nvdec_dpb_entry_s *e = &ps->dpb[i];
         if (!r->ref) continue;
         nref++;
-        e->index = (unsigned)r->surf; e->col_idx = (unsigned)r->surf; e->state = 3;
-        e->is_long_term = r->ref == 2;
-        e->top_field_marking = e->bottom_field_marking = (unsigned)r->ref;
+        e->index = (unsigned)r->surf; e->col_idx = (unsigned)r->surf;
+        e->state = (r->mark[0] ? 1u : 0u) | (r->mark[1] ? 2u : 0u);
+        e->is_long_term = r->ref == 2; e->is_field = r->fields;
+        e->top_field_marking = (unsigned)r->mark[0]; e->bottom_field_marking = (unsigned)r->mark[1];
         e->FieldOrderCnt[0] = (unsigned)r->top_poc; e->FieldOrderCnt[1] = (unsigned)r->bot_poc;
         e->FrameIdx = r->ref == 2 ? r->long_term_frame_idx : r->frame_num;
     }
@@ -253,17 +311,27 @@ static int decode_pending(H264Dec *d)
     const nvdec_status_s *st = d->status.cpu;
     d->mbs_ok = st->mbs_correctly_decoded; d->mbs_err = st->mbs_in_error; d->err_status = st->error_status;
     if (d->verbose)
-        printf("  dec: surf %2d %c frame_num %3d POC %4d refs %d -> %u MBs ok, %u err, status 0x%x, %.2f ms\n", surf, "PBIps"[sl->slice_type],
-               sl->frame_num, top, nref, d->mbs_ok, d->mbs_err, d->err_status, d->engine_ms);
+        printf("  dec: surf %2d %c%s frame_num %3d POC %4d/%4d refs %d -> %u MBs ok, %u err, status 0x%x, %.2f ms\n", surf, "PBIps"[sl->slice_type],
+               field ? (second ? (par ? " bot2" : " top2") : (par ? " bot1" : " top1")) : "", sl->frame_num, top, bot, nref, d->mbs_ok, d->mbs_err, d->err_status, d->engine_ms);
     mark(d, sps, sl, surf, top, bot);
     if (sl->nal_ref_idc) { d->prev_ref_frame_num = sl->has_mmco5 ? 0 : sl->frame_num; d->last_ref_surf = surf; d->last_top = top; d->last_bot = bot; }
-    d->busy[surf] = true; d->cur_surf = surf; d->cur_top = top; d->cur_bot = bot; d->cur_w = sps->width; d->cur_h = sps->height;
-    d->x0[surf] = sps->crop_x0; d->y0[surf] = sps->crop_y0;
+    d->busy[surf] = true; d->x0[surf] = sps->crop_x0; d->y0[surf] = sps->crop_y0;
     d->auN = 0; d->auSlices = 0;
-    return 1;
+    if (field && !second) {                                     // wait for the second field
+        d->fld.valid = true; d->fld.surf = surf; d->fld.par = par; d->fld.frame_num = sl->frame_num; d->fld.ref = sl->nal_ref_idc != 0;
+        d->fld.top = top; d->fld.bot = bot; d->fld.w = sps->width; d->fld.h = sps->height;
+        return done;
+    }
+    d->fld.valid = false;
+    push_out(d, surf, top, bot, sps->width, sps->height);
+    return done + 1;
 }
 
-int h264dec_flush(H264Dec *d) { return decode_pending(d); }
+int h264dec_flush(H264Dec *d)
+{
+    const int r = decode_pending(d);
+    return r < 0 ? r : r + complete_field(d);
+}
 
 int h264dec_nal(H264Dec *d, const uint8_t *nal, size_t len)
 {

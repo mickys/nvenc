@@ -707,6 +707,10 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
         while (r >= 0 && h264_next_lenpfx((const uint8_t *)p, len, s->nalLen, &pos, &nal, &n)) { int q = h264dec_nal(&s->dec, nal, n); if (q) r = q; }
         if (r >= 0) { int q = h264dec_flush(&s->dec); if (q) r = q; }   // one sample is one access unit
         if (r < 0) res = kVTVideoDecoderBadDataErr;
+        // completed frames: normally one; a non-paired field before it adds another, of which only the newest is emitted
+        int got = 0;
+        while (h264dec_pop(&s->dec)) { if (got) h264dec_release(&s->dec, got - 1); got = s->dec.cur_surf + 1; }
+        r = r < 0 ? r : got ? 1 : 0;
     }
     if (!res && r == 1) {
         s->tEngine += s->dec.engine_ms; double tp = nowms();

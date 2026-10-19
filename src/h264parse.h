@@ -49,6 +49,7 @@ typedef struct {
     int no_output_of_prior_pics_flag, long_term_reference_flag, adaptive_ref_pic_marking_mode_flag;
     int n_mmco; H264Mmco mmco[66];
     int has_mmco5;                                    // memory_management_control_operation 5 present
+    int nonexist_marker;                              // set by the decoder for frame_num gap frames (not parsed)
 } H264Slice;
 
 typedef struct { H264Sps sps[32]; H264Pps pps[256]; } H264Params;
