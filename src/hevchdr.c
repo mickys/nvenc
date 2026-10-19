@@ -122,7 +122,7 @@ size_t hevc_write_pps(const HevcParams *p, uint8_t *out)
     put(&b, 0, 1); put(&b, p->no_ts ? 0 : 1, 1);                // constrained_intra_pred, transform_skip_enabled
     put(&b, p->no_cqd ? 0 : 1, 1); if (!p->no_cqd) ue(&b, 0);   // cu_qp_delta_enabled, diff_cu_qp_delta_depth 0
     se(&b, 0); se(&b, 0); put(&b, 0, 1);                        // cb / cr qp offsets, slice chroma offsets present
-    put(&b, 0, 1); put(&b, 0, 1); put(&b, 0, 1);                // weighted pred / bipred, transquant bypass
+    put(&b, 0, 1); put(&b, 0, 1); put(&b, p->lossless ? 1 : 0, 1);   // weighted pred / bipred, transquant bypass
     put(&b, 0, 1); put(&b, 0, 1);                               // tiles, entropy coding sync
     put(&b, 1, 1);                                              // pps_loop_filter_across_slices_enabled_flag
     put(&b, 1, 1); put(&b, 0, 1); put(&b, 0, 1); se(&b, 0); se(&b, 0);   // deblocking control present: no override, enabled, offsets 0

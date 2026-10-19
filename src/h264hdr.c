@@ -31,7 +31,7 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
         ue(&b, p->chroma444 ? 3 : 1);                  // chroma_format_idc 4:4:4 / 4:2:0
         if (p->chroma444) put(&b, 0, 1);               // separate_colour_plane_flag
         ue(&b, 0); ue(&b, 0);                          // bit depth luma/chroma - 8
-        put(&b, 0, 1);                                 // qpprime_y_zero_transform_bypass
+        put(&b, p->lossless ? 1 : 0, 1);               // qpprime_y_zero_transform_bypass
         put(&b, 0, 1);                                 // seq_scaling_matrix_present
     }
     ue(&b, (unsigned)p->log2_max_frame_num_minus4);

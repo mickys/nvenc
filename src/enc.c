@@ -33,7 +33,8 @@ int enc_open(Enc *e, const EncConfig *cfg)
     if (e->cfg.num_refs > ENC_MAX_REFS) e->cfg.num_refs = ENC_MAX_REFS;
     // H.264 4:4:4: the engine's CABAC coder only knows 4:2:0 (broken IDRs, then an engine exception, RM error 0x2f on P
     // frames); CAVLC 4:4:4 is correct (M13 T13.02)
-    if (cfg->codec == ENC_H264 && cfg->chroma444) e->cfg.cabac = false;
+    if (cfg->codec == ENC_H264 && (cfg->chroma444 || cfg->lossless)) e->cfg.cabac = false;
+    if (cfg->lossless) { e->cfg.qp_i = e->cfg.qp_p = 0; e->cfg.rc_mode = 0; }   // lossless: constant QP 0
     int W = cfg->width, H = cfg->height;
     e->wmb = (W + 15) / 16; e->hmb = (H + 15) / 16;
     Rm *rm = &e->rm; rm->verbose = cfg->verbose;
@@ -136,7 +137,7 @@ void enc_close(Enc *e)
 
 static H264Params hdr_params(const Enc *e)
 {
-    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51, .chroma444 = e->cfg.chroma444,
+    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 || e->cfg.lossless ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = 2, .num_ref_frames = e->cfg.num_refs,
         .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100 || e->cfg.chroma444, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
 }
@@ -149,7 +150,7 @@ static HevcParams hevc_params(const Enc *e)
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
         .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
-        .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444,
+        .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
         .no_ts = hevc_off("ts") || e->cfg.bit_depth > 8,   /* nullmoth's 10-bit setup turns transform skip off */ .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
         .sis = hevc_off("sis") };
@@ -360,6 +361,7 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     sp->bit_depth_minus_8 = (unsigned)(e->cfg.bit_depth - 8);
     nvenc_h265_pps_data_s *pp = &ps->pps_data;   // matches hevc_write_pps()
     pp->num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1); pp->transform_skip_enabled_flag = !hp.no_ts;
+    pp->transquant_bypass_enabled_flag = e->cfg.lossless;
     pp->pps_loop_filter_across_slices_enabled_flag = 1; pp->cu_qp_delta_enabled_flag = !hp.no_cqd; pp->cabac_init_present_flag = 1;
     pp->sign_data_hiding_enabled_flag = !hp.no_sdh;
     if (e->cfg.bit_depth > 8) {
@@ -570,6 +572,7 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;   // plane offsets 0: each plane has its own method
     H264Params hp = hdr_params(e);
     ps->sps_data.profile_idc = (unsigned)hp.profile_idc; ps->sps_data.level_idc = (unsigned)hp.level_idc; ps->sps_data.chroma_format_idc = e->cfg.chroma444 ? 3 : 1;
+    ps->sps_data.lossless_qpprime_flag = e->cfg.lossless;
     ps->sps_data.pic_order_cnt_type = 2; ps->sps_data.log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4;
     ps->sps_data.frame_mbs_only = 1;
     ps->pps_data.num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1);

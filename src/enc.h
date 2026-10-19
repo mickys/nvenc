@@ -31,6 +31,7 @@ typedef struct {
     bool cabac;                     // H.264: CABAC entropy coding (else CAVLC; always CAVLC in 4:4:4)
     int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
     bool chroma444;                 // HEVC Main 4:4:4 / H.264 High 4:4:4 Predictive (enc_load_yuv444 / enc_load_nv24)
+    bool lossless;                  // H.264 (High 4:4:4 Predictive, CAVLC) / HEVC: every macroblock / CU at QP 0, bypassed
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;

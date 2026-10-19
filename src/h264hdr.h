@@ -17,6 +17,7 @@ typedef struct {
     int vui;                        // write VUI: BT.709 colour description, no frame reordering (max_num_reorder_frames 0)
     int full_range;                 // VUI video_full_range_flag
     int chroma444;                  // High 4:4:4 Predictive (profile_idc 244): chroma_format_idc 3
+    int lossless;                   // qpprime_y_zero_transform_bypass_flag (needs profile_idc 244; QP 0 macroblocks are lossless)
 } H264Params;
 
 // Annex B (start code 00 00 00 01) SPS and PPS; returns bytes written into out (needs ~64 bytes)
