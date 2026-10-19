@@ -50,11 +50,13 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->pitch = ((size_t)e->wmb * 16 + 63) & ~(size_t)63;
     e->lumaSz = (nvenc_in_plane_size(e->pitch * e->bps, inRows) + 255) & ~(size_t)255;
     e->chromaSz = nvenc_in_plane_size(e->pitch * e->bps, inRows / 2);
+    if (hevc && cfg->chroma444) e->chromaSz = 2 * e->lumaSz;   // 4:4:4: two full-size planes (or one interleaved plane twice as wide)
     // reconstructed pictures: block-linear block_height 2, rows rounded up to 32 (the engine writes that far)
     e->rPitch = ((size_t)e->wmb * 16 + 255) & ~(size_t)255;
     const size_t rRows = av1 ? (((size_t)H + 63) & ~(size_t)63) : (((size_t)e->hmb * 16 + 31) & ~(size_t)31);
     e->rLuma = (e->rPitch * e->bps * rRows + 255) & ~(size_t)255;
     e->rSlot = (e->rLuma + e->rPitch * e->bps * (av1 ? rRows / 2 : (((size_t)e->hmb * 8 + 31) & ~(size_t)31)) + 0xffff) & ~(size_t)0xffff;
+    if (hevc && cfg->chroma444) e->rSlot = (3 * e->rLuma + 0xffff) & ~(size_t)0xffff;   // 4:4:4: chroma twice the luma plane
     if (hevc || av1) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
     int slots = e->cfg.num_refs + 1;
     size_t mbs = (size_t)e->wmb * e->hmb;
@@ -144,7 +146,7 @@ static HevcParams hevc_params(const Enc *e)
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
         .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
-        .bit_depth = e->cfg.bit_depth,
+        .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
         .no_ts = hevc_off("ts") || e->cfg.bit_depth > 8,   /* nullmoth's 10-bit setup turns transform skip off */ .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
         .sis = hevc_off("sis") };
@@ -170,7 +172,8 @@ static void load_widened(Enc *e, uint8_t *dst, const uint8_t *src, size_t stride
     uint16_t *buf = malloc(width * 2 * rows);
     if (!buf) return;
     for (size_t r = 0; r < rows; r++) for (size_t c = 0; c < width; c++) buf[r * width + c] = (uint16_t)(src[r * stride + c] << 8);
-    nvenc_in_tile_plane(dst, (const uint8_t *)buf, width * 2, width * 2, rows, e->pitch * 2);
+    // the plane's pitch: the luma pitch, or twice it for a row wider than that (4:4:4 interleaved chroma)
+    nvenc_in_tile_plane(dst, (const uint8_t *)buf, width * 2, width * 2, rows, e->pitch * 2 * (width > e->pitch ? 2 : 1));
     free(buf);
 }
 
@@ -198,6 +201,27 @@ void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, 
     }
     nvenc_in_tile_plane(in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
     nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)e->cfg.width, (size_t)(e->cfg.height + 1) / 2, e->pitch);
+}
+
+void enc_load_yuv444(Enc *e, const uint8_t *y, size_t ys, const uint8_t *u, size_t us, const uint8_t *v, size_t vs)
+{
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    const size_t W = (size_t)e->cfg.width, H = (size_t)e->cfg.height;
+    uint8_t *buf = malloc(2 * W * H); if (!buf) return;           // Cb Cr interleaved, twice the pitch
+    for (size_t r = 0; r < H; r++) for (size_t c = 0; c < W; c++) { buf[r * 2 * W + 2 * c] = u[r * us + c]; buf[r * 2 * W + 2 * c + 1] = v[r * vs + c]; }
+    if (e->bps == 2) {   // Main 4:4:4 10 from 8-bit planes: widened like enc_load_nv12 does
+        load_widened(e, in->cpu, y, ys, W, H); load_widened(e, (uint8_t *)in->cpu + e->lumaSz, buf, 2 * W, 2 * W, H);
+        free(buf); return;
+    }
+    nvenc_in_tile_plane(in->cpu, y, ys, W, H, e->pitch);
+    nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, buf, 2 * W, 2 * W, H, 2 * e->pitch);
+    free(buf);
+}
+void enc_load_nv24(Enc *e, const uint8_t *y, size_t ys, const uint8_t *uv, size_t uvs)
+{
+    RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    nvenc_in_tile_plane(in->cpu, y, ys, (size_t)e->cfg.width, (size_t)e->cfg.height, e->pitch);
+    nvenc_in_tile_plane((uint8_t *)in->cpu + e->lumaSz, uv, uvs, 2 * (size_t)e->cfg.width, (size_t)e->cfg.height, 2 * e->pitch);
 }
 
 void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride)
@@ -312,9 +336,13 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     // nullmoth's sets the field offsets of the reference/output surfaces to half a plane (unused in frame mode)
     rc.luma_bot_offset = (unsigned)((size_t)ch / 2 * e->rPitch * e->bps / 256);
     rc.chroma_bot_offset = (unsigned)((((size_t)ch / 2 + 31) & ~(size_t)31) / 2 * e->rPitch * e->bps / 256);
+    // 4:4:4 (T13.01): chroma Cb / Cr interleaved at full width (like NV24), input and reconstruction alike, the chroma
+    // pitch twice the luma's. (Planar input via memory_mode 1 and the CHROMA_U / _V methods, or a planar reconstruction,
+    // gave 8-18 dB chroma.)
+    if (e->cfg.chroma444) { ic.sfc_pitch_chroma = (unsigned short)(2 * e->pitch); rc.sfc_pitch_chroma = (unsigned short)(2 * e->rPitch); }
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
     nvenc_h265_sps_data_s *sp = &ps->sps_data;
-    sp->chroma_format_idc = 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = 1; sp->max_cu_size = 2;
+    sp->chroma_format_idc = e->cfg.chroma444 ? 3 : 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = 1; sp->max_cu_size = 2;
     sp->min_tu_size = 0; sp->max_tu_size = 3; sp->max_transform_depth_inter = 3; sp->max_transform_depth_intra = 3;
     sp->amp_enabled_flag = !hp.no_amp; sp->num_short_term_ref_pic_sets = 1; sp->sample_adaptive_offset_enabled_flag = !hp.no_sao;
     sp->strong_intra_smoothing_enabled_flag = hp.sis ? 1 : 0;

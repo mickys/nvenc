@@ -30,6 +30,7 @@ typedef struct {
     int h264_profile;               // H.264: 77 Main (default) or 100 High (adds the 8x8 transform and 8x8 intra modes)
     bool cabac;                     // H.264: CABAC entropy coding (else CAVLC)
     int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
+    bool chroma444;                 // HEVC: 4:4:4 (Main 4:4:4; enc_load_yuv444)
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;
@@ -80,6 +81,10 @@ size_t enc_av1_config(Enc *e, uint8_t *out);                   // AV1: the seque
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride);
 // copy a 16-bit 4:2:0 frame (P010-style: 10 bits in the high bits of each 16-bit sample) into a 10-bit session's input
 void enc_load_p010(Enc *e, const uint16_t *y, size_t yStride, const uint16_t *uv, size_t uvStride);
+// copy a planar 8-bit 4:4:4 frame into a 4:4:4 session's input
+void enc_load_yuv444(Enc *e, const uint8_t *y, size_t ys, const uint8_t *u, size_t us, const uint8_t *v, size_t vs);
+// copy a biplanar 8-bit 4:4:4 frame (Cb Cr interleaved at full width, CoreVideo 444v / 444f) into a 4:4:4 session's input
+void enc_load_nv24(Enc *e, const uint8_t *y, size_t ys, const uint8_t *uv, size_t uvs);
 // convert an l10r frame (ARGB2101010 LE, ScreenCaptureKit's 10-bit format) into a 10-bit session's input (BT.709 video range)
 void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride);
 // convert a BGRA frame (BT.709 video range) into the next frame's input surface

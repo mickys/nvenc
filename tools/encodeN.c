@@ -1,7 +1,8 @@
 // encodeN.c (milestone M3): encode N frames of moving synthetic NV12 content through src/enc.c (IDR + P, constant QP).
 //   ./encodeN [-v] [-hevc | -av1] W H N QP_I QP_P REFS out.h264|out.h265|out.ivf out.nv12   (AV1: QP = quantizer index 0..255)
 // Environment: IDR_PERIOD=<n> (an IDR every n frames), RC=<RCMODE> BITRATE=<bit/s> MAXRATE=<bit/s> VBV=<bits>,
-// SLICES=<n>, ENCN_STATIC=<n> (cycle through n fixed pictures), BITDEPTH=10 (HEVC / AV1: the 8-bit source widened).
+// SLICES=<n>, ENCN_STATIC=<n> (cycle through n fixed pictures), BITDEPTH=10 (HEVC / AV1: the 8-bit source widened),
+// CHROMA444=1 (HEVC 4:4:4; the source file is then planar yuv444p).
 // Writes the Annex B stream (SPS + PPS once, then every picture; AV1: an IVF file) and all source frames for h264check.
 #include "enc.h"
 #include <math.h>
@@ -38,7 +39,8 @@ int main(int argc, char **argv)
                       .idr_period = getenv("IDR_PERIOD") ? atoi(getenv("IDR_PERIOD")) : 0, .verbose = verbose,
                       .rc_mode = getenv("RC") ? atoi(getenv("RC")) : 0, .bitrate = getenv("BITRATE") ? atoi(getenv("BITRATE")) : 0,
                       .max_bitrate = getenv("MAXRATE") ? atoi(getenv("MAXRATE")) : 0, .vbv_bits = getenv("VBV") ? atoi(getenv("VBV")) : 0,
-                      .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1, .bit_depth = getenv("BITDEPTH") ? atoi(getenv("BITDEPTH")) : 8 };
+                      .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1, .bit_depth = getenv("BITDEPTH") ? atoi(getenv("BITDEPTH")) : 8,
+                      .chroma444 = getenv("CHROMA444") != NULL };
     Enc e; if (enc_open(&e, &cfg)) return 1;
     FILE *fh = fopen(argv[ai + 6], "wb"), *fs = fopen(argv[ai + 7], "wb");
     uint8_t hdr[256]; fwrite(hdr, 1, enc_headers(&e, hdr), fh);
@@ -53,8 +55,19 @@ int main(int argc, char **argv)
         // ENCN_STATIC=n: cycle through n fixed pictures (A B A B ... for n = 2), each very different from the next
         int ns = getenv("ENCN_STATIC") ? atoi(getenv("ENCN_STATIC")) : 0;
         frame(y, uv, W, H, ns > 0 ? (f % ns) * 37 : f);
+        if (cfg.chroma444) {   // full-resolution chroma, the same pattern as the 4:2:0 frames
+            static uint8_t *u4, *v4; if (!u4) { u4 = malloc((size_t)W * H); v4 = malloc((size_t)W * H); }
+            const int fr = ns > 0 ? (f % ns) * 37 : f;
+            for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) {
+                u4[(size_t)r * W + c] = (uint8_t)(128 + 60 * sin((c / 2 + fr) * 0.02) + ((c ^ r) & 8 ? 6 : 0));
+                v4[(size_t)r * W + c] = (uint8_t)(128 + 60 * cos((r / 2 + fr) * 0.03) - ((c + r) & 4 ? 5 : 0));
+            }
+            fwrite(y, 1, (size_t)W * H, fs); fwrite(u4, 1, (size_t)W * H, fs); fwrite(v4, 1, (size_t)W * H, fs);
+            enc_load_yuv444(&e, y, W, u4, W, v4, W);
+        } else {
         fwrite(y, 1, (size_t)W * H, fs); fwrite(uv, 1, (size_t)W * CH, fs);
         enc_load_nv12(&e, y, W, uv, W);
+        }
         EncFrame fr;
         if (enc_encode(&e, false, &fr)) { printf("frame %d FAILED (ucode error %u)\n", f, fr.ucode_error); fails++; break; }
         if (av1) { uint8_t fhd[12] = { (uint8_t)fr.size, (uint8_t)(fr.size >> 8), (uint8_t)(fr.size >> 16), (uint8_t)(fr.size >> 24), (uint8_t)f, (uint8_t)(f >> 8) }; fwrite(fhd, 1, 12, fh); }

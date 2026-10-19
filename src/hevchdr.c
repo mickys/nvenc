@@ -35,12 +35,15 @@ static int level(const HevcParams *p) { return p->level_idc ? p->level_idc : hev
 size_t hevc_coded_width(const HevcParams *p) { return ((size_t)p->width + 31) & ~(size_t)31; }
 size_t hevc_coded_height(const HevcParams *p) { return ((size_t)p->height + 31) & ~(size_t)31; }
 
-static void profile_tier_level(Bw *b, int level_idc, bool ten)  // 7.3.3, sps_max_sub_layers_minus1 = 0
+static void profile_tier_level(Bw *b, int level_idc, bool ten, bool rext)  // 7.3.3, sps_max_sub_layers_minus1 = 0
 {
-    put(b, 0, 2); put(b, 0, 1); put(b, ten ? 2 : 1, 5);         // general_profile_space, tier Main, profile Main / Main 10
-    put(b, ten ? 0x20000000u : 0x60000000u, 32);                // compatibility flags: Main 10 only / Main and Main 10
+    put(b, 0, 2); put(b, 0, 1); put(b, rext ? 4 : ten ? 2 : 1, 5);   // general_profile_space, tier Main, profile Main / Main 10 / RExt
+    put(b, rext ? 0x08000000u : ten ? 0x20000000u : 0x60000000u, 32);   // compatibility flags: RExt / Main 10 only / Main and Main 10
     put(b, 1, 1); put(b, 0, 1); put(b, 0, 1); put(b, 1, 1);     // progressive, not interlaced, not non-packed, frame only
-    put(b, 0, 32); put(b, 0, 11);                               // 43 reserved constraint bits
+    if (rext) {   // Main 4:4:4 (10): max_12bit, max_10bit, max_8bit (8-bit only), no 4:2:2 / 4:2:0 / monochrome / intra / one picture limits, lower_bit_rate
+        put(b, 1, 1); put(b, 1, 1); put(b, ten ? 0 : 1, 1); put(b, 0, 1); put(b, 0, 1); put(b, 0, 1); put(b, 0, 1); put(b, 0, 1); put(b, 1, 1);
+        put(b, 0, 32); put(b, 0, 2);                            // 34 reserved bits
+    } else { put(b, 0, 32); put(b, 0, 11); }                    // 43 reserved constraint bits
     put(b, 0, 1);                                               // general_inbld_flag
     put(b, (unsigned)level_idc, 8);
 }
@@ -52,7 +55,7 @@ size_t hevc_write_vps(const HevcParams *p, uint8_t *out)
     put(&b, 1, 1); put(&b, 1, 1);                               // base layer internal / available
     put(&b, 0, 6); put(&b, 0, 3); put(&b, 1, 1);                // max_layers_minus1, max_sub_layers_minus1, temporal_id_nesting
     put(&b, 0xffff, 16);                                        // vps_reserved_0xffff_16bits
-    profile_tier_level(&b, level(p), p->bit_depth > 8);
+    profile_tier_level(&b, level(p), p->bit_depth > 8, p->chroma444);
     put(&b, 1, 1);                                              // vps_sub_layer_ordering_info_present_flag
     ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, 0); ue(&b, 0);   // max_dec_pic_buffering_minus1, no reorder, no latency limit
     put(&b, 0, 6); ue(&b, 0);                                   // vps_max_layer_id, vps_num_layer_sets_minus1
@@ -67,11 +70,13 @@ size_t hevc_write_sps(const HevcParams *p, uint8_t *out)
     Bw b; memset(&b, 0, sizeof b);
     unsigned cw = (unsigned)hevc_coded_width(p), ch = (unsigned)hevc_coded_height(p);
     put(&b, 0, 4); put(&b, 0, 3); put(&b, 1, 1);                // vps id, max_sub_layers_minus1, temporal_id_nesting
-    profile_tier_level(&b, level(p), p->bit_depth > 8);
+    profile_tier_level(&b, level(p), p->bit_depth > 8, p->chroma444);
     ue(&b, 0);                                                  // sps_seq_parameter_set_id
-    ue(&b, 1);                                                  // chroma_format_idc 4:2:0
+    ue(&b, p->chroma444 ? 3 : 1);                               // chroma_format_idc 4:4:4 / 4:2:0
+    if (p->chroma444) put(&b, 0, 1);                            // separate_colour_plane_flag
     ue(&b, cw); ue(&b, ch);
-    unsigned cr = (cw - (unsigned)p->width) / 2, cb = (ch - (unsigned)p->height) / 2;   // 4:2:0: conformance window units of 2 pixels
+    const unsigned u = p->chroma444 ? 1 : 2;                    // conformance window units: SubWidthC / SubHeightC
+    unsigned cr = (cw - (unsigned)p->width) / u, cb = (ch - (unsigned)p->height) / u;
     put(&b, cr || cb ? 1 : 0, 1);
     if (cr || cb) { ue(&b, 0); ue(&b, cr); ue(&b, 0); ue(&b, cb); }
     unsigned bd = p->bit_depth > 8 ? (unsigned)p->bit_depth - 8 : 0;
