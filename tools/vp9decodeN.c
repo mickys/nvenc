@@ -1,6 +1,6 @@
 // vp9decodeN.c (M10, T10.02/T10.03): decode a VP9 IVF stream with src/vp9dec.c and compare every shown frame with a
 // reference decode (ffmpeg, I420, display order; scripts/make-vp9-streams.sh makes both).
-//   ./vp9decodeN [-v] [-n frames] in.ivf ref.yuv
+//   ./vp9decodeN [-v] [-n frames] [-s WxH (at least this session size)] in.ivf ref.yuv
 #include "vp9dec.h"
 #include <math.h>
 #include <stdio.h>
@@ -16,16 +16,34 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n)
 
 int main(int argc, char **argv)
 {
-    int ai = 1, maxf = 1 << 30; bool verbose = false;
+    int ai = 1, maxf = 1 << 30; bool verbose = false; unsigned minW = 0, minH = 0;
     for (; ai < argc && argv[ai][0] == '-'; ai++) {
         if (!strcmp(argv[ai], "-v")) verbose = true;
         else if (!strcmp(argv[ai], "-n") && ai + 1 < argc) maxf = atoi(argv[++ai]);
+        else if (!strcmp(argv[ai], "-s") && ai + 1 < argc) { ai++; minW = (unsigned)atoi(argv[ai]); minH = (unsigned)atoi(strchr(argv[ai], 'x') + 1); }
     }
     if (argc - ai < 2) { fprintf(stderr, "usage: vp9decodeN [-v] [-n frames] in.ivf ref.yuv\n"); return 2; }
     FILE *fp = fopen(argv[ai], "rb"); if (!fp) { perror(argv[ai]); return 1; }
     FILE *rf = fopen(argv[ai + 1], "rb"); if (!rf) { perror(argv[ai + 1]); return 1; }
     uint8_t ih[32]; if (fread(ih, 1, 32, fp) != 32 || memcmp(ih, "DKIF", 4)) { fprintf(stderr, "not IVF\n"); return 1; }
-    const unsigned W = ih[12] | ih[13] << 8, H = ih[14] | ih[15] << 8;
+    unsigned W = ih[12] | ih[13] << 8, H = ih[14] | ih[15] << 8;
+    {   // the largest frame (streams that resize grow beyond the IVF header's size)
+        static Vp9State ps; vp9_init(&ps); uint8_t fh[12];
+        while (fread(fh, 1, 12, fp) == 12) {
+            const size_t sz = fh[0] | fh[1] << 8 | fh[2] << 16 | (size_t)fh[3] << 24;
+            uint8_t *buf = malloc(sz); if (fread(buf, 1, sz, fp) != sz) { free(buf); break; }
+            size_t off[8], len[8]; const int nf = vp9_superframe(buf, sz, off, len);
+            for (int i = 0; i < nf; i++) {
+                Vp9Frame f; if (vp9_parse_frame(&ps, buf + off[i], len[i], &f)) continue;
+                if (!f.show_existing_frame) { if ((unsigned)f.width > W) W = (unsigned)f.width; if ((unsigned)f.height > H) H = (unsigned)f.height; }
+                vp9_end_frame(&ps, &f, NULL);
+            }
+            free(buf);
+        }
+        fseek(fp, 32, SEEK_SET);
+        if (W < minW) W = minW;
+        if (H < minH) H = minH;
+    }
     Rm rm = { 0 }; if (rm_open(&rm) || rm_va_init(&rm)) { fprintf(stderr, "RM failed\n"); return 1; }
     static Vp9Dec d; if (vp9dec_open(&d, &rm, W, H)) return 1;
     d.verbose = verbose;

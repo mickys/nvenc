@@ -271,8 +271,8 @@ int vp9_parse_frame(Vp9State *st, const uint8_t *buf, size_t n, Vp9Frame *h)
         h->refresh_frame_flags = 0xff;
         h->frame_is_intra = 1;
     } else {
-        if (!st->started) return -1;                         // the first frame must be a key frame (8.2)
         h->intra_only = h->show_frame ? 0 : (int)f1(&r);
+        if (!st->started && !h->intra_only) return -1;      // a stream starts with a key frame or an intra-only frame (8.2)
         h->frame_is_intra = h->intra_only;
         h->reset_frame_context = h->error_resilient_mode ? 0 : (int)f(&r, 2);
         if (h->intra_only) {
@@ -358,7 +358,7 @@ int vp9_parse_frame(Vp9State *st, const uint8_t *buf, size_t n, Vp9Frame *h)
     if (r.err || h->header_size_in_bytes == 0 || (size_t)h->uncomp_bytes + (size_t)h->header_size_in_bytes > n) return -1;
     st->frame_type = h->frame_type;
     st->profile = h->profile;
-    if (h->frame_type == VP9_KEY_FRAME) st->started = true;
+    if (h->frame_is_intra) st->started = true;
     // load_probs + load_probs2, then the compressed header's updates
     st->fc = st->ctx[h->frame_context_idx];
     Bd d;

@@ -16,7 +16,7 @@ mk() {   # name size frames pix_fmt [libvpx options...]
             -c:v libvpx-vp9 "${fp[@]}" "${pass[@]}" "$@" -f ivf "$out/$name.ivf"
     done
     rm -f "$out/.pass-$name"*
-    ffmpeg -nostdin -loglevel error -y -i "$out/$name.ivf" -f rawvideo -pix_fmt "$pf" "$out/$name.yuv"
+    ffmpeg -nostdin -loglevel error -y -i "$out/$name.ivf" -fps_mode passthrough -f rawvideo -pix_fmt "$pf" "$out/$name.yuv"
     echo "$name: $(stat -c %s "$out/$name.ivf") bytes"
 }
 PASSES=2 mk altref-352x288    352x288   60 yuv420p -b:v 400k -auto-alt-ref 1 -lag-in-frames 16

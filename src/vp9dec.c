@@ -118,6 +118,28 @@ static void pack_probs(nvdec_vp9EntropyProbs_t *e, const Vp9Probs *p, const Vp9F
         memcpy(coef[t][i][j][k][l], p->coef[t][i][j][k][l], 3);
 }
 
+// The engine reads reference samples up to the superblock-aligned size and does not clamp them at the frame edge, which
+// the spec does (8.5.2.4: every read is clipped to the last row / column), so the right and bottom padding of each
+// reference must repeat the edge (T10.03: the 8x8 and 66x66 test vectors). g = bytes per sample (pair, for chroma).
+static void extend_plane(uint8_t *p, size_t pitch, unsigned w, unsigned h, unsigned aw, unsigned ah, unsigned g)
+{
+    if (aw > w)
+        for (unsigned y = 0; y < h; y++) {
+            const uint8_t *src = p + nvenc_in_offset((size_t)(w - 1) * g, y, pitch);   // a whole group: g divides 16
+            for (size_t x = (size_t)w * g; x < (size_t)aw * g; x++) p[nvenc_in_offset(x, y, pitch)] = src[x % g];
+        }
+    for (unsigned y = h; y < ah; y++)
+        for (size_t x = 0; x < (size_t)aw * g; x += 16) memcpy(p + nvenc_in_offset(x, y, pitch), p + nvenc_in_offset(x, h - 1, pitch), 16);
+}
+
+static void extend_edges(Vp9Dec *d, int surf, unsigned w, unsigned h)
+{
+    const unsigned aw = (w + 63) & ~63u, ah = (h + 63) & ~63u;
+    if (aw == w && ah == h) return;
+    extend_plane(d->luma[surf].cpu, d->pitch, w, h, aw, ah, 1);
+    extend_plane(d->chroma[surf].cpu, d->pitch, (w + 1) / 2, (h + 1) / 2, aw / 2, ah / 2, 2);
+}
+
 static int tile_offset(int n, int mis, int log2) { int sbs = (mis + 7) >> 3, o = ((n * sbs) >> log2) << 3; return o < mis ? o : mis; }
 
 int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
@@ -130,6 +152,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
         d->busy[s] = true; d->cur_surf = s; d->cur_w = (int)d->w[s]; d->cur_h = (int)d->h[s];
         return 1;
     }
+    if (f->width > 8192 || f->height > 8192) { fprintf(stderr, "vp9dec: %dx%d is beyond NVDEC's VP9 limit (8192)\n", f->width, f->height); return -1; }
     if ((unsigned)f->width > d->maxW || (unsigned)f->height > d->maxH) { fprintf(stderr, "vp9dec: %dx%d is larger than the session\n", f->width, f->height); return -1; }
     if (f->bit_depth != 8 || !f->subsampling_x || !f->subsampling_y) { fprintf(stderr, "vp9dec: only 8-bit 4:2:0 so far\n"); return -1; }
     int surf = -1;
@@ -243,6 +266,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
                f->width, f->height, f->base_q_idx, rs[0], rs[1], rs[2], st->error_status, st->mbs_correctly_decoded, st->mbs_in_error,
                st->vp9.frame_status_intra_cnt, st->vp9.frame_status_inter_cnt, d->engine_ms);
 
+    if (f->refresh_frame_flags) extend_edges(d, surf, (unsigned)f->width, (unsigned)f->height);
     // after the frame: adaptation, reference slots, segmentation map, column MVs (6.1.2, 8.1, 8.10)
     vp9_end_frame(&d->st, f, vp9_adapts(f) ? d->counts.cpu : NULL);
     for (int i = 0; i < 8; i++) if (f->refresh_frame_flags & (1 << i)) d->ref[i] = surf;
