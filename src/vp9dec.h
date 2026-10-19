@@ -1,0 +1,43 @@
+// vp9dec.h (M10): a VP9 decode session on NVDEC. src/vp9parse.c parses the headers and keeps the probability contexts;
+// this sets up nvdec_vp9_pic_s, the probability table (nvdec_vp9EntropyProbs_t), the segmentation maps, column MVs,
+// tile sizes and filter buffer, decodes each frame into a surface and feeds the engine's counters back for backward
+// adaptation. 8-bit 4:2:0 for now. Headers only: open-gpu-doc's nvdec_drv.h / clc9b0.h and the VP9 specification;
+// what the headers do not say is in docs/tasks.md (M10).
+#pragma once
+#include "rm.h"
+#include "channel.h"
+#include "vp9parse.h"
+
+enum { VP9_SURFACES = 12 };         // 8 reference slots + the frame being decoded + frames the caller still holds
+
+typedef struct {
+    Rm *rm; Chan chan;
+    unsigned maxW, maxH;            // allocation size (pixels, multiple of 64)
+    size_t pitch;
+    RmMem setup, bs, probs, counts, seg[2], tiles, colmv[2], filter, intra, status, sem;
+    RmMem luma[VP9_SURFACES], chroma[VP9_SURFACES];
+    unsigned w[VP9_SURFACES], h[VP9_SURFACES];  // the size each surface was decoded at
+    bool busy[VP9_SURFACES];        // held by the caller until vp9dec_release
+    int ref[8];                     // surface in each reference slot (-1 = empty)
+    Vp9State st;
+    int seg_prev, mv_prev;          // which seg[] holds PrevSegmentIds, which colmv[] the previous frame's MVs
+    int last_w, last_h, last_show;  // the previous decoded frame (compute_image_size, 7.2.6)
+    bool have_last;
+    size_t flt_above, flt_bsd;      // offsets in the filter buffer
+    NvU32 semval;
+    bool verbose;
+    // the frame just decoded
+    Vp9Frame f;
+    int cur_surf, cur_w, cur_h;     // the picture to show (valid when vp9dec_frame returned 1)
+    unsigned err_status, ok_blocks;
+    double engine_ms;
+} Vp9Dec;
+
+int  vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH);
+void vp9dec_close(Vp9Dec *d);
+// Decode one frame (a superframe already split, vp9_superframe). Returns 1 when a picture is to be shown (cur_surf,
+// held until vp9dec_release), 0 for a hidden frame, -1 on error.
+int  vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n);
+void vp9dec_release(Vp9Dec *d, int surf);
+void vp9dec_read_nv12(Vp9Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h);
+void vp9dec_read_i420(Vp9Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h);
