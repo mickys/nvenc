@@ -17,7 +17,7 @@ def spec_consts(text):
     for m in re.finditer(r"^\s*([A-Z][A-Z0-9_]{2,})\s+(-?\d+)\s+\S", text, re.M): c.setdefault(m.group(1), int(m.group(2)))
     return c
 
-NAMES = r"(?:kf|default|Default)_[A-Za-z0-9_]+"
+NAMES = r"(?:(?:kf|default|Default)_[A-Za-z0-9_]+|Gaussian_Sequence)"
 
 def clean(text):
     # page furniture (footer + header at each page break), /* */ comments, form feeds
@@ -28,6 +28,7 @@ def clean(text):
     out = []
     for l in keep:
         if out and re.match(r"^\s*\[", l) and re.search(NAMES + r"\s*(\[[^\]]*\]\s*)+$", out[-1]): out[-1] += " " + l.strip()
+        elif out and re.search(NAMES, out[-1]) and out[-1].count("[") > out[-1].count("]"): out[-1] += " " + l.strip()   # inside a bracket
         else: out.append(l)
     return out
 
@@ -51,7 +52,7 @@ def tables(text, consts):
             if started and depth == 0: break
             j += 1
         flat = re.sub(r"(\d+)\s*\*\s*(\d+)", lambda m: str(int(m.group(1)) * int(m.group(2))), " ".join(body))   # AV1: 128*125
-        nums = [int(x) for x in re.findall(r"(?<![A-Za-z_\d])\d+(?![\d])", flat)]
+        nums = [int(x) for x in re.findall(r"(?<![A-Za-z_\d])-?\d+(?![\d])", flat)]
         try: shape = [eval(d, {}, consts) for d in dims]
         except Exception: shape = None
         out.append((name, dims, shape, nums)); i = j + 1
@@ -71,7 +72,7 @@ def main(codec, src, dst):
         for s in (shape or [0]): want *= s
         ok = shape is not None and want == len(nums)
         print(f"{name:32s} dims {dims} -> {shape} want {want} got {len(nums)} {'ok' if ok else 'CHECK'}")
-        ty = "uint8_t" if max(nums, default=0) <= 255 else "uint16_t"
+        ty = "int16_t" if min(nums, default=0) < 0 else "uint8_t" if max(nums, default=0) <= 255 else "uint16_t"
         if ok:
             o.append(f"static const {ty} {name}{''.join(f'[{s}]' for s in shape)} = {{")
             for k in range(0, len(nums), 24): o.append("    " + ", ".join(map(str, nums[k:k + 24])) + ",")
