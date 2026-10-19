@@ -4,6 +4,7 @@
 // compares the luma (PSNR). Prints which decoder ran and how fast.
 //   ./vtdecode in.mp4 [frames]
 //   VTDECODE_REF=ref.yuv: compare the hardware decoder with a reference decode instead (ffmpeg, I420 / yuv420p10le)
+//   VTDECODE_SW=1: with VTDECODE_REF, compare the software decoder (Apple's) instead
 //   VTDECODE_AVREAD=1: decode through AVAssetReader (alwaysCopiesSampleData NO) instead, compared with VTDECODE_REF
 //   VTDECODE_PF=x420: ask for that output format (default 420v)
 //   VTDECODE_SUPP=1: opt in to VP9 first (VTRegisterSupplementalVideoDecoderIfAvailable), as WebKit and ffmpeg do
@@ -129,8 +130,9 @@ int main(int argc, char **argv)
         const char *refPath = getenv("VTDECODE_REF");
         if (refPath) {   // compare the hardware decoder's frames with a reference decode (I420, or 16-bit LE for 10-bit: ffmpeg's yuv420p10le)
             Out h = {0}; bool hwH = false;
-            if (decode(samples, fd, true, &h, &hwH)) return 1;
-            printf("  hardware decoder: %d frames in %.1f ms (%.0f fps), using hardware %d, error %d\n", h.n, h.ms, h.n * 1000.0 / h.ms, hwH, (int)h.err);
+            const bool wantHw = !getenv("VTDECODE_SW");
+            if (decode(samples, fd, wantHw, &h, &hwH)) return 1;
+            printf("  %s decoder: %d frames in %.1f ms (%.0f fps), using hardware %d, error %d\n", wantHw ? "hardware" : "software", h.n, h.ms, h.n * 1000.0 / h.ms, hwH, (int)h.err);
             FILE *rf = fopen(refPath, "rb"); if (!rf) { perror(refPath); return 1; }
             int exact = 0, first = -1; double worst = 99;
             // the reference is in display order, decoders return pictures in decode order: compare by presentation time

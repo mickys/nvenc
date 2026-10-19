@@ -1,13 +1,13 @@
 #!/bin/bash
-# m2all.sh DIR: mpeg2decodeN on every NAME.m2v with NAME.yuv (ffmpeg faani reference), in the guest's ~/nvenc-dev.
-# MPEG-2 has no normative IDCT, so each stream gets a baseline: the worst frame of ffmpeg's simple IDCT against faani
+# m2all.sh DIR [TOOL EXT]: TOOL (default mpeg2decodeN) on every NAME.EXT (default m2v) with NAME.yuv (ffmpeg faani
+# reference), in the guest's ~/nvenc-dev (also mpeg4decodeN m4v / h263). MPEG-1/2/4 and H.263 have no normative IDCT, so each stream gets a baseline: the worst frame of ffmpeg's simple IDCT against faani
 # (two correct decoders drifting apart), cached in NAME.base. A stream passes when every frame decodes and our worst
 # frame is >= min(55, baseline - 8) dB (the engine's IDCT drifts a little more than ffmpeg's within long GOPs: a sawtooth that
 # resets at each I frame).
-cd ~/nvenc-dev; pass=0; tot=0; F=/usr/local/bin/ffmpeg
-for f in $1/*.m2v; do n=${f%.m2v}; tot=$((tot+1))
+cd ~/nvenc-dev; pass=0; tot=0; F=/usr/local/bin/ffmpeg; T=${2:-mpeg2decodeN}; X=${3:-m2v}
+for f in $1/*.$X; do n=${f%.$X}; tot=$((tot+1))
   # NAME.skip: an output frame ffmpeg's reference does not have (it drops the last anchor before a size change)
-  r=$(MPEG2_SKIP_SHOWN=$(cat $n.skip 2>/dev/null || echo -1) ./mpeg2decodeN $f $n.yuv 2>&1 | grep -E "RESULT|error" | tail -1)
+  r=$(MPEG2_SKIP_SHOWN=$(cat $n.skip 2>/dev/null || echo -1) ./$T $f $n.yuv 2>&1 | grep -E "RESULT|error" | tail -1)
   w=$(echo "$r" | sed -nE "s/.*worst ([0-9.]+) dB.*/\1/p")
   if [ ! -s $n.base ]; then
     sz=$($F -nostdin -hide_banner -i $f 2>&1 | grep -oE "[0-9]{2,5}x[0-9]{2,5}" | head -1)
