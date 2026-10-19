@@ -15,6 +15,21 @@ Why: the driver's own encoder library is Blackwell-only and closed. With a layou
 4K frame still costs ~9 ms in CPU copies, tiling and spin-waiting, the bitrate setting is ignored, and only one session
 per process works ([measurements](https://github.com/mickys/kvm-tahoe-nvidia/blob/main/docs/nvenc-enable-plan.md)).
 
+## Using it
+
+Releases ship inside the [mickys overlay](https://github.com/mickys/nvidia-macos-driver/releases) for nullmoth's driver
+(RTX 40 / Ada; H.264 High, HEVC Main and Main 10).
+
+- **Apps** (Parsec, OBS, AVFoundation apps): the Metal plugin loads `libnvencvt.dylib` into every process that uses
+  Metal, and VideoToolbox lists "NVENC - H.264 - (NVIDIA <card>) - mickys/nvenc - <version>" and its HEVC twin.
+- **Command-line tools** (ffmpeg, HandBrakeCLI, avconvert) never use Metal, so they see the encoder only through the
+  overlay's wrapper: `nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox -b:v 20M out.mp4` (it sets
+  `DYLD_INSERT_LIBRARIES` for that one tool; the library registers itself when injected). macOS has no supported way for a
+  third party to register a video encoder for every process: VideoToolbox loads only Apple-signed encoder plug-ins, and
+  MediaExtension has decoder extensions but no encoder ones ([docs/reports/T7.00-cli-and-extensions.md](docs/reports/T7.00-cli-and-extensions.md)).
+  The wrapper relies on the boot settings nullmoth's driver needs (relaxed SIP, `amfi_get_out_of_my_way`) for hardened
+  and Apple binaries; unsigned builds (evermeet.cx, Homebrew) take it anyway.
+
 ## Layout
 
 | Path | What |

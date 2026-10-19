@@ -94,7 +94,7 @@ first.
 
 | Task | What | Done when | Status |
 |---|---|---|---|
-| T7.00 | Registration without a Metal device (CLI apps like ffmpeg get -12908): VT plug-in bundle or another hook | `ffmpeg -c:v hevc_videotoolbox` uses our encoder without injection | open (names done: reports/T7.00-names.md) |
+| T7.00 | Registration without a Metal device (CLI apps like ffmpeg get -12908): VT plug-in bundle or another hook | `ffmpeg -c:v hevc_videotoolbox` uses our encoder without injection | done another way: no supported registration exists (reports/T7.00-cli-and-extensions.md, T7.03-coremedia-codesign-summary.md); CLI tools use the overlay's `nvenc-run` wrapper (injection), released in v2.3.6-mickys.9 (names: reports/T7.00-names.md) |
 | T7.01 | Full-range input (420f/xf20) signalled in the VUI (H.264 and HEVC) | Parsec's 420f stream decodes to the same levels as the source | done (ffmpeg, OBS) |
 | T7.02 | H.264 High profile, CABAC, 8x8 transform (observe nullmoth's libnvenc_h264) | ~10 % less bitrate at equal PSNR; decodes | done: 4K 32 -> 49 dB at 20 Mbit/s |
 | T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | open |
