@@ -2,7 +2,7 @@
 # make-vp9-streams.sh OUTDIR: VP9 test streams (IVF) for the decoder (M10) from ffmpeg's testsrc2 with libvpx-vp9, plus a
 # reference decode of each (I420 / yuv420p10le, display order) from ffmpeg's own VP9 decoder. Each stream exercises
 # something else: alt-ref (hidden frames + superframes), tiles, error resilience, lossless, frame-parallel mode,
-# segmentation (cyclic refresh), tile rows, 4K, 10-bit (profile 2), odd sizes.
+# segmentation (cyclic refresh), tile rows, 4K, 10/12-bit (profile 2, 4K and a width that is not a multiple of 64), odd sizes.
 set -euo pipefail
 out=${1:?usage: make-vp9-streams.sh OUTDIR}; mkdir -p "$out"
 # frame-parallel mode (no backward adaptation) is ffmpeg's libvpx default; every stream but fpd-* turns it off.
@@ -29,4 +29,7 @@ mk seg-640x360       640x360   60 yuv420p -b:v 600k -deadline realtime -cpu-used
 mk rows-1920x1080    1920x1080 30 yuv420p -b:v 4M -tile-columns 2 -tile-rows 2
 mk uhd-3840x2160     3840x2160 30 yuv420p -b:v 12M -deadline realtime -cpu-used 8 -tile-columns 4
 mk p2-10bit-1280x720 1280x720  30 yuv420p10le -b:v 2M -profile:v 2
+mk p2-12bit-640x360  640x360   30 yuv420p12le -b:v 1M -profile:v 2
+mk p2-10bit-3840x2160 3840x2160 20 yuv420p10le -b:v 12M -profile:v 2 -deadline realtime -cpu-used 8 -tile-columns 4
+mk p2-10bit-1366x768 1366x768  30 yuv420p10le -b:v 2M -profile:v 2
 mk odd-351x287       351x287   30 yuv420p -b:v 400k

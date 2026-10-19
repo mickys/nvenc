@@ -8,10 +8,13 @@
 #include <string.h>
 #include <time.h>
 
-static double psnr(const uint8_t *a, const uint8_t *b, size_t n)
+static int gB = 1, gBD = 8;   // bytes per sample, bit depth
+static double psnr(const uint8_t *a, const uint8_t *b, size_t n)   // n samples
 {
-    double se = 0; for (size_t i = 0; i < n; i++) { int d = a[i] - b[i]; se += d * d; }
-    return se == 0 ? 99.0 : 10 * log10(255.0 * 255.0 / (se / n));
+    double se = 0;
+    for (size_t i = 0; i < n; i++) { int d = gB == 1 ? a[i] - b[i] : (a[2 * i] | a[2 * i + 1] << 8) - (b[2 * i] | b[2 * i + 1] << 8); se += (double)d * d; }
+    const double mx = (double)((1 << gBD) - 1);
+    return se == 0 ? 99.0 : 10 * log10(mx * mx / (se / n));
 }
 
 int main(int argc, char **argv)
@@ -26,7 +29,7 @@ int main(int argc, char **argv)
     FILE *fp = fopen(argv[ai], "rb"); if (!fp) { perror(argv[ai]); return 1; }
     FILE *rf = fopen(argv[ai + 1], "rb"); if (!rf) { perror(argv[ai + 1]); return 1; }
     uint8_t ih[32]; if (fread(ih, 1, 32, fp) != 32 || memcmp(ih, "DKIF", 4)) { fprintf(stderr, "not IVF\n"); return 1; }
-    unsigned W = ih[12] | ih[13] << 8, H = ih[14] | ih[15] << 8;
+    unsigned W = ih[12] | ih[13] << 8, H = ih[14] | ih[15] << 8; int bd = 0;
     {   // the largest frame (streams that resize grow beyond the IVF header's size)
         static Vp9State ps; vp9_init(&ps); uint8_t fh[12];
         while (fread(fh, 1, 12, fp) == 12) {
@@ -35,6 +38,7 @@ int main(int argc, char **argv)
             size_t off[8], len[8]; const int nf = vp9_superframe(buf, sz, off, len);
             for (int i = 0; i < nf; i++) {
                 Vp9Frame f; if (vp9_parse_frame(&ps, buf + off[i], len[i], &f)) continue;
+                if (!f.show_existing_frame && !bd) bd = f.bit_depth;
                 if (!f.show_existing_frame) { if ((unsigned)f.width > W) W = (unsigned)f.width; if ((unsigned)f.height > H) H = (unsigned)f.height; }
                 vp9_end_frame(&ps, &f, NULL);
             }
@@ -45,7 +49,9 @@ int main(int argc, char **argv)
         if (H < minH) H = minH;
     }
     Rm rm = { 0 }; if (rm_open(&rm) || rm_va_init(&rm)) { fprintf(stderr, "RM failed\n"); return 1; }
-    static Vp9Dec d; if (vp9dec_open(&d, &rm, W, H)) return 1;
+    static Vp9Dec d; if (vp9dec_open(&d, &rm, W, H, bd ? bd : 8)) return 1;
+    const int B = d.bps;   // bytes per sample in the reference file too
+    gB = B; gBD = d.bit_depth;
     d.verbose = verbose;
     int shown = 0, decoded = 0, exact = 0, first_bad = -1; double worst = 99, eng = 0; off_t refpos = 0;
     uint8_t *out = NULL, *ref = NULL; size_t cap = 0;
@@ -60,13 +66,13 @@ int main(int argc, char **argv)
             if (!d.f.show_existing_frame) { decoded++; eng += d.engine_ms; }
             if (r == 0) continue;
             const unsigned w = (unsigned)d.cur_w, h = (unsigned)d.cur_h, cw = (w + 1) / 2, ch = (h + 1) / 2;
-            const size_t fs = (size_t)w * h + 2 * (size_t)cw * ch;
+            const size_t ns = (size_t)w * h + 2 * (size_t)cw * ch, fs = ns * (size_t)B;
             if (fs > cap) { cap = fs; out = realloc(out, cap); ref = realloc(ref, cap); }
             vp9dec_read_i420(&d, d.cur_surf, out, w, h);
             double ps = 0;
             if (!fseeko(rf, refpos, SEEK_SET) && fread(ref, 1, fs, rf) == fs) {
                 ps = psnr(out, ref, (size_t)w * h);
-                const double pu = psnr(out + (size_t)w * h, ref + (size_t)w * h, fs - (size_t)w * h);
+                const double pu = psnr(out + (size_t)w * h * B, ref + (size_t)w * h * B, ns - (size_t)w * h);
                 if (pu < ps) ps = pu;
             }
             refpos += (off_t)fs;

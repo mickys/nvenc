@@ -14,11 +14,12 @@
 static NvU32 hi(NvU64 a) { return (NvU32)(a >> 8); }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
+int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
 {
     memset(d, 0, sizeof *d);
     d->rm = rm; d->maxW = (maxW + 63) & ~63u; d->maxH = (maxH + 63) & ~63u;
-    d->pitch = d->maxW;
+    d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1;
+    d->pitch = (size_t)d->maxW * (size_t)d->bps;
     for (int i = 0; i < 8; i++) d->ref[i] = -1;
     vp9_init(&d->st);
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
@@ -37,7 +38,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
         { &d->setup, 0x2000 }, { &d->bs, bsCap }, { &d->probs, sizeof(nvdec_vp9EntropyProbs_t) },
         { &d->counts, sizeof(nvdec_vp9EntropyCounts_t) }, { &d->seg[0], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE },
         { &d->seg[1], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE }, { &d->tiles, 0x1000 }, { &d->colmv[0], sbs * 1024 },
-        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
+        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "vp9dec: alloc failed\n"); return -1; }
         memset(b[i].m->cpu, 0, b[i].m->size);
@@ -63,20 +64,31 @@ void vp9dec_release(Vp9Dec *d, int surf) { if (surf >= 0 && surf < VP9_SURFACES)
 
 void vp9dec_read_nv12(Vp9Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
 {
-    nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w, h, d->pitch);
-    nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, (w + 1) & ~1u, (h + 1) / 2, d->pitch);
+    const size_t b = (size_t)d->bps;
+    nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch);
+    nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, ((w + 1) & ~1u) * b, (h + 1) / 2, d->pitch);
+}
+
+static unsigned sample(const uint8_t *p, size_t x, size_t y, size_t pitch, int bps, int shift)
+{
+    if (bps == 1) return p[nvenc_in_offset(x, y, pitch)];
+    const size_t o = nvenc_in_offset(2 * x, y, pitch);      // a 16-bit sample never straddles a 16-byte run
+    return (unsigned)(p[o] | p[o + 1] << 8) >> shift;
 }
 
 void vp9dec_read_i420(Vp9Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h)
 {
     const uint8_t *L = d->luma[surf].cpu, *C = d->chroma[surf].cpu;
     const unsigned cw = (w + 1) / 2, ch = (h + 1) / 2;
-    uint8_t *u = dst + (size_t)w * h, *v = u + (size_t)cw * ch;
-    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) dst[(size_t)y * w + x] = L[nvenc_in_offset(x, y, d->pitch)];
+    const int b = d->bps, sh = b == 2 ? 16 - d->bit_depth : 0;   // the engine writes 10/12-bit samples MSB-aligned (like P010)
+    #define PUT(i, v) do { if (b == 1) dst[i] = (uint8_t)(v); else { dst[2 * (i)] = (uint8_t)(v); dst[2 * (i) + 1] = (uint8_t)((v) >> 8); } } while (0)
+    const size_t U = (size_t)w * h, V = U + (size_t)cw * ch;
+    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) PUT((size_t)y * w + x, sample(L, x, y, d->pitch, b, sh));
     for (unsigned y = 0; y < ch; y++) for (unsigned x = 0; x < cw; x++) {
-        u[(size_t)y * cw + x] = C[nvenc_in_offset(2 * x, y, d->pitch)];
-        v[(size_t)y * cw + x] = C[nvenc_in_offset(2 * x + 1, y, d->pitch)];
+        PUT(U + (size_t)y * cw + x, sample(C, 2 * x, y, d->pitch, b, sh));
+        PUT(V + (size_t)y * cw + x, sample(C, 2 * x + 1, y, d->pitch, b, sh));
     }
+    #undef PUT
 }
 
 // the probability table as NVDEC reads it: 9-probability tables split 8 + 1, rows padded to 4, the key frame partition
@@ -136,8 +148,9 @@ static void extend_edges(Vp9Dec *d, int surf, unsigned w, unsigned h)
 {
     const unsigned aw = (w + 63) & ~63u, ah = (h + 63) & ~63u;
     if (aw == w && ah == h) return;
-    extend_plane(d->luma[surf].cpu, d->pitch, w, h, aw, ah, 1);
-    extend_plane(d->chroma[surf].cpu, d->pitch, (w + 1) / 2, (h + 1) / 2, aw / 2, ah / 2, 2);
+    const unsigned b = (unsigned)d->bps;
+    extend_plane(d->luma[surf].cpu, d->pitch, w, h, aw, ah, b);
+    extend_plane(d->chroma[surf].cpu, d->pitch, (w + 1) / 2, (h + 1) / 2, aw / 2, ah / 2, 2 * b);
 }
 
 static int tile_offset(int n, int mis, int log2) { int sbs = (mis + 7) >> 3, o = ((n * sbs) >> log2) << 3; return o < mis ? o : mis; }
@@ -154,7 +167,8 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     }
     if (f->width > 8192 || f->height > 8192) { fprintf(stderr, "vp9dec: %dx%d is beyond NVDEC's VP9 limit (8192)\n", f->width, f->height); return -1; }
     if ((unsigned)f->width > d->maxW || (unsigned)f->height > d->maxH) { fprintf(stderr, "vp9dec: %dx%d is larger than the session\n", f->width, f->height); return -1; }
-    if (f->bit_depth != 8 || !f->subsampling_x || !f->subsampling_y) { fprintf(stderr, "vp9dec: only 8-bit 4:2:0 so far\n"); return -1; }
+    if (!f->subsampling_x || !f->subsampling_y) { fprintf(stderr, "vp9dec: only 4:2:0 (NVDEC has no VP9 4:2:2 / 4:4:4)\n"); return -1; }
+    if (f->bit_depth != d->bit_depth) { fprintf(stderr, "vp9dec: %d-bit frame in a %d-bit session\n", f->bit_depth, d->bit_depth); return -1; }
     int surf = -1;
     for (int i = 0; i < VP9_SURFACES && surf < 0; i++) {
         bool used = d->busy[i];
@@ -192,10 +206,10 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     for (int i = 0; i < 3; i++) {
         unsigned short *r = rw[i];
         r[0] = (unsigned short)(rs[i] == surf ? f->width : (int)d->w[rs[i]]); r[1] = (unsigned short)(rs[i] == surf ? f->height : (int)d->h[rs[i]]);
-        r[2] = r[3] = (unsigned short)d->pitch;
+        r[2] = r[3] = (unsigned short)(d->pitch / (size_t)d->bps);   // strides in samples (T10.03: 10-bit rows landed 2x apart)
     }
     ps->width = (unsigned short)f->width; ps->height = (unsigned short)f->height;
-    ps->framestride[0] = ps->framestride[1] = (unsigned short)d->pitch;
+    ps->framestride[0] = ps->framestride[1] = (unsigned short)(d->pitch / (size_t)d->bps);
     ps->keyFrame = f->frame_type == VP9_KEY_FRAME;
     ps->prevIsKeyFrame = f->last_frame_type == VP9_KEY_FRAME;
     ps->resolutionChange = size_changed;
@@ -223,7 +237,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     for (int i = 0; i < 4; i++) ps->mbRefLfDelta[i] = (char)d->st.lf_ref_deltas[i];
     for (int i = 0; i < 2; i++) ps->mbModeLfDelta[i] = (char)d->st.lf_mode_deltas[i];
     ps->v1.Vp9FltAboveOffset = (unsigned)(d->flt_above >> 8);
-    ps->v1.bit_depth = 8;
+    ps->v1.bit_depth = (unsigned)f->bit_depth;
 
     Chan *c = &d->chan;
     chan_rewind(c);
