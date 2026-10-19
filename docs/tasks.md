@@ -149,6 +149,25 @@ but no CDF table structure), and NVDEC does not initialise or adapt them itself.
 are public (`nvdec_vp9EntropyProbs_t`, `nvdec_vp9EntropyCounts_t`), so VP9 goes first; AV1 waits for a layout hypothesis
 to test (spec order, padded like VP9's tables).
 
+## M9: AV1 decode
+
+Like VP9, the driver parses the headers and NVDEC decodes the tiles. Unlike VP9, the engine adapts the probabilities
+itself (`AV1_SET_PROB_TAB_READ` / `_WRITE`, `context_update_tile_id`), so the driver only has to supply the default CDF
+tables in the engine's layout and keep each reference frame's written table. That layout is the open question (not in
+any public header). Hypothesis 1: libaom's `FRAME_CONTEXT` struct as it is (libaom is the AV1 reference codec, public,
+BSD), with its inverted CDF values (32768 - x) and counters; dumped per quantizer context by a throwaway generator built
+from libaom v3.12.1's entropy sources (`notes/av1/gen.c`, `notes/av1/aom_fc_q*.bin`, 21 240 bytes each; libaom is only
+read, nothing from it is built into nvenc). Sources: AV1 specification (`vendor/specs/av1-spec.txt`), `nvdec_drv.h`,
+`clc9b0.h`. Streams: `scripts/make-av1-streams.sh OUTDIR` (libaom, SVT-AV1, rav1e through ffmpeg; references from dav1d).
+
+| Task | What | Done when | Status |
+|---|---|---|---|
+| T9.00 | Default CDF tables from the spec text | every table's count matches its declared dimensions | done: `scripts/spec-tables.py av1` (constants read from the spec's own table, `a * b` products evaluated, page furniture stripped): 108 tables (94 CDF tables, 1196 CDF arrays) in `src/av1tables.h` |
+| T9.01 | Parser: OBUs, sequence header, uncompressed frame header (frame refs incl. short signalling, superres, tile info, quantisation, segmentation, delta q / lf, loop filter, CDEF, loop restoration, tx / reference / skip mode, global motion, film grain), tile groups, reference slot state (7.20, 7.21) | the header fields match ffmpeg's `trace_headers` on every frame of every test stream | done (`src/av1parse.c`, `tools/av1parsetest`, `scripts/vp9-trace-compare.py` now also for AV1): 14 streams (libaom incl. alt-ref / show_existing_frame, 4x2 tiles, 10-bit, screen content, error resilient, film grain, 351x287; SVT-AV1 incl. 4K 10-bit, superres, film grain; rav1e incl. tiles), 0 differences in ~20 000 compared fields. Not covered by the streams yet: global motion, intra block copy |
+| T9.02 | One key frame through `nvdec_av1_pic_s`: CDF table (hypothesis 1 first), tile info / tile stream buffers, filter buffers | bit-exact against dav1d | planned |
+| T9.03 | Inter frames: references, temporal MVs, segmentation maps, CDF save / load per slot, loop filter, CDEF, loop restoration, superres, film grain | all test streams bit-exact | planned |
+| T9.04 | VideoToolbox `av01` decoder in libnvencvt (av1C) | AVFoundation / ffmpeg `-hwaccel videotoolbox` decode AV1 with it | planned |
+
 ## M10: VP9 decode
 
 The driver parses both frame headers, keeps the four probability contexts, applies the compressed header's probability

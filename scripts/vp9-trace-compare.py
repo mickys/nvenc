@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""vp9-trace-compare.py vp9parsetest in.ivf: compare tools/vp9parsetest's header fields (VP9TRACE=1) with ffmpeg's
-trace_headers bitstream filter, frame by frame, for every field both print."""
+"""vp9-trace-compare.py parsetest in.ivf: compare tools/vp9parsetest's (VP9TRACE=1) or tools/av1parsetest's (AV1TRACE=1)
+header fields with ffmpeg's trace_headers bitstream filter, frame by frame, for every field both print. AV1: a frame
+starts at each "Frame Header" / "Frame" OBU of the trace."""
 import os, re, subprocess, sys
 exe, ivf = sys.argv[1], sys.argv[2]
 def frames(lines, start):
@@ -12,8 +13,8 @@ def frames(lines, start):
     return out
 ff = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-i", ivf, "-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"],
                     capture_output=True, text=True).stderr.splitlines()
-ff = frames([l for l in ff if "trace_headers" in l], lambda l: l.rstrip().endswith("] Frame"))
-ours = subprocess.run([exe, ivf], capture_output=True, text=True, env=dict(os.environ, VP9TRACE="1")).stdout.splitlines()
+ff = frames([l for l in ff if "trace_headers" in l], lambda l: l.rstrip().endswith(("] Frame", "] Frame Header")))
+ours = subprocess.run([exe, ivf], capture_output=True, text=True, env=dict(os.environ, VP9TRACE="1", AV1TRACE="1")).stdout.splitlines()
 ours = frames(ours, lambda l: l == "FRAME")
 bad = checked = 0
 for i, (a, b) in enumerate(zip(ours, ff)):
