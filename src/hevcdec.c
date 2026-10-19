@@ -71,18 +71,28 @@ void hevcdec_close(HevcDec *d)
 
 void hevcdec_release(HevcDec *d, int surf) { if (surf >= 0 && surf < HEVC_SURFACES) d->busy[surf] = false; }
 
-void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
-{
-    const size_t b = (size_t)d->bps;
-    nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch);
-    nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, ((w + 1) & ~1u) * b, (h + 1) / 2, d->pitch);
-}
-
 static unsigned sample(const uint8_t *p, size_t x, size_t y, size_t pitch, int bps, int shift)
 {
     if (bps == 1) return p[nvenc_in_offset(x, y, pitch)];
     const size_t o = nvenc_in_offset(2 * x, y, pitch);
     return (unsigned)(p[o] | p[o + 1] << 8) >> shift;
+}
+
+void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0)
+{
+    const size_t b = (size_t)d->bps, cp = d->chroma_format == 3 ? 2 * d->pitch : d->pitch;
+    const unsigned cw = d->chroma_format == 3 ? w : (w + 1) / 2, ch = d->chroma_format == 3 ? h : (h + 1) / 2;
+    if (!x0 && !y0) {
+        nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch);
+        nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, 2 * cw * b, ch, cp);
+        return;
+    }
+    // a conformance window that crops the left / top: sample by sample (rare)
+    const unsigned cx0 = d->chroma_format == 3 ? x0 : x0 / 2, cy0 = d->chroma_format == 3 ? y0 : y0 / 2;
+    for (unsigned r = 0; r < h; r++) for (unsigned x = 0; x < w; x++) for (size_t k = 0; k < b; k++)
+        y[r * ystride + x * b + k] = ((const uint8_t *)d->luma[surf].cpu)[nvenc_in_offset((x0 + x) * b + k, y0 + r, d->pitch)];
+    for (unsigned r = 0; r < ch; r++) for (unsigned x = 0; x < 2 * cw; x++) for (size_t k = 0; k < b; k++)
+        uv[r * uvstride + x * b + k] = ((const uint8_t *)d->chroma[surf].cpu)[nvenc_in_offset((2 * cx0 + x) * b + k, cy0 + r, cp)];
 }
 
 void hevcdec_read_yuv(HevcDec *d, int surf, uint8_t *dst, const int crop[4], unsigned w, unsigned h)

@@ -75,7 +75,8 @@ void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, 
     size_t bands = (rows + 15) / 16;
     if ((uintptr_t)src & 15) { untile_band_slow(dst, dst_stride, src, 0, width, 0, rows, pitch); return; }
     if (bands >= 32) {
-        size_t chunks = 2, per = (bands + chunks - 1) / chunks;
+        // memory-bound: 4K NV12 into a VideoToolbox pool buffer took 6.7 ms with 1 thread, 4.7 with 2, 3.4 with 4, 3.8 with 6-8 (T11.05)
+        const size_t chunks = 4, per = (bands + chunks - 1) / chunks;
         dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
             for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch); });
     } else

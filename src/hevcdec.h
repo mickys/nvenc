@@ -45,6 +45,7 @@ void hevcdec_close(HevcDec *d);
 int  hevcdec_nal(HevcDec *d, const uint8_t *nal, size_t len);
 int  hevcdec_flush(HevcDec *d);
 void hevcdec_release(HevcDec *d, int surf);
-// Copy a decoded surface out, cropped: I420 / I444 (16-bit little-endian samples above 8 bits), or NV12 / P010.
+// Copy a decoded surface out: I420 / I444 cropped (16-bit little-endian samples above 8 bits), or biplanar (NV12 / P010,
+// 4:4:4 like NV24) w x h from (x0, y0) (the conformance window's left / top crop).
 void hevcdec_read_yuv(HevcDec *d, int surf, uint8_t *dst, const int crop[4], unsigned w, unsigned h);
-void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h);
+void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0);

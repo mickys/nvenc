@@ -15,13 +15,13 @@
 #import <Metal/Metal.h>
 #include <math.h>
 
-typedef struct { int n; NSMutableArray *frames; double ms; OSStatus err; } Out;
+typedef struct { int n; NSMutableArray *frames, *pts; double ms; OSStatus err; } Out;
 
 static void cb(void *ref, void *src, OSStatus st, VTDecodeInfoFlags f, CVImageBufferRef img, CMTime pts, CMTime dur)
 {
     Out *o = ref;
     if (st) { o->err = st; return; }
-    if (img) { [o->frames addObject:(__bridge id)img]; o->n++; }
+    if (img) { [o->frames addObject:(__bridge id)img]; [o->pts addObject:@(CMTimeGetSeconds(pts))]; o->n++; }
 }
 
 static int decode(NSArray *samples, CMFormatDescriptionRef fd, bool hw, Out *o, bool *usedHW)
@@ -38,7 +38,7 @@ static int decode(NSArray *samples, CMFormatDescriptionRef fd, bool hw, Out *o, 
     CFBooleanRef b = NULL;
     VTSessionCopyProperty(s, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, NULL, &b);
     *usedHW = b == kCFBooleanTrue; if (b) CFRelease(b);
-    o->frames = [NSMutableArray array];
+    o->frames = [NSMutableArray array]; o->pts = [NSMutableArray array];
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     for (id x in samples) {
         VTDecodeFrameFlags fl = 0; VTDecodeInfoFlags info = 0;
@@ -133,8 +133,13 @@ int main(int argc, char **argv)
             printf("  hardware decoder: %d frames in %.1f ms (%.0f fps), using hardware %d, error %d\n", h.n, h.ms, h.n * 1000.0 / h.ms, hwH, (int)h.err);
             FILE *rf = fopen(refPath, "rb"); if (!rf) { perror(refPath); return 1; }
             int exact = 0, first = -1; double worst = 99;
+            // the reference is in display order, decoders return pictures in decode order: compare by presentation time
+            NSMutableArray *idx = [NSMutableArray array]; for (int i = 0; i < h.n; i++) [idx addObject:@(i)];
+            NSMutableArray *pts = h.pts;
+            NSArray *order = [idx sortedArrayUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) {
+                return [pts[x.intValue] compare:pts[y.intValue]]; }];
             for (int i = 0; i < h.n; i++) {
-                CVPixelBufferRef a = (__bridge CVPixelBufferRef)h.frames[i];
+                CVPixelBufferRef a = (__bridge CVPixelBufferRef)h.frames[[order[i] intValue]];
                 CVPixelBufferLockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
                 const size_t w = CVPixelBufferGetWidth(a), hh = CVPixelBufferGetHeight(a), cw = (w + 1) / 2, ch = (hh + 1) / 2;
                 const OSType pf = CVPixelBufferGetPixelFormatType(a);

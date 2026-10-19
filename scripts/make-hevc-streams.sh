@@ -1,14 +1,17 @@
 #!/bin/bash
-# make-hevc-streams.sh OUTDIR: HEVC test streams (Annex B) for the decoder (M11) from ffmpeg's testsrc2 with libx265, plus a
-# reference decode of each from ffmpeg's HEVC decoder (display order, every frame kept). Each exercises something else:
-# B-pyramids and RPS in the slice header, RPS in the SPS, open GOP (CRA + RASL), slices, WPP, scaling lists, weighted
-# prediction, lossless (transquant bypass), transform skip, AMP, temporal layers, CTB 16/32, HRD/VUI, 10/12-bit, 4K, odd sizes.
+# make-hevc-streams.sh OUTDIR: HEVC test streams for the decoder (M11) from ffmpeg's testsrc2 with libx265, as MP4 (hvc1, with
+# composition times, for VideoToolbox) and the same bitstream as Annex B (.hevc), plus a reference decode of each from
+# ffmpeg's HEVC decoder (display order, every frame kept). Each exercises something else: B-pyramids and RPS in the slice
+# header, RPS in the SPS, open GOP (CRA + RASL), slices, WPP, scaling lists, weighted prediction, lossless (transquant
+# bypass), transform skip, AMP, temporal layers, CTB 16/32, HRD/VUI, 10/12-bit, 4:4:4, 4K, odd sizes; 4:2:2 and monochrome
+# (refused by the engine).
 set -uo pipefail
 out=${1:?usage: make-hevc-streams.sh OUTDIR}; mkdir -p "$out"
 mk() {   # name size frames pix_fmt x265-params
     local name=$1 size=$2 n=$3 pf=$4 xp=$5
     ffmpeg -nostdin -loglevel error -y -f lavfi -i "testsrc2=size=$size:rate=30" -frames:v "$n" -pix_fmt "$pf" \
-        -c:v libx265 -x265-params "log-level=1:$xp" -f hevc "$out/$name.hevc" 2>"$out/$name.log" || { echo "$name: FAILED"; grep error "$out/$name.log"; return; }
+        -c:v libx265 -x265-params "log-level=1:$xp" -tag:v hvc1 "$out/$name.mp4" 2>"$out/$name.log" || { echo "$name: FAILED"; grep error "$out/$name.log"; return; }
+    ffmpeg -nostdin -loglevel error -y -i "$out/$name.mp4" -c copy -bsf:v hevc_mp4toannexb -f hevc "$out/$name.hevc"
     ffmpeg -nostdin -loglevel error -y -i "$out/$name.hevc" -fps_mode passthrough -noautoscale -f rawvideo -pix_fmt "$pf" "$out/$name.yuv"
     echo "$pf" > "$out/$name.fmt"
     echo "$name: $(stat -c %s "$out/$name.hevc") bytes"
