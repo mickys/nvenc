@@ -151,7 +151,7 @@ static void vui_parameters(Br *r, HevcSps *s)
 }
 
 // ---- short-term reference picture sets (7.3.7, 7.4.8) ----
-static int st_ref_pic_set(Br *r, HevcStRps *sets, int idx, int num_sets, HevcStRps *out)
+static int st_ref_pic_set(Br *r, HevcStRps *sets, int idx, int num_sets, HevcStRps *out, int *ref_num_delta)
 {
     HevcStRps rps = { 0 };
     int inter = idx != 0 ? (int)u1(r) : 0;
@@ -160,6 +160,7 @@ static int st_ref_pic_set(Br *r, HevcStRps *sets, int idx, int num_sets, HevcStR
         if (idx == num_sets) delta_idx = (int)ue(r) + 1;
         if (delta_idx > idx) return -1;
         const HevcStRps *R = &sets[idx - delta_idx];
+        if (ref_num_delta) *ref_num_delta = R->num_negative + R->num_positive;
         const int sign = (int)u1(r), deltaRps = (1 - 2 * sign) * ((int)ue(r) + 1);
         const int nd = R->num_negative + R->num_positive;
         int used[33], use_delta[33];
@@ -221,9 +222,9 @@ int hevc_parse_sps(HevcParams *p, const uint8_t *nal, size_t len)
     s.log2_max_poc_lsb = (int)ue(&r) + 4;
     const int ordering = (int)u1(&r);
     for (int i = ordering ? 0 : s.max_sub_layers_minus1; i <= s.max_sub_layers_minus1; i++) {
-        s.max_dec_pic_buffering[i] = (int)ue(&r) + 1; s.max_num_reorder[i] = (int)ue(&r); ue(&r);
+        s.max_dec_pic_buffering[i] = (int)ue(&r) + 1; s.max_num_reorder[i] = (int)ue(&r); s.max_latency_increase_plus1[i] = (int)ue(&r);
     }
-    if (!ordering) for (int i = 0; i < s.max_sub_layers_minus1; i++) { s.max_dec_pic_buffering[i] = s.max_dec_pic_buffering[s.max_sub_layers_minus1]; s.max_num_reorder[i] = s.max_num_reorder[s.max_sub_layers_minus1]; }
+    if (!ordering) for (int i = 0; i < s.max_sub_layers_minus1; i++) { s.max_dec_pic_buffering[i] = s.max_dec_pic_buffering[s.max_sub_layers_minus1]; s.max_num_reorder[i] = s.max_num_reorder[s.max_sub_layers_minus1]; s.max_latency_increase_plus1[i] = s.max_latency_increase_plus1[s.max_sub_layers_minus1]; }
     s.log2_min_cb = (int)ue(&r) + 3; s.log2_max_cb = s.log2_min_cb + (int)ue(&r);
     s.log2_min_tb = (int)ue(&r) + 2; s.log2_max_tb = s.log2_min_tb + (int)ue(&r);
     s.max_th_depth_inter = (int)ue(&r); s.max_th_depth_intra = (int)ue(&r);
@@ -238,7 +239,7 @@ int hevc_parse_sps(HevcParams *p, const uint8_t *nal, size_t len)
     }
     s.num_short_term_ref_pic_sets = (int)ue(&r);
     if (s.num_short_term_ref_pic_sets > 64) return -1;
-    for (int i = 0; i < s.num_short_term_ref_pic_sets; i++) if (st_ref_pic_set(&r, s.st_rps, i, s.num_short_term_ref_pic_sets, &s.st_rps[i])) return -1;
+    for (int i = 0; i < s.num_short_term_ref_pic_sets; i++) if (st_ref_pic_set(&r, s.st_rps, i, s.num_short_term_ref_pic_sets, &s.st_rps[i], NULL)) return -1;
     s.long_term_ref_pics_present = (int)u1(&r);
     if (s.long_term_ref_pics_present) {
         s.num_long_term_ref_pics_sps = (int)ue(&r);
@@ -394,7 +395,7 @@ int hevc_parse_slice_header(const HevcParams *p, const uint8_t *nal, size_t len,
             s->short_term_ref_pic_set_sps_flag = (int)u1(&r);
             if (!s->short_term_ref_pic_set_sps_flag) {
                 const size_t b0 = r.bit;
-                if (st_ref_pic_set(&r, (HevcStRps *)sps->st_rps, sps->num_short_term_ref_pic_sets, sps->num_short_term_ref_pic_sets, &s->st_rps)) return -1;
+                if (st_ref_pic_set(&r, (HevcStRps *)sps->st_rps, sps->num_short_term_ref_pic_sets, sps->num_short_term_ref_pic_sets, &s->st_rps, &s->st_rps_ref_num_delta)) return -1;
                 s->st_rps_bits = (int)(r.bit - b0);
             } else {
                 if (sps->num_short_term_ref_pic_sets > 1) s->short_term_ref_pic_set_idx = (int)u(&r, ceil_log2((unsigned)sps->num_short_term_ref_pic_sets));
@@ -499,3 +500,4 @@ int hevc_poc(HevcPocState *st, const HevcSps *sps, const HevcSlice *s, bool no_r
     if (s->temporal_id == 0 && !rasl_radl && !slnr) st->prev_poc_tid0 = poc;
     return poc;
 }
+

@@ -29,7 +29,7 @@ typedef struct {
     int chroma_format_idc, separate_colour_plane_flag, width, height;
     int conf_win_left, conf_win_right, conf_win_top, conf_win_bottom;   // in luma samples
     int bit_depth_luma, bit_depth_chroma, log2_max_poc_lsb;
-    int max_dec_pic_buffering[8], max_num_reorder[8];
+    int max_dec_pic_buffering[8], max_num_reorder[8], max_latency_increase_plus1[8];
     int log2_min_cb, log2_max_cb, log2_min_tb, log2_max_tb, max_th_depth_inter, max_th_depth_intra;
     int scaling_list_enabled, scaling_list_data_present; HevcScaling scaling;
     int amp_enabled, sao_enabled, pcm_enabled, pcm_bit_depth_luma, pcm_bit_depth_chroma, log2_min_pcm_cb, log2_max_pcm_cb;
@@ -72,6 +72,7 @@ typedef struct {
     int slice_type, pic_output_flag, colour_plane_id, poc_lsb;
     int short_term_ref_pic_set_sps_flag, short_term_ref_pic_set_idx; HevcStRps st_rps;   // the RPS in use
     int st_rps_bits;                                 // bits of short_term_ref_pic_set() in the slice header (0 if from the SPS)
+    int st_rps_ref_num_delta;                        // NumDeltaPocs[RefRpsIdx] when that set is predicted (inter RPS), else 0
     int num_long_term_sps, num_long_term_pics, lt_poc_lsb[32], lt_used[32], lt_msb_present[32], lt_delta_msb_cycle[32];
     int rps_start, rps_bits;                         // RBSP bit (after the NAL header) of short_term_ref_pic_set_sps_flag, and the
                                                      // bits from it to the end of the long-term part
