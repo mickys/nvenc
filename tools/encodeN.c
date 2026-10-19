@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void frame(uint8_t *y, uint8_t *uv, int W, int H, int f)
+static void frame_synth(uint8_t *y, uint8_t *uv, int W, int H, int f)
 {
     // moving diagonal gradient + 64 px checkerboard scrolling right + a sweeping bar
     for (int r = 0; r < H; r++)
@@ -24,6 +24,18 @@ static void frame(uint8_t *y, uint8_t *uv, int W, int H, int f)
             uv[r * W + 2 * c] = (uint8_t)(128 + 60 * sin((c + f) * 0.02));
             uv[r * W + 2 * c + 1] = (uint8_t)(128 + 60 * cos((r + f) * 0.03));
         }
+}
+
+// SRC=file.nv12: frames from a raw NV12 file (display index f, looping) instead of the synthetic pattern
+static void frame(uint8_t *y, uint8_t *uv, int W, int H, int f)
+{
+    static FILE *src; static long nframes = -1;
+    const char *path = getenv("SRC");
+    if (!path) { frame_synth(y, uv, W, H, f); return; }
+    const size_t ys = (size_t)W * H, cs = (size_t)W * ((H + 1) / 2);
+    if (!src) { src = fopen(path, "rb"); if (!src) { perror(path); exit(1); } fseek(src, 0, SEEK_END); nframes = ftell(src) / (long)(ys + cs); }
+    fseek(src, (long)(f % nframes) * (long)(ys + cs), SEEK_SET);
+    if (fread(y, 1, ys, src) != ys || fread(uv, 1, cs, src) != cs) { fprintf(stderr, "short read from %s\n", path); exit(1); }
 }
 
 int main(int argc, char **argv)
@@ -40,7 +52,7 @@ int main(int argc, char **argv)
                       .rc_mode = getenv("RC") ? atoi(getenv("RC")) : 0, .bitrate = getenv("BITRATE") ? atoi(getenv("BITRATE")) : 0,
                       .max_bitrate = getenv("MAXRATE") ? atoi(getenv("MAXRATE")) : 0, .vbv_bits = getenv("VBV") ? atoi(getenv("VBV")) : 0,
                       .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1, .bit_depth = getenv("BITDEPTH") ? atoi(getenv("BITDEPTH")) : 8,
-                      .chroma444 = getenv("CHROMA444") != NULL, .lossless = getenv("LOSSLESS") != NULL, .cabac = getenv("CABAC") != NULL, .h264_profile = getenv("HIGH") ? 100 : 77 };
+                      .chroma444 = getenv("CHROMA444") != NULL, .lossless = getenv("LOSSLESS") != NULL, .bframes = getenv("BFRAMES") ? atoi(getenv("BFRAMES")) : 0, .cabac = getenv("CABAC") != NULL, .h264_profile = getenv("HIGH") ? 100 : 77 };
     Enc e; if (enc_open(&e, &cfg)) return 1;
     FILE *fh = fopen(argv[ai + 6], "wb"), *fs = fopen(argv[ai + 7], "wb");
     uint8_t hdr[256]; fwrite(hdr, 1, enc_headers(&e, hdr), fh);
@@ -50,6 +62,26 @@ int main(int argc, char **argv)
         fwrite(ih, 1, 32, fh);
     }
     uint8_t *y = malloc((size_t)W * H), *uv = malloc((size_t)W * CH);
+    if (cfg.bframes > 0 && !av1 && !hevc) {   // BFRAMES=n (H.264): IDR, then each anchor followed by the n B pictures before it
+        for (int f = 0; f < N; f++) { frame(y, uv, W, H, f); fwrite(y, 1, (size_t)W * H, fs); fwrite(uv, 1, (size_t)W * CH, fs); }
+        int fails = 0; double bits = 0, ms = 0; int prev = 0, coded = 0;
+        for (int a = 0; a < N && !fails; ) {   // a: the next anchor in display order
+            int order[16], no = 0; order[no++] = a; for (int k = prev + 1; k < a; k++) order[no++] = k;
+            if (a == 0) no = 1;
+            for (int i = 0; i < no; i++) {
+                const int disp = order[i]; const bool bp = i > 0;
+                frame(y, uv, W, H, disp); enc_load_nv12(&e, y, W, uv, W);
+                EncFrame fr;
+                if (enc_encode_ex(&e, false, bp, disp, &fr)) { printf("frame %d FAILED (ucode error %u)\n", disp, fr.ucode_error); fails++; break; }
+                fwrite(fr.data, 1, fr.size, fh); bits += fr.bits; ms += fr.ms; coded++;
+                if (verbose || coded <= 4) printf("coded %3d: display %3d %s poc %3u: %8u bits, %.3f ms, avgQP %u, intra %u inter %u MBs\n", coded - 1, disp, fr.idr ? "IDR" : bp ? "B  " : "P  ", fr.poc, fr.bits, fr.ms, fr.avg_qp, fr.intra_mbs, fr.inter_mbs);
+            }
+            prev = a; a = a == 0 ? (cfg.bframes + 1 < N ? cfg.bframes + 1 : N - 1) : (a + cfg.bframes + 1 < N ? a + cfg.bframes + 1 : (a == N - 1 ? N : N - 1));
+        }
+        printf("%d frames %dx%d with B pictures (%d between anchors): %.1f kbit/frame, %.2f Mbit/s at 60 fps, encode %.3f ms avg, %d failed\n",
+               coded, W, H, cfg.bframes, bits / coded / 1000, bits / coded * 60 / 1e6, ms / coded, fails);
+        fclose(fh); fclose(fs); enc_close(&e); return fails ? 1 : 0;
+    }
     double bits = 0, ms = 0, msMax = 0, bitsSteady = 0, pMax = 0; int fails = 0, nSteady = 0, qpMin = 99, qpMax = 0;
     for (int f = 0; f < N; f++) {
         // ENCN_STATIC=n: cycle through n fixed pictures (A B A B ... for n = 2), each very different from the next

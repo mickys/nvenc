@@ -63,6 +63,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     if (cfg->chroma444 && !av1) e->rSlot = (3 * e->rLuma + 0xffff) & ~(size_t)0xffff;   // 4:4:4: chroma twice the luma plane
     if (hevc || av1) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
     int slots = e->cfg.num_refs + 1;
+    if (e->cfg.bframes > 0 && e->cfg.codec == ENC_H264) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
     if (hevc) histSz = ((size_t)(W + 31) / 32 * 768 + 0xffff) & ~(size_t)0xffff;   // HEVC: 768 bytes per CTB column (nullmoth's size, T6.06)
@@ -81,6 +82,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     if (rm_mem_alloc(rm, &e->recon, e->rSlot * (size_t)slots, 0x10000, false, false, true) ||
         rm_mem_alloc(rm, &e->hist, histSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->coloc, (mbs * 64 + 0xffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
+        rm_mem_alloc(rm, &e->colocB, (mbs * 64 + 0xffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[0], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[1], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->rcproc, 0x10000, 0x1000, true, true, true) ||
@@ -124,7 +126,7 @@ void enc_close(Enc *e)
 {
     if (e->ev.h) rm_event_close(&e->rm, &e->ev);
     chan_destroy(&e->chan);
-    RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata, &e->av1ProbIn, &e->av1ProbOut,
+    RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->colocB, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata, &e->av1ProbIn, &e->av1ProbOut,
                    &e->av1ProbOut2, &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5] };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
     for (int d = 0; d < ENC_MAX_DEPTH; d++) { free(e->av1Tu[d]); e->av1Tu[d] = NULL; }
@@ -138,7 +140,8 @@ void enc_close(Enc *e)
 static H264Params hdr_params(const Enc *e)
 {
     return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 || e->cfg.lossless ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
-        .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = 2, .num_ref_frames = e->cfg.num_refs,
+        .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = e->cfg.bframes > 0 ? 0 : 2, .log2_max_poc_lsb_minus4 = 4,
+        .num_reorder = e->cfg.bframes > 0 ? 1 : 0, .num_ref_frames = e->cfg.num_refs,
         .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100 || e->cfg.chroma444, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
 }
 
@@ -545,17 +548,25 @@ static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs)
     e->pend[ds].lf = lf;
 }
 
-int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
+int enc_submit(Enc *e, bool force_idr, NvU32 *ticket) { return enc_submit_ex(e, force_idr, false, -1, ticket); }
+
+int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
 {
     Chan *c = &e->chan;
     int W = e->cfg.width, H = e->cfg.height, ds = (int)(e->seq % (NvU32)e->cfg.depth);
     RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
     if (enc_inflight(e) >= e->cfg.depth) return -1;
-    bool idr = force_idr || e->forceIdr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period);
+    const bool b = isB && e->cfg.codec == ENC_H264 && e->cfg.bframes > 0 && e->nRefs >= 2;
+    bool idr = !b && (force_idr || e->forceIdr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period));
     e->forceIdr = false;
-    if (idr) { e->frame_num = 0; e->sinceIdr = 0; e->nRefs = 0; }
-    int slot = e->nextSlot;                                   // where this picture's reconstruction goes
+    if (idr) { e->frame_num = 0; e->sinceIdr = 0; e->nRefs = 0; if (disp >= 0) e->idrDisp = disp; }
+    int slot = b ? e->bSlot : e->nextSlot;                    // where this picture's reconstruction goes
     int nRefs = idr ? 0 : e->nRefs;
+    // POC: from the display index (enc_submit_ex), else from the count since the IDR (one picture after the other)
+    const unsigned poc = disp >= 0 ? 2u * (unsigned)(disp - e->idrDisp) : 2u * e->sinceIdr;
+    // B: list 0 = the anchors before it (slotOf[1..]), list 1 = the newest anchor (slotOf[0], after it in display order)
+    const int nL0 = b ? nRefs - 1 : nRefs;
+    const int *L0 = b ? e->slotOf + 1 : e->slotOf;
 
     // ---- picture setup ----
     memset(setup->cpu, 0, SETUP_SIZE);
@@ -573,14 +584,17 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     H264Params hp = hdr_params(e);
     ps->sps_data.profile_idc = (unsigned)hp.profile_idc; ps->sps_data.level_idc = (unsigned)hp.level_idc; ps->sps_data.chroma_format_idc = e->cfg.chroma444 ? 3 : 1;
     ps->sps_data.lossless_qpprime_flag = e->cfg.lossless;
-    ps->sps_data.pic_order_cnt_type = 2; ps->sps_data.log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4;
+    ps->sps_data.pic_order_cnt_type = (unsigned)hp.poc_type; ps->sps_data.log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4;
+    ps->sps_data.log2_max_pic_order_cnt_lsb_minus4 = (unsigned)hp.log2_max_poc_lsb_minus4;
     ps->sps_data.frame_mbs_only = 1;
     ps->pps_data.num_ref_idx_l0_active_minus1 = (unsigned)(e->cfg.num_refs - 1);
     ps->pps_data.deblocking_filter_control_present_flag = 1;
     // High / CABAC as nullmoth's libnvenc_h264 sets them (profile_idc, entropy and 8x8 transform flags; T7.02)
     ps->pps_data.entropy_coding_mode_flag = e->cfg.cabac; ps->pps_data.transform_8x8_mode_flag = e->cfg.h264_profile == 100 || e->cfg.chroma444;
     nvenc_h264_rc_s *r = &ps->rate_control;
-    r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
+    // QP[] = P, B, I; B pictures (not references) 2 above P, as encoders usually do
+    const int qp_b = e->cfg.qp_p + 2 > 51 ? 51 : e->cfg.qp_p + 2;
+    r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)qp_b; r->QP[2] = (unsigned char)e->cfg.qp_i;
     for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 51; r->rhopbi[i] = 256; }
     r->framerate = e->cfg.fps; r->gop_length = 0xffffffffu;
     if (e->cfg.rc_mode) {   // field encodings as the reference client fills them (it runs const QP, though): T3.06
@@ -600,11 +614,21 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
 
     nvenc_h264_pic_control_s *pc = &ps->pic_control;
     memset(pc->l0, -2, sizeof pc->l0); memset(pc->l1, -2, sizeof pc->l1);   // -2 = unused, as the reference client
-    for (int i = 0; i < nRefs; i++) { pc->l0[i] = (char)(2 * e->slotOf[i]); pc->temp_dist_l0[i] = (char)(i + 1); }   // field-indexed DPB slots
-    pc->frame_num = (unsigned short)e->frame_num; pc->pic_order_cnt_lsb = (unsigned short)(2 * e->sinceIdr);
+    for (int i = 0; i < nL0; i++) {                            // field-indexed DPB slots; distances in frames
+        pc->l0[i] = (char)(2 * L0[i]); pc->temp_dist_l0[i] = (char)(((int)poc - (int)e->slotPoc[L0[i]]) / 2);
+    }
+    if (b) { pc->l1[0] = (char)(2 * e->slotOf[0]); pc->temp_dist_l1[0] = (char)(((int)poc - (int)e->slotPoc[e->slotOf[0]]) / 2); }
+    if (b && getenv("ENC_BL")) {   // experiment: list arrangements
+        const int v = atoi(getenv("ENC_BL"));
+        if (v == 1) { pc->l1[0] = (char)(2 * e->slotOf[1]); pc->l0[0] = (char)(2 * e->slotOf[0]); }                       // swapped
+        if (v == 2) { pc->temp_dist_l1[0] = (char)-pc->temp_dist_l1[0]; pc->temp_dist_l0[0] = (char)-pc->temp_dist_l0[0]; }  // signs
+        if (v == 3) { pc->diff_pic_order_cnt_zero[0] = 0xffffffffu; pc->diff_pic_order_cnt_zero[1] = 0xffffffffu; }
+        if (v == 4) { pc->l1[0] = (char)(2 * e->slotOf[0] + 1); }
+    }
+    pc->frame_num = (unsigned short)e->frame_num; pc->pic_order_cnt_lsb = (unsigned short)(poc & 0xff);
     pc->slice_control_offset = OFF_SLICE; pc->me_control_offset = OFF_ME; pc->md_control_offset = OFF_MD; pc->q_control_offset = OFF_Q;
     pc->hist_buf_size = (unsigned)e->hist.size; pc->bitstream_buf_size = (unsigned)bs->size;
-    pc->pic_type = idr ? 3 : 0; pc->ref_pic_flag = 1; pc->cabac_zero_word_enable = 1; pc->e4byteStartCode = 1;
+    pc->pic_type = idr ? 3 : b ? 1 : 0; pc->ref_pic_flag = !b; pc->cabac_zero_word_enable = 1; pc->e4byteStartCode = 1;
     pc->slice_mode = 0;   // 1 hangs the engine (T2.05e); one control with all MBs = one slice
 
     // slices: one slice control per slice, whole MB rows, under slice_mode 0 (slice_mode 1 hangs the engine: T2.05e, T3.09)
@@ -614,12 +638,35 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     nvenc_h264_slice_control_s *sc = (void *)((NvU8 *)setup->cpu + OFF_SLICE);
     for (int k = 0; k < nsl; k++) {
         int mb = ((k + 1) * e->hmb / nsl - k * e->hmb / nsl) * e->wmb;   // rows spread evenly
-        sc[k].num_mb = (unsigned)mb; sc[k].qp_avr = (unsigned)(idr ? e->cfg.qp_i : e->cfg.qp_p); sc[k].qp_slice_min = 0; sc[k].qp_slice_max = 51;
-        if (!idr) { sc[k].num_ref_idx_active_override_flag = 1; sc[k].num_ref_idx_l0_active_minus1 = (unsigned)(nRefs - 1); }
+        sc[k].num_mb = (unsigned)mb; sc[k].qp_avr = (unsigned)(idr ? e->cfg.qp_i : b ? qp_b : e->cfg.qp_p); sc[k].qp_slice_min = 0; sc[k].qp_slice_max = 51;
+        if (!idr) { sc[k].num_ref_idx_active_override_flag = 1; sc[k].num_ref_idx_l0_active_minus1 = (unsigned)(nL0 - 1); sc[k].num_ref_idx_l1_active_minus1 = 0; }
     }
 
     setup_me((void *)((NvU8 *)setup->cpu + OFF_ME), !idr);
     setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr, e->cfg.h264_profile == 100 || e->cfg.chroma444);
+    if (b) {                                                  // B: list 1 and bi partitions, spatial direct with B skip
+        nvenc_h264_md_control_s *md = (void *)((NvU8 *)setup->cpu + OFF_MD);
+        md->l1_part_16x16_enable = 1; md->l1_part_16x8_enable = 1; md->l1_part_8x16_enable = 1; md->l1_part_8x8_enable = 1;
+        md->bi_part_16x16_enable = 1; md->bi_part_16x8_enable = 1; md->bi_part_8x16_enable = 1; md->bi_part_8x8_enable = 1;
+        md->bdirect_mode = 1; md->bskip_enable = 1; md->pskip_enable = 0;
+        md->bdirect_bias_multiplier = 2;
+        if (getenv("ENC_BCOLOC")) {   // experiment: co-located hints for the B picture's motion search
+            nvenc_h264_me_control_s *me = (void *)((NvU8 *)setup->cpu + OFF_ME);
+            const int v = atoi(getenv("ENC_BCOLOC"));
+            me->predsrc.coloc_enable = 1; me->predsrc.coloc_search = 1; me->predsrc.coloc_refine = (v & 1);
+            if (v & 2) { me->predsrc.const_mv_stamp_l1 = 2; me->predsrc.self_temporal_search = 0; }
+            if (v & 4) { me->fbm_op_winner_num_b_frame_l0 = 2; me->fbm_op_winner_num_b_frame_l1 = 2; }
+        }
+        if (getenv("ENC_BX")) {   // experiments: direct mode, multiplier, bias
+            int a = 0, m = 2, bb = 2; sscanf(getenv("ENC_BX"), "%d,%d,%d", &a, &m, &bb);
+            if (a) md->bdirect_mode = (unsigned)a; md->bdirect_bias_multiplier = (short)m; md->bias_bdir = (short)bb;
+            if (a == 7) { md->bi_part_16x16_enable = md->bi_part_16x8_enable = md->bi_part_8x16_enable = md->bi_part_8x8_enable = 0; md->bdirect_mode = 1; }
+            if (a == 8) { md->l1_part_16x16_enable = md->l1_part_16x8_enable = md->l1_part_8x16_enable = md->l1_part_8x8_enable = 0; md->bdirect_mode = 1; }
+            if (a == 6) { md->bi_part_16x8_enable = md->bi_part_8x16_enable = md->bi_part_8x8_enable = 0; md->l1_part_16x8_enable = md->l1_part_8x16_enable = md->l1_part_8x8_enable = 0; md->bdirect_mode = 1; }
+            if (a == 9) { md->l1_part_16x16_enable = md->l1_part_16x8_enable = md->l1_part_8x16_enable = md->l1_part_8x8_enable = 0;
+                          md->bi_part_16x16_enable = md->bi_part_16x8_enable = md->bi_part_8x16_enable = md->bi_part_8x8_enable = 0; md->bdirect_mode = 0; md->bskip_enable = 0; }
+        }
+    }
     }
 
     // ---- methods ----
@@ -638,7 +685,7 @@ methods:
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     struct { NvU32 m; NvU64 a; } bm[] = {
         { NVC9B7_SET_IN_DRV_PIC_SETUP, setup->gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
-        { hevc ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc ? recOut : e->coloc.gpu },   // HEVC: no colocated data
+        { hevc ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc ? recOut : b ? e->colocB.gpu : e->coloc.gpu },   // HEVC: no colocated data
         { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
         { NVC9B7_SET_OUT_ENC_STATUS, status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, bs->gpu },
         { NVC9B7_SET_IN_CUR_PIC, inVa }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, inVa + e->lumaSz },
@@ -672,12 +719,14 @@ execute:
         chan_mthd(c, 0, NVC56F_NON_STALL_INTERRUPT, 1, 0u);
     }
     memset(status->cpu, 0, av1 ? 0x880 : 256);
-    e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = av1 ? e->sinceIdr : 2 * e->sinceIdr;
+    e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = av1 ? e->sinceIdr : poc;
     e->pend[ds].t0 = now_ms(); e->pend[ds].slot = slot; e->pend[ds].nRefs = nRefs;
     for (int i = 0; i < nRefs; i++) e->pend[ds].refs[i] = e->slotOf[i];
     chan_submit(c);
     *ticket = payload;
 
+    if (b) return 0;                                          // B pictures are not references: DPB, frame_num and count unchanged
+    e->slotPoc[slot] = poc;
     // DPB (decided by submission order): this picture becomes the most recent reference; the oldest drops out past num_refs
     int keep = e->nRefs < e->cfg.num_refs ? e->nRefs : e->cfg.num_refs - 1;
     if (idr) keep = 0;
@@ -780,5 +829,12 @@ int enc_encode(Enc *e, bool force_idr, EncFrame *out)
 {
     NvU32 t;
     if (enc_submit(e, force_idr, &t)) { memset(out, 0, sizeof *out); return -1; }
+    return enc_wait(e, t, out);
+}
+
+int enc_encode_ex(Enc *e, bool force_idr, bool b, int disp, EncFrame *out)
+{
+    NvU32 t;
+    if (enc_submit_ex(e, force_idr, b, disp, &t)) { memset(out, 0, sizeof *out); return -1; }
     return enc_wait(e, t, out);
 }

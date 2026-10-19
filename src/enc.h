@@ -32,6 +32,8 @@ typedef struct {
     int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
     bool chroma444;                 // HEVC Main 4:4:4 / H.264 High 4:4:4 Predictive (enc_load_yuv444 / enc_load_nv24)
     bool lossless;                  // H.264 (High 4:4:4 Predictive, CAVLC) / HEVC: every macroblock / CU at QP 0, bypassed
+    int bframes;                    // H.264: B pictures between anchors announced (POC type 0, VUI reordering); the caller orders
+                                    // the pictures and marks the B ones (enc_submit_ex). num_refs must be >= 2
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;
@@ -66,6 +68,10 @@ typedef struct {
     int slotOf[ENC_MAX_REFS];       // DPB slots of the reference frames, most recent first
     int nRefs;                      // valid entries in slotOf
     int nextSlot;
+    int bSlot;                      // reconstruction slot for B pictures (non-reference)
+    unsigned slotPoc[ENC_MAX_REFS + 2];   // POC of the picture in each reconstruction slot
+    int idrDisp;                    // display index of the last IDR (enc_submit_ex)
+    RmMem colocB;                   // co-located data a B picture writes (the anchor's must survive for the next B)
     RmEvent ev;                     // NVENC non-stall event (ev.h == 0: none, spin)
     // AV1: default probability tables, the tables the engine wrote, entropy / filter line buffers, assembled temporal units
     RmMem av1ProbIn, av1ProbOut, av1ProbOut2, av1Line[6];
@@ -94,5 +100,10 @@ void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride);
 void enc_load_bgra(Enc *e, const uint8_t *bgra, size_t stride);
 int  enc_encode(Enc *e, bool force_idr, EncFrame *out);         // encode the loaded frame and wait; 0 = ok
 int  enc_submit(Enc *e, bool force_idr, NvU32 *ticket);         // start encoding the loaded frame; 0 = ok
+// B pictures (H.264): like enc_submit, with the picture's display index and whether it is a B picture. The caller
+// submits each anchor (I / P) before the B pictures that precede it in display order: list 0 of a B picture is the
+// anchors before it, list 1 the newest anchor. Display indices give the POCs (POC type 0, EncConfig.bframes > 0).
+int  enc_submit_ex(Enc *e, bool force_idr, bool b, int disp, NvU32 *ticket);
+int  enc_encode_ex(Enc *e, bool force_idr, bool b, int disp, EncFrame *out);
 int  enc_wait(Enc *e, NvU32 ticket, EncFrame *out);             // wait for a submitted frame (in submission order); 0 = ok
 static inline int enc_inflight(const Enc *e) { return (int)(e->seq - e->waited); }

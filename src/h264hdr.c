@@ -62,7 +62,7 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
         put(&b, 1, 1);                                 // motion_vectors_over_pic_boundaries
         ue(&b, 2); ue(&b, 1);                          // max_bytes_per_pic_denom, max_bits_per_mb_denom (defaults)
         ue(&b, 16); ue(&b, 16);                        // log2_max_mv_length_horizontal / vertical
-        ue(&b, 0);                                     // max_num_reorder_frames: output in decode order, at once
+        ue(&b, (unsigned)p->num_reorder);              // max_num_reorder_frames (0: output in decode order, at once)
         ue(&b, (unsigned)p->num_ref_frames);           // max_dec_frame_buffering
     }
     trailing(&b);
