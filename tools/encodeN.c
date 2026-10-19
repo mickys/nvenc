@@ -1,7 +1,7 @@
 // encodeN.c (milestone M3): encode N frames of moving synthetic NV12 content through src/enc.c (IDR + P, constant QP).
 //   ./encodeN [-v] [-hevc | -av1] W H N QP_I QP_P REFS out.h264|out.h265|out.ivf out.nv12   (AV1: QP = quantizer index 0..255)
 // Environment: IDR_PERIOD=<n> (an IDR every n frames), RC=<RCMODE> BITRATE=<bit/s> MAXRATE=<bit/s> VBV=<bits>,
-// SLICES=<n>, ENCN_STATIC=<n> (cycle through n fixed pictures).
+// SLICES=<n>, ENCN_STATIC=<n> (cycle through n fixed pictures), BITDEPTH=10 (HEVC / AV1: the 8-bit source widened).
 // Writes the Annex B stream (SPS + PPS once, then every picture; AV1: an IVF file) and all source frames for h264check.
 #include "enc.h"
 #include <math.h>
@@ -38,7 +38,7 @@ int main(int argc, char **argv)
                       .idr_period = getenv("IDR_PERIOD") ? atoi(getenv("IDR_PERIOD")) : 0, .verbose = verbose,
                       .rc_mode = getenv("RC") ? atoi(getenv("RC")) : 0, .bitrate = getenv("BITRATE") ? atoi(getenv("BITRATE")) : 0,
                       .max_bitrate = getenv("MAXRATE") ? atoi(getenv("MAXRATE")) : 0, .vbv_bits = getenv("VBV") ? atoi(getenv("VBV")) : 0,
-                      .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1 };
+                      .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1, .bit_depth = getenv("BITDEPTH") ? atoi(getenv("BITDEPTH")) : 8 };
     Enc e; if (enc_open(&e, &cfg)) return 1;
     FILE *fh = fopen(argv[ai + 6], "wb"), *fs = fopen(argv[ai + 7], "wb");
     uint8_t hdr[256]; fwrite(hdr, 1, enc_headers(&e, hdr), fh);

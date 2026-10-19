@@ -28,6 +28,7 @@ typedef struct {
     bool error_resilient;           // inter frames
     bool disable_cdf_update, disable_frame_end_update_cdf;
     int base_q_idx, dq_y_dc, dq_u_dc, dq_u_ac;
+    bool delta_q_present;           // block-level quantizer deltas (delta_q_res 0; no loop filter deltas)
     int lf_level[4], lf_sharpness;
     bool lf_delta_enabled;          // the reference / mode deltas (spec defaults, not updated)
     int cdef_damping;               // 3..6

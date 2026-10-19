@@ -420,14 +420,16 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
     memcpy(b + OFF_AV1_TILE, idr ? av1_tmpl_key_tile : av1_tmpl_p_tile, sizeof av1_tmpl_key_tile);
     // surface configs: reference, input, output, and the extra one (dims, pitch, plane offsets in units of 256: luma
     // "bottom" = half a plane, chroma after the luma plane, chroma "bottom" half a chroma plane on)
-    const NvU32 dims = (NvU32)(W - 1) | (NvU32)(H - 1) << 16, rp = (NvU32)e->rPitch * (NvU32)e->bps, ip = (NvU32)e->pitch * (NvU32)e->bps;
+    // pitches in samples, plane offsets in bytes (10-bit: 16-bit samples, offsets double; as HEVC Main 10)
+    const NvU32 dims = (NvU32)(W - 1) | (NvU32)(H - 1) << 16, rp = (NvU32)e->rPitch, ip = (NvU32)e->pitch, rpb = rp * (NvU32)e->bps;
     for (int k = 0; k < 4; k++) {
         const size_t o = 4 + 0x20 * (size_t)k; const bool in = k == 1;
         put32(b, o, dims); put32(b, o + 4, in ? ip | ip << 16 : rp | rp << 16);
         if (in) { put32(b, o + 0x14, (NvU32)(e->lumaSz >> 8)); continue; }
-        put32(b, o + 0x10, (NvU32)(rows / 2 * rp >> 8)); put32(b, o + 0x14, (NvU32)(e->rLuma >> 8));
-        put32(b, o + 0x18, (NvU32)((e->rLuma + rows / 4 * rp) >> 8));
+        put32(b, o + 0x10, (NvU32)(rows / 2 * rpb >> 8)); put32(b, o + 0x14, (NvU32)(e->rLuma >> 8));
+        put32(b, o + 0x18, (NvU32)((e->rLuma + rows / 4 * rpb) >> 8));
     }
+    if (e->cfg.bit_depth > 8) put32(b, 0x84, *(NvU32 *)(b + 0x84) | 2u << 7 | 2u << 11);   // seqhdr: bit depth, input bit depth - 8
     for (int i = 0; i < 4; i++) b[0x98 + i] = (NvU8)lf;            // frame header: loop filter levels
     b[0xc0] = (NvU8)q;                                              // frame header: base_q_idx
     b[0xc9] = (NvU8)e->cfg.qp_p; b[0xca] = (NvU8)e->cfg.qp_p; b[0xcb] = (NvU8)e->cfg.qp_i;   // RC: QP[P, B, I]
@@ -440,6 +442,25 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
     put16(t, 4, (NvU16)(e->av1SbCols - 1)); put16(t, 6, (NvU16)(e->av1SbRows - 1));
     put16(t, 0x14, (NvU16)(e->av1SbCols - 1)); put16(t, 0x16, (NvU16)(e->av1SbRows - 1));
     t[0xa] = (NvU8)q;                                               // qp_avr
+    if (e->cfg.rc_mode) {   // rate control as the driver sets it up (docs/traces/av1-linux cbr / vbr; M12, T12.03)
+        put32(b, 0x88, *(NvU32 *)(b + 0x88) | 0x2000);               // frame header: delta_q_present (block-level deltas)
+        nvenc_av1_rc_s r; memset(&r, 0, sizeof r);
+        const bool vbr = e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17;
+        const double pixels = (double)W * H, perFrame = (double)e->cfg.bitrate / e->cfg.fps;
+        r.hrd_type = 2;
+        r.QP[0] = (unsigned char)e->cfg.qp_p; r.QP[1] = (unsigned char)(e->cfg.qp_p + 16 > 255 ? 255 : e->cfg.qp_p + 16); r.QP[2] = (unsigned char)e->cfg.qp_i;
+        for (int i = 0; i < 3; i++) { r.minQP[i] = 0; r.maxQP[i] = 255; }
+        r.maxQPD = 32; r.baseQPD = 16; r.rhopbi[0] = vbr ? 316 : 294; r.rhopbi[1] = vbr ? 414 : 330; r.rhopbi[2] = 256;
+        r.framerate = (unsigned)e->cfg.fps << 8;
+        r.buffersize = r.nal_cpb_size = r.vcl_cpb_size = (unsigned)e->cfg.vbv_bits;
+        r.nal_bitrate = r.vcl_bitrate = (unsigned)(vbr ? e->cfg.max_bitrate : e->cfg.bitrate);
+        r.gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
+        r.Np = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period - 1 : 0;
+        r.Ravg = (unsigned)(perFrame / pixels * 256); r.R = (unsigned)((double)r.nal_bitrate / e->cfg.fps / pixels * 256);
+        r.Bmin = vbr ? 0 : r.buffersize / 81920;                     // the driver's CBR value (122 for a 10 Mbit buffer)
+        r.i_size_ratio_x = 1; r.i_size_ratio_y = 1;
+        memcpy(b + 0xc8, &r, sizeof r);
+    }
 }
 
 // AV1 picture setup and methods, in the driver's order (docs/traces/av1-linux): codec type 5 with force-output, tile
@@ -456,7 +477,9 @@ static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs)
     RmMem *probOut = e->av1OutIdx ? &e->av1ProbOut2 : &e->av1ProbOut, *probPrev = e->av1OutIdx ? &e->av1ProbOut : &e->av1ProbOut2;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
     chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_AV1);
-    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, 0x00041905u | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
+    // rate control: the driver uses the MB-row modes (17 VBR, 18 CBR)
+    const NvU32 rcm = e->cfg.rc_mode == 1 ? 17u : e->cfg.rc_mode == 2 ? 18u : (NvU32)e->cfg.rc_mode;
+    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, 0x00041905u | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, rcm));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     chan_mthd(c, 0, NVC9B7_SET_IN_DRV_PIC_SETUP, 1, (NvU32)(setup->gpu >> 8));
     chan_mthd(c, 0, NVC9B7_SET_IOHISTORY, 1, (NvU32)(e->hist.gpu >> 8));
@@ -642,7 +665,7 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
     Av1FrameParams fp = { .frame_type = key ? 0 : 1, .order_hint = (int)e->pend[ds].poc, .refresh_frame_flags = 1 << e->pend[ds].slot,
         .primary_ref_frame = key ? 7 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
         .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = 1, .cdef_y = { 0, 16 }, .cdef_uv = { 0, 0 },
-        .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4 };
+        .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4, .delta_q_present = e->cfg.rc_mode != 0 };
     for (int i = 0; i < 7; i++) { fp.ref_frame_idx[i] = e->pend[ds].nRefs ? e->pend[ds].refs[0] : 0; fp.ref_order_hint[i] = (int)e->pend[ds].poc - 1; }
     const uint8_t *tile = (const uint8_t *)e->bs[ds].cpu + ts[0]; size_t tsz = ts[1];
     if (getenv("ENC_AV1_LOG")) fprintf(stderr, "av1: frame %u %s: %u bits, q %u, lf %u (asked %d), cdef damping %u, %u tiles, tile 0 at %u size %u\n",

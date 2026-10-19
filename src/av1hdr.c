@@ -117,7 +117,10 @@ size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uin
     delta_q(&b, f->dq_y_dc); delta_q(&b, f->dq_u_dc); delta_q(&b, f->dq_u_ac);   // (separate_uv_delta_q 0)
     put(&b, 0, 1);                                             // using_qmatrix
     put(&b, 0, 1);                                             // segmentation_enabled
-    if (f->base_q_idx > 0) put(&b, 0, 1);                      // delta_q_present
+    if (f->base_q_idx > 0) {                                   // delta_q_params, delta_lf_params (5.9.17, 5.9.18)
+        put(&b, f->delta_q_present, 1);
+        if (f->delta_q_present) { put(&b, 0, 2); put(&b, 0, 1); }   // delta_q_res 0, delta_lf_present 0
+    }
     const bool lossless = f->base_q_idx == 0 && !f->dq_y_dc && !f->dq_u_dc && !f->dq_u_ac;
     if (!lossless) {                                           // loop_filter_params (5.9.11)
         put(&b, (unsigned)f->lf_level[0], 6); put(&b, (unsigned)f->lf_level[1], 6);
