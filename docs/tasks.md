@@ -99,3 +99,23 @@ first.
 | T7.02 | H.264 High profile, CABAC, 8x8 transform (observe nullmoth's libnvenc_h264) | ~10 % less bitrate at equal PSNR; decodes | done: 4K 32 -> 49 dB at 20 Mbit/s |
 | T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | open |
 | T7.04 | HEVC 4:4:4 (Range Extensions) | a 4:4:4 stream decodes | open |
+
+## M8: H.264 hardware decoder (2026-10-19)
+
+Why: nullmoth's driver registers its H.264 decoder (`libnvdec_h264_t2d` on cards before Blackwell) in every process that
+uses Metal, and it decodes correctly, but on an RTX 4090 a 4K H.264 stream decodes at **32 fps** (Apple's software
+decoder: 30 fps; their HEVC decoder: 175 fps at 4K). 4K60 H.264 playback is not possible, and command-line tools get no
+hardware decoder at all (same registration limit as the encoder). Measured with `tools/vtdecode` (x264/x265 test streams,
+hardware vs software output compared: bit-exact). Sources: NVIDIA's open-gpu-doc `classes/video/nvdec_drv.h`
+(`nvdec_h264_pic_s`, DPB entries, status) and `clc9b0.h` (Ada NVDEC methods), the H.264 standard. Same ground rules as the
+encoder (no disassembly or patching of closed binaries).
+
+| Task | What | Done when | Status |
+|---|---|---|---|
+| T8.00 | Measure the gap: hardware vs software H.264/HEVC decode, correctness and speed (`tools/vtdecode`) | numbers recorded | done: H.264 4K 32 fps (sw 30), 1080p 127 (sw 74); HEVC 4K 175 (sw 84); outputs bit-exact except one HEVC 1080p frame (44 dB) |
+| T8.01 | A channel on NVDEC with the NVC9B0 object; host + engine semaphores (`tools/dechello`) | both semaphores land | done: NVDEC0 (engine 0x13; RM exposes no other NVDEC on this RTX 4090), both semaphores in 0.011 ms |
+| T8.02 | H.264 bitstream reader: SPS, PPS (scaling lists, fall-back rules), slice header to dec_ref_pic_marking (`src/h264parse.c`), POC types 0-2 | parses x264 streams (High, CABAC, B-frames) and our encoder's | done (`tools/h264parsetest`): x264 default, Baseline (POC type 2), JVT scaling matrices, interlaced MBAFF, strict B-pyramid with 16 refs, 4 slices/picture: 0 parse errors, POC order = container timestamp order for every picture; MMCOs parsed (80 pictures). NVDEC parses slice data itself, so no reference-list construction is needed |
+| T8.03 | One IDR picture: picture setup from `nvdec_h264_pic_s`, bitstream buffer, output surface, EXECUTE, status | the decoded luma matches the software decoder (PSNR 99 = identical) | open |
+| T8.04 | P/B pictures: DPB management (sliding window, MMCO), colocated buffers, reference surfaces | a 300-frame x264 stream with B-frames decodes bit-exact | open |
+| T8.05 | Output: decoded surface to NV12 CVPixelBuffer. First try NVDEC's own display-surface DMA (`nvdec_display_param_s.enableTFOutput` + `TilingFormat`/`OutStride`, `SET_DISPLAY_BUF_LUMA/CHROMA_OFFSET`): if one tiling format is pitch-linear, no untiling pass at all; else copy engine block-linear -> pitch, or SIMD | 4K at ≥ 120 fps end to end | open |
+| T8.06 | `libnvdecvt`: VideoToolbox decoder plugin (interface worked out black-box like the encoder's), registered by `libnvencvt` / the plugin hook | AVFoundation playback and `vtdecode` use it; `nvenc-run ffmpeg -hwaccel videotoolbox` decodes in hardware | open |
