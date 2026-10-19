@@ -98,7 +98,7 @@ first.
 | T7.01 | Full-range input (420f/xf20) signalled in the VUI (H.264 and HEVC) | Parsec's 420f stream decodes to the same levels as the source | done (ffmpeg, OBS) |
 | T7.02 | H.264 High profile, CABAC, 8x8 transform (observe nullmoth's libnvenc_h264) | ~10 % less bitrate at equal PSNR; decodes | done: 4K 32 -> 49 dB at 20 Mbit/s |
 | T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | open |
-| T7.04 | HEVC 4:4:4 (Range Extensions) | a 4:4:4 stream decodes | open |
+| T7.04 | HEVC 4:4:4 (Range Extensions) | a 4:4:4 stream decodes | moved to M13 (T13.01) |
 
 ## M8: H.264 hardware decoder (2026-10-19)
 
@@ -119,3 +119,23 @@ encoder (no disassembly or patching of closed binaries).
 | T8.04 | P/B pictures: DPB management (sliding window, MMCO), colocated buffers, reference surfaces | a 300-frame x264 stream with B-frames decodes bit-exact | open |
 | T8.05 | Output: decoded surface to NV12 CVPixelBuffer. First try NVDEC's own display-surface DMA (`nvdec_display_param_s.enableTFOutput` + `TilingFormat`/`OutStride`, `SET_DISPLAY_BUF_LUMA/CHROMA_OFFSET`): if one tiling format is pitch-linear, no untiling pass at all; else copy engine block-linear -> pitch, or SIMD | 4K at ≥ 120 fps end to end | open |
 | T8.06 | `libnvdecvt`: VideoToolbox decoder plugin (interface worked out black-box like the encoder's), registered by `libnvencvt` / the plugin hook | AVFoundation playback and `vtdecode` use it; `nvenc-run ffmpeg -hwaccel videotoolbox` decodes in hardware | open |
+
+## M9-M14: every codec the hardware has (user, 2026-10-19: "we want to add ALL of them")
+
+RTX 4090 (Ada): two NVENC engines (0xc9b7), one NVDEC exposed by RM (0xc9b0), no NVJPG. Picture setups for every codec are
+public: `nvdec_drv.h` (H.264, HEVC, VP9, AV1, VP8, MPEG-2, MPEG-4, VC-1) and `nvenc_drv.h` (H.264, HEVC, AV1). The
+decoders share M8's pieces: the NVDEC channel and buffers, the output path to CVPixelBuffer (T8.05) and the VideoToolbox
+decoder plugin `libnvdecvt` (T8.06), which gains one factory per codec. Order by value: what Macs with NVIDIA cards
+lack most first. Each decoder is checked against a software decoder (ffmpeg: libdav1d, libvpx, its own H.264/HEVC/MPEG
+decoders) frame by frame, with streams from more than one encoder.
+
+| Milestone | Codec | Tasks (each: done when it decodes/encodes bit-exact or ≥ the stated quality) | Status |
+|---|---|---|---|
+| M9 | **AV1 decode** (8/10-bit, `av01`) | T9.01 OBU parser (sequence header, frame header, tile info, reference frame state) · T9.02 one key frame through `nvdec_av1_pic_s` · T9.03 inter frames (reference slots, segmentation, loop filter, CDEF, loop restoration, film grain parameters) · T9.04 VideoToolbox `av01` decoder (av1C) + ffmpeg `-hwaccel videotoolbox` · streams from libaom, SVT-AV1, rav1e | planned |
+| M10 | **VP9 decode** (8/10/12-bit, `vp09`) | T10.01 uncompressed + compressed header parser · T10.02 key frame through `nvdec_vp9_pic_s` · T10.03 inter frames, probability contexts (forward updates, backward adaptation counts), reference refresh, scaled references · T10.04 VideoToolbox `vp09` decoder · streams from libvpx | planned |
+| M11 | **HEVC decode, ours** (Main, Main 10, Main 12, 4:4:4, `hvc1`) | T11.01 VPS/SPS/PPS/slice header reader (beside `hevchdr.c`) · T11.02 IDR · T11.03 P/B with RPS · T11.04 10/12-bit and 4:4:4 · T11.05 VideoToolbox `hvc1` decoder rated above nullmoth's (theirs: one mismatched frame in the x265 1080p test) | planned |
+| M12 | **AV1 encode** (8/10-bit) | T12.01 OBU writer (sequence and frame headers) · T12.02 one key frame through `nvenc_av1_drv_pic_setup_s` · T12.03 inter frames, references, rate control (CBR/VBR/low latency) · T12.04 10-bit · T12.05 VideoToolbox `av01` encoder | planned |
+| M13 | **4:4:4 encode** + encoder probe | T13.01 HEVC Range Extensions 4:4:4 (was T7.04) · T13.02 H.264 High 4:4:4 Predictive · T13.03 probe whether Ada NVENC accepts the VP8 / VP9 application IDs (not in NVIDIA's Ada support matrix; drop if refused) | planned |
+| M14 | **legacy decode** | T14.01 MPEG-2 (`mp2v`) and MPEG-1 · T14.02 MPEG-4 Part 2 (`mp4v`) · T14.03 VC-1 / WMV3 · T14.04 VP8 (`vp08`); VideoToolbox registration only where AVFoundation or ffmpeg can feed the codec | planned |
+
+Not codecs, out of scope: the optical flow accelerator (OFA, 0xc9fa). No JPEG engine on this card.
