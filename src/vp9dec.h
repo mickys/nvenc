@@ -30,6 +30,7 @@ typedef struct {
     // the frame just decoded
     Vp9Frame f;
     int cur_surf, cur_w, cur_h;     // the picture to show (valid when vp9dec_frame returned 1)
+    int dec_surf;                   // the surface the last coded frame went to (also hidden ones; -1 for show_existing_frame)
     unsigned err_status, ok_blocks;
     double engine_ms;
 } Vp9Dec;
@@ -40,6 +41,10 @@ void vp9dec_close(Vp9Dec *d);
 // held until vp9dec_release), 0 for a hidden frame, -1 on error.
 int  vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n);
 void vp9dec_release(Vp9Dec *d, int surf);
+// Take over another session's stream state (probability contexts, reference slots and their pictures, the previous
+// frame's size) into a freshly opened, at least as large session `to` (same Rm, same bit depth): for a stream that grows
+// past the session it started in. `from` can be closed afterwards.
+int  vp9dec_migrate(Vp9Dec *to, const Vp9Dec *from);
 void vp9dec_read_nv12(Vp9Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h);
 // I420 (8-bit) or yuv420p10le / 12le (16-bit little-endian samples, value in the low bits) for 10/12-bit sessions
 void vp9dec_read_i420(Vp9Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h);

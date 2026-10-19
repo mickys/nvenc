@@ -62,6 +62,32 @@ void vp9dec_close(Vp9Dec *d)
 
 void vp9dec_release(Vp9Dec *d, int surf) { if (surf >= 0 && surf < VP9_SURFACES) d->busy[surf] = false; }
 
+static void copy_plane(uint8_t *dst, size_t dpitch, const uint8_t *src, size_t spitch, size_t bytes, size_t rows)
+{
+    for (size_t y = 0; y < rows; y++) for (size_t x = 0; x < bytes; x += 16) memcpy(dst + nvenc_in_offset(x, y, dpitch), src + nvenc_in_offset(x, y, spitch), 16);
+}
+
+int vp9dec_migrate(Vp9Dec *to, const Vp9Dec *from)
+{
+    if (to->bit_depth != from->bit_depth || to->maxW < from->maxW || to->maxH < from->maxH) return -1;
+    to->st = from->st;
+    to->have_last = from->have_last; to->last_w = from->last_w; to->last_h = from->last_h; to->last_show = from->last_show;
+    // every surface a slot refers to, with its padding (the decoded size rounded up to superblocks)
+    for (int i = 0; i < 8; i++) to->ref[i] = from->ref[i];
+    for (int sfc = 0; sfc < VP9_SURFACES; sfc++) {
+        bool used = false;
+        for (int k = 0; k < 8; k++) used |= from->ref[k] == sfc;
+        if (!used) continue;
+        const size_t bytes = (size_t)((from->w[sfc] + 63) & ~63u) * (size_t)from->bps, rows = (from->h[sfc] + 63) & ~63u;
+        copy_plane(to->luma[sfc].cpu, to->pitch, from->luma[sfc].cpu, from->pitch, bytes, rows);
+        copy_plane(to->chroma[sfc].cpu, to->pitch, from->chroma[sfc].cpu, from->pitch, bytes, rows / 2);
+        to->w[sfc] = from->w[sfc]; to->h[sfc] = from->h[sfc];
+    }
+    // the segmentation map and column MVs only matter for a frame of the same size, which this one will not be
+    // (UsePrevFrameMvs is off and the map is cleared on a size change, 7.2.6)
+    return 0;
+}
+
 void vp9dec_read_nv12(Vp9Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
 {
     const size_t b = (size_t)d->bps;
@@ -162,7 +188,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     if (f->show_existing_frame) {
         const int s = d->ref[f->frame_to_show_map_idx];
         if (s < 0) { fprintf(stderr, "vp9dec: show_existing_frame of an empty slot\n"); return -1; }
-        d->busy[s] = true; d->cur_surf = s; d->cur_w = (int)d->w[s]; d->cur_h = (int)d->h[s];
+        d->busy[s] = true; d->cur_surf = s; d->cur_w = (int)d->w[s]; d->cur_h = (int)d->h[s]; d->dec_surf = -1;
         return 1;
     }
     if (f->width > 8192 || f->height > 8192) { fprintf(stderr, "vp9dec: %dx%d is beyond NVDEC's VP9 limit (8192)\n", f->width, f->height); return -1; }
@@ -287,7 +313,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     d->w[surf] = (unsigned)f->width; d->h[surf] = (unsigned)f->height;
     if (f->seg_enabled && f->seg_update_map) d->seg_prev ^= 1;
     d->mv_prev ^= 1;
-    d->have_last = true; d->last_w = f->width; d->last_h = f->height; d->last_show = f->show_frame;
+    d->have_last = true; d->last_w = f->width; d->last_h = f->height; d->last_show = f->show_frame; d->dec_surf = surf;
     if (!f->show_frame) return 0;
     d->busy[surf] = true; d->cur_surf = surf; d->cur_w = f->width; d->cur_h = f->height;
     return 1;

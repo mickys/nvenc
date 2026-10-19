@@ -3,6 +3,10 @@
 // twice through VTDecompressionSession: once with a hardware decoder required, once with the software decoder, and
 // compares the luma (PSNR). Prints which decoder ran and how fast.
 //   ./vtdecode in.mp4 [frames]
+//   VTDECODE_REF=ref.yuv: compare the hardware decoder with a reference decode instead (ffmpeg, I420 / yuv420p10le)
+//   VTDECODE_AVREAD=1: decode through AVAssetReader (alwaysCopiesSampleData NO) instead, compared with VTDECODE_REF
+//   VTDECODE_PF=x420: ask for that output format (default 420v)
+//   VTDECODE_SUPP=1: opt in to VP9 first (VTRegisterSupplementalVideoDecoderIfAvailable), as WebKit and ffmpeg do
 // Build: clang -fobjc-arc -O2 vtdecode.m -o vtdecode -framework Foundation -framework AVFoundation -framework CoreMedia
 //        -framework CoreVideo -framework VideoToolbox -framework Metal
 #import <Foundation/Foundation.h>
@@ -24,7 +28,9 @@ static int decode(NSArray *samples, CMFormatDescriptionRef fd, bool hw, Out *o, 
 {
     NSDictionary *spec = hw ? @{ (id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES }
                             : @{ (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO };
-    NSDictionary *attrs = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) };
+    const char *pfs = getenv("VTDECODE_PF");   // the output format to ask for (four characters, e.g. x420); default NV12 420v
+    const OSType pf = pfs && strlen(pfs) == 4 ? (OSType)pfs[0] << 24 | (OSType)pfs[1] << 16 | (OSType)pfs[2] << 8 | (OSType)pfs[3] : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    NSDictionary *attrs = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(pf) };
     VTDecompressionOutputCallbackRecord rec = { cb, o };
     VTDecompressionSessionRef s = NULL;
     OSStatus st = VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attrs, &rec, &s);
@@ -63,6 +69,10 @@ int main(int argc, char **argv)
     @autoreleasepool {
         if (argc < 2) { printf("usage: vtdecode in.mp4 [frames]\n"); return 2; }
         int maxf = argc > 2 ? atoi(argv[2]) : 600;
+        if (getenv("VTDECODE_SUPP")) {   // VP9 / AV1: VideoToolbox offers these only after the process opts in (as WebKit and ffmpeg do)
+            extern void VTRegisterSupplementalVideoDecoderIfAvailable(CMVideoCodecType) __attribute__((weak_import));
+            if (VTRegisterSupplementalVideoDecoderIfAvailable) { VTRegisterSupplementalVideoDecoderIfAvailable('vp09'); printf("supplemental VP9 decoder requested\n"); }
+        }
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         printf("Metal device: %s\n", dev ? dev.name.UTF8String : "none");
         AVAsset *as = [AVAsset assetWithURL:[NSURL fileURLWithPath:@(argv[1])]];
@@ -81,6 +91,74 @@ int main(int argc, char **argv)
         FourCharCode c = CMFormatDescriptionGetMediaSubType(fd); CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fd);
         printf("stream: %c%c%c%c %dx%d, %lu frames; VTIsHardwareDecodeSupported: %d\n", c >> 24, (c >> 16) & 255, (c >> 8) & 255, c & 255,
                d.width, d.height, (unsigned long)samples.count, VTIsHardwareDecodeSupported(c));
+        if (getenv("VTDECODE_AVREAD")) {   // decode through AVAssetReader instead (what AVFoundation apps get), compare with VTDECODE_REF
+            const char *pfs = getenv("VTDECODE_PF");
+            const OSType pf = pfs && strlen(pfs) == 4 ? (OSType)pfs[0] << 24 | (OSType)pfs[1] << 16 | (OSType)pfs[2] << 8 | (OSType)pfs[3] : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+            AVAssetReader *r2 = [AVAssetReader assetReaderWithAsset:as error:&e];
+            AVAssetReaderTrackOutput *o2 = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:tr outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(pf) }];
+            o2.alwaysCopiesSampleData = NO;
+            [r2 addOutput:o2];
+            if (![r2 startReading]) { printf("RESULT avread failed to start: %s\n", r2.error.description.UTF8String); return 1; }
+            FILE *rf = getenv("VTDECODE_REF") ? fopen(getenv("VTDECODE_REF"), "rb") : NULL;
+            int n = 0, exact = 0; CMSampleBufferRef s2; const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            while ((s2 = [o2 copyNextSampleBuffer])) {
+                CVPixelBufferRef a = CMSampleBufferGetImageBuffer(s2);
+                if (a && rf) {
+                    CVPixelBufferLockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+                    const size_t w = CVPixelBufferGetWidth(a), hh = CVPixelBufferGetHeight(a), cw = (w + 1) / 2, ch = (hh + 1) / 2;
+                    const int b = pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ? 2 : 1;
+                    const size_t ns = w * hh + 2 * cw * ch; uint8_t *ref = malloc(ns * b); bool same = fread(ref, b, ns, rf) == ns;
+                    const uint8_t *Y = CVPixelBufferGetBaseAddressOfPlane(a, 0), *C = CVPixelBufferGetBaseAddressOfPlane(a, 1);
+                    const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(a, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(a, 1);
+                    #define RV(k) (b == 1 ? ref[k] : (ref[2 * (k)] | ref[2 * (k) + 1] << 8))
+                    for (size_t y = 0; y < hh && same; y++) for (size_t x = 0; x < w && same; x++)
+                        same = (b == 1 ? Y[y * ys + x] : ((const uint16_t *)(Y + y * ys))[x] >> 6) == RV(y * w + x);
+                    for (size_t y = 0; y < ch && same; y++) for (size_t x = 0; x < cw && same; x++) for (int k = 0; k < 2 && same; k++)
+                        same = (b == 1 ? C[y * cs + 2 * x + k] : ((const uint16_t *)(C + y * cs))[2 * x + k] >> 6) == RV(w * hh + k * cw * ch + y * cw + x);
+                    #undef RV
+                    exact += same; free(ref);
+                    CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+                }
+                n += a != NULL; CFRelease(s2);
+            }
+            const double ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6;
+            printf("RESULT avread frames=%d/%lu in %.1f ms (%.0f fps), %d bit-exact vs reference, reader status %ld %s\n", n, (unsigned long)samples.count, ms,
+                   n * 1000.0 / ms, exact, (long)r2.status, r2.error ? r2.error.localizedDescription.UTF8String : "");
+            return 0;
+        }
+        const char *refPath = getenv("VTDECODE_REF");
+        if (refPath) {   // compare the hardware decoder's frames with a reference decode (I420, or 16-bit LE for 10-bit: ffmpeg's yuv420p10le)
+            Out h = {0}; bool hwH = false;
+            if (decode(samples, fd, true, &h, &hwH)) return 1;
+            printf("  hardware decoder: %d frames in %.1f ms (%.0f fps), using hardware %d, error %d\n", h.n, h.ms, h.n * 1000.0 / h.ms, hwH, (int)h.err);
+            FILE *rf = fopen(refPath, "rb"); if (!rf) { perror(refPath); return 1; }
+            int exact = 0, first = -1; double worst = 99;
+            for (int i = 0; i < h.n; i++) {
+                CVPixelBufferRef a = (__bridge CVPixelBufferRef)h.frames[i];
+                CVPixelBufferLockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+                const size_t w = CVPixelBufferGetWidth(a), hh = CVPixelBufferGetHeight(a), cw = (w + 1) / 2, ch = (hh + 1) / 2;
+                const OSType pf = CVPixelBufferGetPixelFormatType(a);
+                const int b = (pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) ? 2 : 1;
+                const size_t n = w * hh + 2 * cw * ch; uint8_t *ref = malloc(n * b);
+                if (fread(ref, b, n, rf) != n) { printf("  reference ends at frame %d\n", i); free(ref); CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly); break; }
+                #define REF(k) (b == 1 ? ref[k] : (ref[2 * (k)] | ref[2 * (k) + 1] << 8))
+                const uint8_t *Y = CVPixelBufferGetBaseAddressOfPlane(a, 0), *C = CVPixelBufferGetBaseAddressOfPlane(a, 1);
+                const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(a, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(a, 1);
+                double se = 0;
+                for (size_t y = 0; y < hh; y++) for (size_t x = 0; x < w; x++) {
+                    int v = b == 1 ? Y[y * ys + x] : ((const uint16_t *)(Y + y * ys))[x] >> 6; int d = v - (int)REF(y * w + x); se += d * d; }
+                for (size_t y = 0; y < ch; y++) for (size_t x = 0; x < cw; x++) for (int k = 0; k < 2; k++) {
+                    int v = b == 1 ? C[y * cs + 2 * x + k] : ((const uint16_t *)(C + y * cs))[2 * x + k] >> 6;
+                    int d = v - (int)REF(w * hh + k * cw * ch + y * cw + x); se += d * d; }
+                #undef REF
+                const double mx = b == 1 ? 255.0 : 1023.0, p = se == 0 ? 99.0 : 10 * log10(mx * mx / (se / n));
+                if (p >= 99) exact++; else if (first < 0) first = i;
+                if (p < worst) worst = p;
+                CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly); free(ref);
+            }
+            printf("RESULT hw=%d frames=%d/%lu vs reference: %d bit-exact, first difference %d, worst %.2f dB\n", hwH, h.n, (unsigned long)samples.count, exact, first, worst);
+            return 0;
+        }
         Out h = {0}, s = {0}; bool hwH = false, hwS = false;
         int rh = decode(samples, fd, true, &h, &hwH), rs = decode(samples, fd, false, &s, &hwS);
         if (!rh) printf("  hardware decoder: %d frames in %.1f ms (%.0f fps), using hardware %d, error %d\n", h.n, h.ms, h.n * 1000.0 / h.ms, hwH, (int)h.err);
