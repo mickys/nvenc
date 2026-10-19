@@ -136,7 +136,7 @@ decoders) frame by frame, with streams from more than one encoder.
 |---|---|---|---|
 | M9 | **AV1 decode** (8/10-bit, `av01`) | T9.01 OBU parser (sequence header, frame header, tile info, reference frame state) · T9.02 one key frame through `nvdec_av1_pic_s` · T9.03 inter frames (reference slots, segmentation, loop filter, CDEF, loop restoration, film grain parameters) · T9.04 VideoToolbox `av01` decoder (av1C) + ffmpeg `-hwaccel videotoolbox` · streams from libaom, SVT-AV1, rav1e | done 2026-10-19 (mesa-nova as reference, see below) |
 | M10 | **VP9 decode** (8/10/12-bit, `vp09`) | T10.01 uncompressed + compressed header parser · T10.02 key frame through `nvdec_vp9_pic_s` · T10.03 inter frames, probability contexts (forward updates, backward adaptation counts), reference refresh, scaled references · T10.04 VideoToolbox `vp09` decoder · streams from libvpx | done 2026-10-19 (before M9; see below) |
-| M11 | **HEVC decode, ours** (Main, Main 10, Main 12, 4:4:4, `hvc1`) | T11.01 VPS/SPS/PPS/slice header reader (beside `hevchdr.c`) · T11.02 IDR · T11.03 P/B with RPS · T11.04 10/12-bit and 4:4:4 · T11.05 VideoToolbox `hvc1` decoder rated above nullmoth's (theirs: one mismatched frame in the x265 1080p test) | planned |
+| M11 | **HEVC decode, ours** (Main, Main 10, Main 12, 4:4:4, `hvc1`) | T11.01 VPS/SPS/PPS/slice header reader (beside `hevchdr.c`) · T11.02 IDR · T11.03 P/B with RPS · T11.04 10/12-bit and 4:4:4 · T11.05 VideoToolbox `hvc1` decoder rated above nullmoth's (theirs: one mismatched frame in the x265 1080p test) | in progress (T11.01 done) |
 | M12 | **AV1 encode** (8/10-bit) | T12.01 OBU writer (sequence and frame headers) · T12.02 one key frame through `nvenc_av1_drv_pic_setup_s` · T12.03 inter frames, references, rate control (CBR/VBR/low latency) · T12.04 10-bit · T12.05 VideoToolbox `av01` encoder | planned |
 | M13 | **4:4:4 encode** + encoder probe | T13.01 HEVC Range Extensions 4:4:4 (was T7.04) · T13.02 H.264 High 4:4:4 Predictive · T13.03 probe whether Ada NVENC accepts the VP8 / VP9 application IDs (not in NVIDIA's Ada support matrix; drop if refused) | planned |
 | M14 | **legacy decode** | T14.01 MPEG-2 (`mp2v`) and MPEG-1 · T14.02 MPEG-4 Part 2 (`mp4v`) · T14.03 VC-1 / WMV3 · T14.04 VP8 (`vp08`); VideoToolbox registration only where AVFoundation or ffmpeg can feed the codec | planned |
@@ -148,6 +148,19 @@ symbol probabilities (CDFs) from a buffer whose layout no public header gives (`
 but no CDF table structure), and NVDEC does not initialise or adapt them itself. VP9's probability tables and counters
 are public (`nvdec_vp9EntropyProbs_t`, `nvdec_vp9EntropyCounts_t`), so VP9 goes first; AV1 waits for a layout hypothesis
 to test (spec order, padded like VP9's tables).
+
+## M11: HEVC decode
+
+Unlike VP9 and AV1, NVDEC parses HEVC slice data and slice headers itself (`nvdec_hevc_pic_s` is DXVA-like): the driver
+gives the SPS / PPS fields, scaling lists, tile sizes, the reference picture set (which DPB entries are references, their
+POC distances, long-term flags) and the bit counts of the slice header parts it has parsed already
+(`sw_hdr_skip_length`, `num_bits_short_term_ref_pics_in_slice`). Sources: ITU-T H.265, `nvdec_drv.h`, `clc9b0.h`.
+Streams: `scripts/make-hevc-streams.sh OUTDIR` (libx265 through ffmpeg) and `scripts/fetch-hevc-vectors.sh OUTDIR` (the
+JCT-VC conformance bitstreams from FFmpeg's FATE suite); references from ffmpeg's HEVC decoder.
+
+| Task | What | Done when | Status |
+|---|---|---|---|
+| T11.01 | Parser: NAL units (Annex B, length-prefixed), SPS (profile_tier_level, sub-layer ordering, scaling lists incl. prediction and defaults, short-term RPS incl. inter-RPS prediction (7.4.8), long-term pictures, VUI / HRD, range extension), PPS (tiles, deblocking, scaling lists, range extension), slice segment header (with the bit position and length of the RPS part and of the whole header), POC (8.3.1) | the fields match ffmpeg's `trace_headers` on every test stream, including bit positions | done (`src/hevcparse.c`, `tools/hevcparsetest`, `scripts/hevc-trace-compare.py`, which also compares where the SPS / PPS end, where the RPS starts and ends and where the slice header ends): 26 x265 streams (B-pyramids, open / closed GOP, P only, 8 references, slices, WPP, scaling lists, weighted prediction, lossless, transform skip + AMP, temporal layers, CTB 16 / 32, HRD, RPS in the SPS, 10 / 12-bit, 4:2:2 / 4:4:4, 350x286, 4K) and all 188 conformance bitstreams (base layer of MV-HEVC), 0 differences. Found: a Main-profile PPS may carry garbage in its extension flags (conformance `PS_A`), so the range extension is read for RExt profiles only (as ffmpeg does); `EXT_A_ericsson_3` is unreadable for ffmpeg too (`_4` is fine) |
 
 ## M9: AV1 decode
 
