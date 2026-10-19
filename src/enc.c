@@ -627,7 +627,9 @@ methods:
     NvU64 inVa = e->extInput ? e->extInput : in->gpu;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
     // HEVC: application ID 3 and codec type 4 (not in clc9b7.h; seen in nullmoth's library, T6.03)
-    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, hevc ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H265 : (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
+    NvU32 appId = hevc ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H265 : (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264;
+    if (getenv("ENC_PROBE_APPID")) appId = (NvU32)atoi(getenv("ENC_PROBE_APPID"));   // T13.03 probe: documented IDs only (2 VP8, 4 VP9)
+    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, appId);
     chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, hevc ? 4u : NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
               DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
