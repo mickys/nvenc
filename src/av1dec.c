@@ -263,6 +263,13 @@ static int decode_frame(Av1Dec *d)
 {
     Av1Frame *f = &d->f; const Av1Seq *s = &d->st.seq;
     if ((unsigned)f->upscaled_width > d->maxW || (unsigned)f->frame_height > d->maxH) { fprintf(stderr, "av1dec: frame larger than the session\n"); return -1; }
+    // what the engine decodes (T9.03): 4:2:0 or monochrome (written as 4:2:0 with neutral chroma), 8/10-bit, 128x128 up
+    // (NVIDIA's minimum; smaller frames came out grey with status 0xb), 256 tiles
+    if (!s->subsampling_x || !s->subsampling_y || s->bit_depth > 10 || f->upscaled_width < 128 || f->frame_height < 128 || f->tile_cols * f->tile_rows > 256) {
+        fprintf(stderr, "av1dec: %dx%d %s%d-bit is beyond what NVDEC decodes here\n", f->upscaled_width, f->frame_height,
+                !s->subsampling_y ? "4:2:2/4:4:4 " : "", s->bit_depth);
+        return -1;
+    }
     int surf = -1;
     for (int i = 0; i < AV1_SURFACES && surf < 0; i++) {
         bool used = d->busy[i];
@@ -292,7 +299,8 @@ static int decode_frame(Av1Dec *d)
 
     nvdec_av1_pic_s *ps = d->setup.cpu; memset(ps, 0, sizeof *ps);
     ps->stream_len = (unsigned)d->bsN;
-    ps->use_128x128_superblock = (unsigned)s->use_128x128_superblock; ps->chroma_format = 1; ps->bit_depth = (unsigned)s->bit_depth;
+    ps->use_128x128_superblock = (unsigned)s->use_128x128_superblock; ps->bit_depth = (unsigned)s->bit_depth;
+    ps->chroma_format = s->mono_chrome ? 0 : s->subsampling_x && s->subsampling_y ? 1 : s->subsampling_x ? 2 : 3;   // 0 = monochrome (mesa-nova)
     ps->enable_filter_intra = (unsigned)s->enable_filter_intra; ps->enable_intra_edge_filter = (unsigned)s->enable_intra_edge_filter;
     ps->enable_interintra_compound = (unsigned)s->enable_interintra_compound; ps->enable_masked_compound = (unsigned)s->enable_masked_compound;
     ps->enable_dual_filter = (unsigned)s->enable_dual_filter; ps->reserved10 = (unsigned)s->enable_order_hint;   // "0 - disable order hint"
@@ -305,7 +313,8 @@ static int decode_frame(Av1Dec *d)
     int disp = -1;
     // (also for a hidden frame that can be shown later: its show_existing_frame outputs this twin, 7.21 loads the same
     // grain parameters)
-    if (s->film_grain_params_present && f->fg.apply_grain && (f->show_frame || f->showable_frame)) {
+    const bool grain = s->film_grain_params_present && f->fg.apply_grain;
+    if (grain && (f->show_frame || f->showable_frame)) {
         for (int i = 0; i < AV1_SURFACES && disp < 0; i++) {
             bool used = d->busy[i] || i == surf;
             for (int k = 0; k < AV1_SURFACES; k++) if (d->twin[k] == i) used = true;
@@ -313,10 +322,10 @@ static int decode_frame(Av1Dec *d)
             if (!used) disp = i;
         }
         if (disp < 0) { fprintf(stderr, "av1dec: no free surface for the film grain output\n"); return -1; }
-        film_grain_setup(&f->fg, s->bit_depth, &ps->fgs_cfg, d->fg.cpu);
-        ps->enable_fgs = 1;
+        film_grain_setup(&f->fg, s->bit_depth, &ps->fgs_cfg, d->fg.cpu); ps->enable_fgs = 1;
     }
-    ps->frame_type = (unsigned)f->frame_type; ps->show_frame = 1;   // always 1 (mesa-nova) ps->disable_cdf_update = (unsigned)f->disable_cdf_update;
+    ps->frame_type = (unsigned)f->frame_type; ps->disable_cdf_update = (unsigned)f->disable_cdf_update;
+    ps->show_frame = 1;   // always 1 (mesa-nova)
     ps->allow_screen_content_tools = (unsigned)f->allow_screen_content_tools; ps->cur_frame_force_integer_mv = (unsigned)f->force_integer_mv;
     ps->scale_denom_minus9 = f->use_superres ? (unsigned)(f->superres_denom - 9) : 0;
     ps->allow_intrabc = (unsigned)f->allow_intrabc; ps->allow_high_precision_mv = (unsigned)f->allow_high_precision_mv;

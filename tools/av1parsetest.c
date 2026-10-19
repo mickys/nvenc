@@ -47,7 +47,6 @@ static void trace(const Av1State *st, const Av1Frame *h)
     P("skip_mode_present", h->skip_mode_present); P("allow_warped_motion", h->allow_warped_motion); P("reduced_tx_set", h->reduced_tx_set);
     if (!h->frame_is_intra) for (int rf = 1; rf <= 7; rf++) {
         printf("is_global[%d] = %d\n", rf, h->gm_type[rf] != AV1_IDENTITY);
-        for (int i = 0; i < 6; i++) if (h->gm_type[rf] != AV1_IDENTITY) printf("gm_params[%d][%d] = %d\n", rf, i, h->gm_params[rf][i]);
     }
     P("apply_grain", h->fg.apply_grain);
     if (h->fg.apply_grain) { P("grain_seed", h->fg.grain_seed); P("num_y_points", h->fg.num_y_points); }

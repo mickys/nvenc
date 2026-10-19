@@ -62,14 +62,21 @@ int main(int argc, char **argv)
         eng += d.engine_ms; decoded++;
         if (r == 0) continue;
         const unsigned w = (unsigned)d.cur_w, h = (unsigned)d.cur_h, cw = (w + 1) / 2, ch = (h + 1) / 2;
-        const size_t ns = (size_t)w * h + 2 * (size_t)cw * ch, fs = ns * (size_t)gB;
-        if (fs > cap) { cap = fs; out = realloc(out, cap); ref = realloc(ref, cap); }
+        const bool mono = d.st.seq.mono_chrome;   // the reference has luma only
+        const size_t ns = (size_t)w * h + (mono ? 0 : 2 * (size_t)cw * ch), fs = ns * (size_t)gB;
+        const size_t full = ((size_t)w * h + 2 * (size_t)cw * ch) * (size_t)gB;
+        if (full > cap) { cap = full; out = realloc(out, cap); ref = realloc(ref, cap); }
         av1dec_read_i420(&d, d.cur_surf, out, w, h);
+        if (verbose) {   // what the engine wrote into the shown surface
+            size_t ln = 0, cn = 0; const uint8_t *L = d.luma[d.cur_surf].cpu, *C = d.chroma[d.cur_surf].cpu;
+            for (size_t i = 0; i < d.luma[d.cur_surf].size; i++) ln += L[i] != 0;
+            for (size_t i = 0; i < d.chroma[d.cur_surf].size; i++) cn += C[i] != 0;
+            printf("    surface %d: %zu nonzero luma bytes, %zu nonzero chroma bytes\n", d.cur_surf, ln, cn);
+        }
         double ps = 0;
         if (!fseeko(rf, refpos, SEEK_SET) && fread(ref, 1, fs, rf) == fs) {
             ps = psnr(out, ref, (size_t)w * h);
-            const double pu = psnr(out + (size_t)w * h * gB, ref + (size_t)w * h * gB, ns - (size_t)w * h);
-            if (pu < ps) ps = pu;
+            if (!mono) { const double pu = psnr(out + (size_t)w * h * gB, ref + (size_t)w * h * gB, ns - (size_t)w * h); if (pu < ps) ps = pu; }
         }
         refpos += (off_t)fs;
         if (getenv("AV1_DUMP") && shown == atoi(getenv("AV1_DUMP"))) {
@@ -82,6 +89,8 @@ int main(int argc, char **argv)
         av1dec_release(&d, d.cur_surf);
         shown++;
     }
+    fseeko(rf, 0, SEEK_END); const off_t left = ftello(rf) - refpos;
+    if (left) printf("reference has %lld bytes more than the frames decoded\n", (long long)left);
     printf("RESULT %d shown frames, %d bit-exact, first difference at %d, worst %.2f dB; engine %.2f ms per temporal unit\n",
            shown, exact, first_bad, worst, decoded ? eng / decoded : 0);
     av1dec_close(&d);
