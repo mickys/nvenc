@@ -54,7 +54,7 @@ typedef struct {
     size_t bps;                     // bytes per sample: 1, or 2 for 10-bit (the surface pitch fields stay in samples)
     // per frame in flight (slot = ticket % depth): input picture, picture setup, bitstream, status
     RmMem in[ENC_MAX_DEPTH], setup[ENC_MAX_DEPTH], bs[ENC_MAX_DEPTH], status[ENC_MAX_DEPTH];
-    struct { bool idr; unsigned frame_num, poc; double t0; int slot, nRefs, refs[ENC_MAX_REFS]; } pend[ENC_MAX_DEPTH];
+    struct { bool idr; unsigned frame_num, poc; double t0; int slot, nRefs, refs[ENC_MAX_REFS], lf; } pend[ENC_MAX_DEPTH];
     RmMem recon, hist, coloc, mepred[2], sem, rcproc, rcdata;
     NvU32 seq;                      // frames submitted (semaphore payload of the last one)
     NvU32 waited;                   // frames waited for
@@ -66,7 +66,8 @@ typedef struct {
     int nextSlot;
     RmEvent ev;                     // NVENC non-stall event (ev.h == 0: none, spin)
     // AV1: default probability tables, the tables the engine wrote, entropy / filter line buffers, assembled temporal units
-    RmMem av1ProbIn, av1ProbOut, av1Line[6], av1Half;
+    RmMem av1ProbIn, av1ProbOut, av1ProbOut2, av1Line[6];
+    int av1OutIdx;                  // which of av1ProbOut / av1ProbOut2 the next frame writes
     uint8_t *av1Tu[ENC_MAX_DEPTH]; size_t av1TuCap;
     int av1SbCols, av1SbRows;
 } Enc;

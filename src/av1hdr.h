@@ -23,6 +23,7 @@ typedef struct {
     int order_hint;
     int refresh_frame_flags;        // inter frames (a shown key frame refreshes all)
     int ref_frame_idx[7];           // inter: slot of LAST..ALTREF
+    int ref_order_hint[7];          // inter: their order hints (for skip mode, 5.9.22)
     int primary_ref_frame;          // inter: 0..6, or 7 = none (default CDFs)
     bool error_resilient;           // inter frames
     bool disable_cdf_update, disable_frame_end_update_cdf;

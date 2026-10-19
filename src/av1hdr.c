@@ -135,7 +135,27 @@ size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uin
         put(&b, f->tx_mode_select, 1);                         // read_tx_mode
     }
     if (!intra) put(&b, f->reference_select, 1);               // frame_reference_mode
-    // skip_mode_params: not allowed (reference_select 0 / intra); allow_warped_motion: 0 (sequence)
+    if (!intra && f->reference_select) {                       // skip_mode_params (5.9.22): skip_mode_present 0 when allowed
+        const int m = 1 << (ohb - 1);
+        #define REL(a, b2) ((((a) - (b2)) & (m - 1)) - (((a) - (b2)) & m))
+        int fwd = -1, fwdHint = 0, bwd = -1, bwdHint = 0, fwd2 = -1, fwd2Hint = 0;
+        for (int i = 0; i < 7; i++) {
+            const int h = f->ref_order_hint[i] & ((1 << ohb) - 1), oh = f->order_hint & ((1 << ohb) - 1);
+            if (REL(h, oh) < 0) { if (fwd < 0 || REL(h, fwdHint) > 0) { fwd = i; fwdHint = h; } }
+            else if (REL(h, oh) > 0) { if (bwd < 0 || REL(h, bwdHint) < 0) { bwd = i; bwdHint = h; } }
+        }
+        bool allowed = fwd >= 0 && bwd >= 0;
+        if (fwd >= 0 && bwd < 0) {
+            for (int i = 0; i < 7; i++) {
+                const int h = f->ref_order_hint[i] & ((1 << ohb) - 1);
+                if (REL(h, fwdHint) < 0 && (fwd2 < 0 || REL(h, fwd2Hint) > 0)) { fwd2 = i; fwd2Hint = h; }
+            }
+            allowed = fwd2 >= 0;
+        }
+        #undef REL
+        if (allowed) put(&b, 0, 1);
+    }
+    // allow_warped_motion: 0 (sequence)
     put(&b, f->reduced_tx_set, 1);
     if (!intra) for (int i = 0; i < 7; i++) put(&b, 0, 1);     // global_motion_params: is_global 0
     // film_grain_params: none (sequence)

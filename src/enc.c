@@ -5,6 +5,7 @@
 #include "hevchdr.h"
 #include "av1hdr.h"
 #include "av1probs.h"
+#include "av1enctmpl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,10 +17,13 @@
 #include "nvenc_drv.h"
 
 // picture setup buffer: the 512-byte header, then one control of each kind
-enum { OFF_ME = 0x400, OFF_MD = 0x500, OFF_Q = 0x600, OFF_SLICE = 0x700, SETUP_SIZE = 0x1000 };   // room for ENC_MAX_SLICES controls
+enum { OFF_ME = 0x400, OFF_MD = 0x500, OFF_Q = 0x600, OFF_SLICE = 0x700, OFF_AV1_TILE = 0x800, SETUP_SIZE = 0x1000 };   // room for ENC_MAX_SLICES controls
 enum { LOG2_MAX_FRAME_NUM = 8 };
 
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+
+// AV1: the RC data buffer's activity and pass-2 areas (the driver's offsets: 0x100 + n, 0x100 + 2n; n = 64 bytes per MB, in pages)
+static size_t av1_rc_area(const Enc *e) { return (((size_t)e->wmb * e->hmb * 64) + 0xfff) & ~(size_t)0xfff; }
 
 int enc_open(Enc *e, const EncConfig *cfg)
 {
@@ -69,27 +73,28 @@ int enc_open(Enc *e, const EncConfig *cfg)
             rm_mem_alloc(rm, &e->status[d], av1 ? 0x40000 : 0x10000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
         else memset(e->in[d].cpu, 0, e->in[d].size);
     if (rm_mem_alloc(rm, &e->recon, e->rSlot * (size_t)slots, 0x10000, false, false, true) ||
-        rm_mem_alloc(rm, &e->hist, histSz, 0x1000, av1, av1, true) ||
+        rm_mem_alloc(rm, &e->hist, histSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->coloc, (mbs * 64 + 0xffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[0], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[1], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->rcproc, 0x10000, 0x1000, true, true, true) ||
-        rm_mem_alloc(rm, &e->rcdata, 0x10000, 0x1000, true, true, true) ||
+        rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000, 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
     memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
     if (av1) {
-        // probability tables: the four default tables (one per quantizer context, av1probs.c = NVDEC's layout; T12.02) at
-        // 0x3000 apart, and room for what the engine writes; the entropy / filter line buffers (sizes not documented: 1 MB)
-        if (rm_mem_alloc(rm, &e->av1ProbIn, 4 * 0x3000, 0x1000, true, true, true) || rm_mem_alloc(rm, &e->av1ProbOut, 0x10000, 0x1000, true, true, true))
-            { fprintf(stderr, "enc: allocation failed\n"); return -1; }
-        memset(e->av1ProbIn.cpu, 0, e->av1ProbIn.size); memset(e->av1ProbOut.cpu, 0, e->av1ProbOut.size);
+        // as NVIDIA's Linux driver sets them up (docs/traces/av1-linux, M12): the four default CDF tables (av1probs.c, the
+        // same layout NVDEC uses) 0x3000 apart, the microcode picking one by quantizer (prob_tables_offset); two buffers for
+        // the tables the engine writes (a P frame reads the previous frame's); the entropy / filter line buffers; the RC
+        // process buffer with the words the driver puts there before the first frame
+        if (rm_mem_alloc(rm, &e->av1ProbIn, 4 * 0x3000, 0x1000, true, true, true) || rm_mem_alloc(rm, &e->av1ProbOut, 0x10000, 0x1000, true, true, true) ||
+            rm_mem_alloc(rm, &e->av1ProbOut2, 0x10000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
+        memset(e->av1ProbIn.cpu, 0, e->av1ProbIn.size); memset(e->av1ProbOut.cpu, 0, e->av1ProbOut.size); memset(e->av1ProbOut2.cpu, 0, e->av1ProbOut2.size);
         for (int q = 0; q < 4; q++) av1_default_probs(q, (uint8_t *)e->av1ProbIn.cpu + q * 0x3000);
-        if (rm_mem_alloc(rm, &e->av1Half, (e->rSlot + 0xffff) & ~(size_t)0xffff, 0x10000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
-        memset(e->av1Half.cpu, 0, e->av1Half.size);
         for (int i = 0; i < 6; i++) {
             if (rm_mem_alloc(rm, &e->av1Line[i], 1 << 20, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
             memset(e->av1Line[i].cpu, 0, e->av1Line[i].size);
         }
+        memcpy(e->rcproc.cpu, av1_tmpl_rcprocess, sizeof av1_tmpl_rcprocess);
         e->av1TuCap = e->bs[0].size + 4096;
         for (int d = 0; d < e->cfg.depth; d++) if (!(e->av1Tu[d] = malloc(e->av1TuCap))) return -1;
     }
@@ -114,7 +119,7 @@ void enc_close(Enc *e)
     if (e->ev.h) rm_event_close(&e->rm, &e->ev);
     chan_destroy(&e->chan);
     RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata, &e->av1ProbIn, &e->av1ProbOut,
-                   &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5], &e->av1Half };
+                   &e->av1ProbOut2, &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5] };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
     for (int d = 0; d < ENC_MAX_DEPTH; d++) { free(e->av1Tu[d]); e->av1Tu[d] = NULL; }
     for (int d = 0; d < ENC_MAX_DEPTH; d++) {
@@ -387,101 +392,93 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
     setup_q_hevc((void *)((NvU8 *)setup->cpu + OFF_Q));
 }
 
-// ---- AV1 (M12): nvenc_av1_drv_pic_setup_s (768 bytes, its ME / MD controls inline) and one tile control. Every frame
-// starts from the default CDFs (primary_ref_frame none) and does not save its own (disable_frame_end_update_cdf), so
-// the engine's written tables are not needed yet. The two codec numbers are not documented: ENC_AV1_CT (the method's
-// codec type) and ENC_AV1_PC (pic_control.codec) override them while they are being found (T12.02).
-static RmMem gSpare;   // experiments (T12.02)
-static int av1_env(const char *k, int d) { const char *v = getenv(k); return v ? (int)strtol(v, NULL, 0) : d; }
-
-static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs)
+// ---- AV1 (M12): NVIDIA's Linux driver's picture setups (src/av1enctmpl.h, traced at 256x128), patched in the fields that
+// change with the picture size and the frame (found by comparing traces at 256x128, 640x360 and 1920x1080 and across
+// frames). Ada reads nvenc_av1_drv_pic_setup_s with a fourth 32-byte surface config at 0x64 (a copy of the reference
+// picture's), so the offsets below are the header's plus 0x20 from there on. One reference (LAST, the previous frame),
+// as the driver's low-latency P frames; CDEF and loop restoration on (the engine picks CDEF per block from two strengths
+// and leaves restoration off); constant quantizer per frame type (rate control: later, T12.03).
+static void put32(void *b, size_t off, NvU32 v) { memcpy((NvU8 *)b + off, &v, 4); }
+static void put16(void *b, size_t off, NvU16 v) { memcpy((NvU8 *)b + off, &v, 2); }
+// loop filter level from the base quantizer index: the driver's choices were 7 at 80 (key) and 13 at 100 (P); libaom's
+// "pick from q" rule rounded the same way (av1_pick_filter_level, 8-bit), minus 4 on key frames
+static int av1_lf_level(int q, bool key)
 {
-    int W = e->cfg.width, H = e->cfg.height;
-    const int q = idr ? e->cfg.qp_i : e->cfg.qp_p;
-    nvenc_av1_drv_pic_setup_s *ps = setup->cpu;
-    ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
-    nvenc_av1_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
-        .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
-    nvenc_av1_surface_cfg_s rc = ic; rc.sfc_pitch = rc.sfc_pitch_chroma = (unsigned short)e->rPitch;
-    if (av1_env("ENC_AV1_COFF", 0)) {   // experiment: chroma planes by offset from the luma address (units of 256)
-        ic.chroma_top_frm_offset = (unsigned)(e->lumaSz >> 8); rc.chroma_top_frm_offset = (unsigned)(e->rLuma >> 8);
+    static const int ac[] = { 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };   // Ac_Qlookup below 16
+    const int acq = q < 16 ? ac[q] : (q * 1191 + 1250) / 1000;   // close to Ac_Qlookup[q] in the low range (8-bit)
+    int l = (acq * 20723 + 1015158 + (1 << 17)) >> 18;
+    if (key) l -= 4;
+    return l < 0 ? 0 : l > 63 ? 63 : l;
+}
+
+static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
+{
+    NvU8 *b = setup->cpu;
+    const int W = e->cfg.width, H = e->cfg.height;
+    const size_t rows = ((size_t)H + 63) & ~(size_t)63;
+    memcpy(b, idr ? av1_tmpl_key : av1_tmpl_p, sizeof av1_tmpl_key);
+    memcpy(b + OFF_AV1_TILE, idr ? av1_tmpl_key_tile : av1_tmpl_p_tile, sizeof av1_tmpl_key_tile);
+    // surface configs: reference, input, output, and the extra one (dims, pitch, plane offsets in units of 256: luma
+    // "bottom" = half a plane, chroma after the luma plane, chroma "bottom" half a chroma plane on)
+    const NvU32 dims = (NvU32)(W - 1) | (NvU32)(H - 1) << 16, rp = (NvU32)e->rPitch * (NvU32)e->bps, ip = (NvU32)e->pitch * (NvU32)e->bps;
+    for (int k = 0; k < 4; k++) {
+        const size_t o = 4 + 0x20 * (size_t)k; const bool in = k == 1;
+        put32(b, o, dims); put32(b, o + 4, in ? ip | ip << 16 : rp | rp << 16);
+        if (in) { put32(b, o + 0x14, (NvU32)(e->lumaSz >> 8)); continue; }
+        put32(b, o + 0x10, (NvU32)(rows / 2 * rp >> 8)); put32(b, o + 0x14, (NvU32)(e->rLuma >> 8));
+        put32(b, o + 0x18, (NvU32)((e->rLuma + rows / 4 * rp) >> 8));
     }
-    ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
-    { const int hv = av1_env("ENC_AV1_HALF", 1);   // the 2x2-subsampled reconstruction (SET_OUT_SCALE_REF_PIC_*); experiment: 2 = the input's config, 3 = the reconstruction's
-      nvenc_av1_surface_cfg_s hc = rc; hc.frame_width_minus1 = (unsigned short)((W + 1) / 2 - 1); hc.frame_height_minus1 = (unsigned short)((H + 1) / 2 - 1);
-      hc.sfc_pitch = hc.sfc_pitch_chroma = (unsigned short)(e->rPitch / 2);
-      if (hv == 1) ps->half_scaled_outputpic_cfg = hc; else if (hv == 2) ps->half_scaled_outputpic_cfg = ic; else if (hv == 3) ps->half_scaled_outputpic_cfg = rc; }
-    nvenc_av1_seq_hdr_data_s *sq = &ps->seqhdr_data;
-    sq->min_cu_size = 1; sq->max_cu_size = 3; sq->chroma_format_idc = 1;
-    sq->bit_depth_minus_8 = (unsigned)(e->cfg.bit_depth - 8); sq->input_bit_depth_minus8 = sq->bit_depth_minus_8;
-    nvenc_av1_frame_hdr_data_s *fh = &ps->framehdr_data;
-    fh->frame_type = idr ? 0 : 1; fh->interp_filter = 0; fh->mc_hfilter = 1; fh->mc_vfilter = 1;
-    fh->frame_tx_mode = 1; fh->frame_end_update_cdf = 0;
-    fh->quant_cfg.base_q_idx = (unsigned char)q;
-    nvenc_av1_rc_s *r = &ps->rate_control;
-    r->QP[0] = r->QP[1] = (unsigned char)e->cfg.qp_p; r->QP[2] = (unsigned char)e->cfg.qp_i;
-    for (int i = 0; i < 3; i++) { r->minQP[i] = 0; r->maxQP[i] = 255; r->rhopbi[i] = 256; }
-    r->framerate = e->cfg.fps; r->gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
-    nvenc_av1_pic_control_s *pc = &ps->pic_control;
-    memset(pc->l0, -2, sizeof pc->l0); memset(pc->l1, -2, sizeof pc->l1);
-    memset(pc->poc_entry_l0, -1, sizeof pc->poc_entry_l0); memset(pc->poc_entry_l1, -1, sizeof pc->poc_entry_l1);
-    memset(pc->temp_dist_l0, -1, sizeof pc->temp_dist_l0); memset(pc->temp_dist_l1, -1, sizeof pc->temp_dist_l1);
-    for (int i = 0; i < nRefs; i++) { pc->l0[i] = (char)(2 * e->slotOf[i]); pc->poc_entry_l0[i] = (char)i; pc->temp_dist_l0[i] = (char)(i + 1); }
-    pc->num_ref_idx_l0_active = (unsigned)nRefs;
-    pc->pic_output_flag = 1; pc->max_tu_depth_inter = 2; pc->max_tu_depth_intra = 0; pc->num_tiles_minus1 = 0;
-    pc->input_sub_sampling = (unsigned)av1_env("ENC_AV1_INSUB", 0); pc->output_sub_sampling = (unsigned)av1_env("ENC_AV1_OUTSUB", 0);
-    pc->force_lf_off_flag = (unsigned)av1_env("ENC_AV1_LFOFF", 0); pc->force_lf_on_flag = (unsigned)av1_env("ENC_AV1_LFON", 0);
-    pc->enable_source_image_padding = (unsigned)av1_env("ENC_AV1_PAD", 1);
-    pc->luma_padding_mode = pc->chroma_padding_mode = (unsigned)av1_env("ENC_AV1_PADMODE", 0);
-    pc->tile_control_offset = OFF_SLICE; pc->hist_buf_size = (unsigned)e->hist.size; pc->bitstream_buf_size = (unsigned)bs->size;
-    pc->pic_type = idr ? 3 : 0; pc->ref_pic_flag = 1; pc->codec = (unsigned)av1_env("ENC_AV1_PC", 7) & 7; pc->qpfifo = 1;
-    pc->num_tile_cols = 1; pc->num_tile_rows = 1; pc->ctx_update_tile_id = 0;
-    pc->tile_stat_offset = (unsigned)offsetof(nvenc_av1_stat_data_s, tile_stat);
-    pc->mpec_stat_offset = (unsigned)offsetof(nvenc_av1_stat_data_s, mpec_stat); pc->aq_stat_offset = (unsigned)offsetof(nvenc_av1_stat_data_s, aq_stats);
-    pc->stats_fifo_offset = (unsigned)offsetof(nvenc_av1_stat_data_s, stats_fifo);
-    if (av1_env("ENC_AV1_NOSTATOFF", 0)) { pc->mpec_stat_offset = pc->aq_stat_offset = pc->stats_fifo_offset = 0; if (av1_env("ENC_AV1_NOSTATOFF", 0) > 1) pc->tile_stat_offset = 0; }
-    pc->strips_in_frame = 1; pc->strip_width_in_sbs = (unsigned short)e->av1SbCols; pc->strip_height_in_sbs = (unsigned short)e->av1SbRows;
-    nvenc_av1_md_control_s *md = &ps->md_control;
-    md->cu8x8_part_2Nx2N_enable = 1; md->cu16x16_part_2Nx2N_enable = 1; md->cu16x16_part_2NxN_enable = 1; md->cu16x16_part_Nx2N_enable = 1;
-    md->cu32x32_part_2Nx2N_enable = 1; md->cu32x32_part_2NxN_enable = 1; md->cu32x32_part_Nx2N_enable = 1;
-    md->cu64x64_part_2Nx2N_enable = 1; md->cu64x64_part_2NxN_enable = 1; md->cu64x64_part_Nx2N_enable = 1;
-    md->tusize_4x4_enable = 1; md->tusize_8x8_enable = 1; md->tusize_16x16_enable = 1; md->tusize_32x32_enable = 1; md->tusize_64x64_enable = 1;
-    md->multiply_bias_with_lambda = 1; md->mv_cost_enable = 1; md->num_1div8_lambda_ssd = 1; md->luma_all_zero_check = 1;
-    md->inter_rdo_cnt_8x8 = md->inter_rdo_cnt_16x16 = md->inter_rdo_cnt_32x32 = md->inter_rdo_cnt_64x64 = 1;
-    md->intra_rdo_cnt_8x8 = md->intra_rdo_cnt_8x4 = md->intra_rdo_cnt_4x8 = md->intra_rdo_cnt_16x16 = md->intra_rdo_cnt_16x8 = md->intra_rdo_cnt_8x16 = 1;
-    md->intra_rdo_cnt_32x32 = md->intra_rdo_cnt_32x16 = md->intra_rdo_cnt_16x32 = md->intra_rdo_cnt_64x64 = md->intra_rdo_cnt_64x32 = md->intra_rdo_cnt_32x64 = 1;
-    unsigned *dd = &md->intra_luma_dir_delta_64x64_enable_0;   // 14 masks: every angular delta of every direction
-    for (int i = 0; i < 14; i++) dd[i] = 0x0fffffff;
-    md->intra_luma_base_mode_4x4_enable = md->intra_luma_base_mode_8x8_enable = md->intra_luma_base_mode_16x16_enable = 0x1fff;
-    md->intra_luma_base_mode_32x32_enable = md->intra_luma_base_mode_64x64_enable = 0x1fff;
-    md->tx_type_search_mask[0] = md->tx_type_search_mask[1] = 0xffff;
-    { const int mm = av1_env("ENC_AV1_ME", 0);   // experiment: 0 HEVC's ME controls, 1 H.264's (intra / inter), 2 none
-      if (mm == 0) setup_me_hevc(&ps->me_control); else if (mm == 1) setup_me(&ps->me_control, !idr); }
-    nvenc_av1_tile_control_s *tc = (void *)((NvU8 *)setup->cpu + OFF_SLICE);
-    tc->tile_bot_sbx = (unsigned)e->av1SbCols - 1; tc->tile_bot_sby = (unsigned)e->av1SbRows - 1;
-    { const int df = av1_env("ENC_AV1_DISF", 0);   // experiment: disable filters at tile boundaries (bit 0 top, 1 bottom, 2 next top, 3 next bottom)
-      tc->disable_tile_top_filters = df & 1; tc->disable_tile_bottom_filters = df >> 1 & 1;
-      tc->disable_next_tile_top_filters = df >> 2 & 1; tc->disable_next_tile_bottom_filters = df >> 3 & 1; }
-    if (av1_env("ENC_AV1_NEXT", 0)) { tc->next_tile_bot_sbx = tc->tile_bot_sbx; tc->next_tile_bot_sby = tc->tile_bot_sby; }
-    if (av1_env("ENC_AV1_NEXT", 0) > 1) { tc->next_tile_top_sby = tc->tile_bot_sby + 1; tc->next_tile_bot_sby = tc->tile_bot_sby + 1; }
-    if (av1_env("ENC_AV1_LIMIT", 0)) { tc->limit_tile_top_boundary = tc->limit_tile_bot_boundary = tc->limit_tile_left_boundary = tc->limit_tile_right_boundary = 1; }
-    if (av1_env("ENC_AV1_TBEXCL", 0)) { tc->tile_bot_sbx++; tc->tile_bot_sby++; }
-    if (av1_env("ENC_AV1_RDO4", 0)) md->intra_rdo_cnt_4x4 = (unsigned)av1_env("ENC_AV1_RDO4", 0);
-    tc->qp_tile_min = 0; tc->qp_tile_max = 255; tc->qp_avr = (unsigned)q; tc->tile_type = idr ? 2 : 1; tc->tile_end_update_cdf = 1;
-    pc->pic_type = (unsigned)av1_env("ENC_AV1_PT", (int)pc->pic_type); pc->ref_pic_flag = (unsigned)av1_env("ENC_AV1_REF", 1);
-    // Ada's microcode reads nvenc_av1_pic_control_s with 32 more bytes than nvenc_drv.h shows, ahead of stripID (T12.02:
-    // with the header's layout the engine read the input 16 rows above the picture and stalled; strip width / height
-    // written 32 bytes later stopped that, while the stat offsets at +64..+72 are read where the header has them). So the
-    // setup is written as the header lays it out, then everything from stripID on moves 32 bytes up.
-    { const int sh = av1_env("ENC_AV1_SHIFT", 32), at = 0x108 + 88;
-      if (sh > 0) { memmove((NvU8 *)setup->cpu + at + sh, (NvU8 *)setup->cpu + at, sizeof *ps - (size_t)at); memset((NvU8 *)setup->cpu + at, 0, (size_t)sh); } }
-    // experiment (T12.02): ENC_AV1_POKE=off:value,... sets 32-bit words of the setup buffer (offsets in bytes, hex ok)
-    for (const char *pk = getenv("ENC_AV1_POKE"); pk && *pk;) {
-        char *end; const unsigned long off = strtoul(pk, &end, 0); if (*end != ':') break;
-        const unsigned long val = strtoul(end + 1, &end, 0);
-        if (off + 4 <= SETUP_SIZE) memcpy((NvU8 *)setup->cpu + off, &(NvU32){ (NvU32)val }, 4);
-        pk = *end == ',' ? end + 1 : end;
+    for (int i = 0; i < 4; i++) b[0x98 + i] = (NvU8)lf;            // frame header: loop filter levels
+    b[0xc0] = (NvU8)q;                                              // frame header: base_q_idx
+    b[0xc9] = (NvU8)e->cfg.qp_p; b[0xca] = (NvU8)e->cfg.qp_p; b[0xcb] = (NvU8)e->cfg.qp_i;   // RC: QP[P, B, I]
+    put32(b, 0x154, (NvU32)e->hist.size); put32(b, 0x158, (NvU32)bs->size); put32(b, 0x15c, 0);   // pic_control buffer sizes
+    put32(b, 0x16c, 0x1000); put32(b, 0x18c, 0x1000);              // mpec / stats fifo offsets in the status (not enabled)
+    put32(b, 0x178, 0x100 + (NvU32)av1_rc_area(e)); put32(b, 0x174, 0x100 + 2 * (NvU32)av1_rc_area(e));   // act / pass-2 in RC data
+    put32(b, 0x180, 0x100u | (NvU32)e->av1SbCols << 16); put32(b, 0x184, (NvU32)e->av1SbRows);   // one strip: the whole frame
+    put32(b, 0x31c, 0x80000000u | (NvU32)((size_t)e->wmb * e->hmb * 56 > 202500 ? (size_t)e->wmb * e->hmb * 56 : 202500));   // gpTimer
+    NvU8 *t = b + OFF_AV1_TILE;                                     // tile control: one tile, corners inclusive, next = this
+    put16(t, 4, (NvU16)(e->av1SbCols - 1)); put16(t, 6, (NvU16)(e->av1SbRows - 1));
+    put16(t, 0x14, (NvU16)(e->av1SbCols - 1)); put16(t, 0x16, (NvU16)(e->av1SbRows - 1));
+    t[0xa] = (NvU8)q;                                               // qp_avr
+}
+
+// AV1 picture setup and methods, in the driver's order (docs/traces/av1-linux): codec type 5 with force-output, tile
+// statistics, the app timer and sub-frame mode 2; no colocated data; luma and chroma by one address each (the surface
+// configs give the chroma planes); on P frames the ME predictors and reference picture 0. Probability tables: key frames
+// read the default tables (by quantizer), P frames the tables the previous frame wrote.
+static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs)
+{
+    Chan *c = &e->chan;
+    RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
+    const int q = idr ? e->cfg.qp_i : e->cfg.qp_p, lf = av1_lf_level(q, idr);
+    setup_av1(e, setup, bs, idr, q, lf);
+    const NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot, inVa = e->extInput ? e->extInput : in->gpu;
+    RmMem *probOut = e->av1OutIdx ? &e->av1ProbOut2 : &e->av1ProbOut, *probPrev = e->av1OutIdx ? &e->av1ProbOut : &e->av1ProbOut2;
+    RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
+    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_AV1);
+    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, 0x00041905u | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
+    chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
+    chan_mthd(c, 0, NVC9B7_SET_IN_DRV_PIC_SETUP, 1, (NvU32)(setup->gpu >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_IOHISTORY, 1, (NvU32)(e->hist.gpu >> 8));
+    if (!idr) { chan_mthd(c, 0, NVC9B7_SET_IN_MEPRED_DATA, 1, (NvU32)(meIn->gpu >> 8)); chan_mthd(c, 0, NVC9B7_SET_OUT_MEPRED_DATA, 1, (NvU32)(meOut->gpu >> 8)); }
+    chan_mthd(c, 0, NVC9B7_SET_IO_RC_PROCESS, 1, (NvU32)(e->rcproc.gpu >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_OUT_REF_PIC_LUMA, 1, (NvU32)(recOut >> 8)); chan_mthd(c, 0, NVC9B7_SET_OUT_REF_PIC_CHROMA, 1, (NvU32)(recOut >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_OUT_ENC_STATUS, 1, (NvU32)(status->gpu >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_OUT_BITSTREAM, 1, (NvU32)(bs->gpu >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_IN_CUR_PIC, 1, (NvU32)(inVa >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_IN_CUR_PIC_CHROMA_U, 1, (NvU32)(inVa >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_CUR_PIC_CHROMA_V, 1, (NvU32)(inVa >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_IN_RCDATA, 1, (NvU32)(e->rcdata.gpu >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_IN_AV1_PROBABILITY_DATA, 1, (NvU32)((idr ? e->av1ProbIn.gpu : probPrev->gpu) >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_OUT_AV1_PROBABILITY_DATA, 1, (NvU32)(probOut->gpu >> 8));
+    static const NvU32 lm[6] = { NVC9B7_SET_IOENTROPY_ABOVE_MV_DATA, NVC9B7_SET_IOENTROPY_ABOVE_CTX_DATA, NVC9B7_SET_IODEBLOCK_TOPROW,
+                                 NVC9B7_SET_IODEBLOCK_LEFTCOLUMN, NVC9B7_SET_IOCDEF_LEFTCOLUMN, NVC9B7_SET_IOLR_LEFTCOLUMN };
+    for (int i = 0; i < 6; i++) chan_mthd(c, 0, lm[i], 1, (NvU32)(e->av1Line[i].gpu >> 8));
+    if (!idr && nRefs > 0) {
+        const NvU64 ra = e->recon.gpu + (NvU64)e->slotOf[0] * e->rSlot;
+        chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA, 1, (NvU32)(ra >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA, 1, (NvU32)(ra >> 8));
     }
+    e->av1OutIdx ^= 1;
+    e->pend[ds].lf = lf;
 }
 
 int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
@@ -501,7 +498,6 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
     bool hevc = e->cfg.codec == ENC_HEVC;
     const bool av1 = e->cfg.codec == ENC_AV1;
     if (hevc) { setup_hevc(e, setup, bs, idr, nRefs); goto methods; }
-    if (av1) { setup_av1(e, setup, bs, idr, nRefs); goto methods; }
     {
     nvenc_h264_drv_pic_setup_s *ps = setup->cpu;
     ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
@@ -562,80 +558,39 @@ int enc_submit(Enc *e, bool force_idr, NvU32 *ticket)
 
     // ---- methods ----
 methods:
+    if (av1) { submit_av1(e, ds, idr, slot, nRefs); goto execute; }
     if (chan_push_used(c) > 0x8000) chan_rewind(c);
     NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot;
     NvU64 inVa = e->extInput ? e->extInput : in->gpu;
-    if (e->cfg.codec == ENC_AV1) inVa += (NvU64)av1_env("ENC_AV1_INOFF", 0);   // experiment (T12.02)
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
     // HEVC: application ID 3 and codec type 4 (not in clc9b7.h; seen in nullmoth's library, T6.03)
-    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, av1 ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_AV1 : hevc ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H265 : (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
-    const NvU32 ct = av1 ? (NvU32)av1_env("ENC_AV1_CT", 5) : hevc ? 4u : NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264;
-    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, ct) |
-              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode) |
-              (av1 ? (NvU32)av1_env("ENC_AV1_CPBITS", 0) : 0u));   // experiment: extra control bits (10 ME only, 12 GP timer, 16 debug)
+    chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, hevc ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H265 : (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264);
+    chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, hevc ? 4u : NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
+              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     struct { NvU32 m; NvU64 a; } bm[] = {
         { NVC9B7_SET_IN_DRV_PIC_SETUP, setup->gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
-        { hevc || av1 ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc || av1 ? recOut : e->coloc.gpu },   // HEVC / AV1: no colocated data
+        { hevc ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc ? recOut : e->coloc.gpu },   // HEVC: no colocated data
         { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
         { NVC9B7_SET_OUT_ENC_STATUS, status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, bs->gpu },
         { NVC9B7_SET_IN_CUR_PIC, inVa }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, inVa + e->lumaSz },
         { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, inVa + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
         { NVC9B7_SET_IN_RCDATA, e->rcdata.gpu } };
-    const unsigned drop = av1 ? (unsigned)av1_env("ENC_AV1_DROP", 0) : 0;   // experiment: leave out common methods (bit = index in bm[])
-    for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) if (!(drop >> i & 1)) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
-    if (av1) {
-        const int qc = av1_q_ctx(idr ? e->cfg.qp_i : e->cfg.qp_p);
-        const NvU32 lm[6] = { NVC9B7_SET_IOENTROPY_ABOVE_CTX_DATA, NVC9B7_SET_IOENTROPY_ABOVE_MV_DATA, NVC9B7_SET_IODEBLOCK_TOPROW,
-                              NVC9B7_SET_IODEBLOCK_LEFTCOLUMN, NVC9B7_SET_IOCDEF_LEFTCOLUMN, NVC9B7_SET_IOLR_LEFTCOLUMN };
-        if (av1_env("ENC_AV1_VCOL", 0)) {   // experiment: colocated buffers in video memory
-            chan_mthd(c, 0, NVC9B7_SET_OUT_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));
-            if (av1_env("ENC_AV1_VCOL", 0) > 1) chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->mepred[1].gpu >> 8));
-        }
-        if (av1_env("ENC_AV1_HALF", 1)) {   // the half-size reconstruction (own buffer: luma, then chroma halfway)
-            chan_mthd(c, 0, NVC9B7_SET_OUT_SCALE_REF_PIC_LUMA, 1, (NvU32)(e->av1Half.gpu >> 8));
-            chan_mthd(c, 0, NVC9B7_SET_OUT_SCALE_REF_PIC_CHROMA, 1, (NvU32)((e->av1Half.gpu + e->av1Half.size / 2) >> 8));
-        }
-        if (av1_env("ENC_AV1_CORES", -1) >= 0) chan_mthd(c, 0, NVC9B7_SET_TOTAL_CORE_NUM, 1, (NvU32)av1_env("ENC_AV1_CORES", 0));
-        const unsigned skip = (unsigned)av1_env("ENC_AV1_SKIP", 0);   // experiment: leave methods out (bit 0 in, 1 out, 2-7 lines)
-        if (!(skip & 1)) chan_mthd(c, 0, NVC9B7_SET_IN_AV1_PROBABILITY_DATA, 1, (NvU32)((e->av1ProbIn.gpu + (NvU64)qc * 0x3000) >> 8));
-        if (!(skip & 2)) chan_mthd(c, 0, NVC9B7_SET_OUT_AV1_PROBABILITY_DATA, 1, (NvU32)(e->av1ProbOut.gpu >> 8));
-        for (int i = 0; i < 6; i++) if (!(skip >> (i + 2) & 1)) chan_mthd(c, 0, lm[i], 1, (NvU32)(e->av1Line[i].gpu >> 8));
-        // experiment (T12.02): ENC_AV1_SPARE=<mask> points the address methods we do not set at a spare buffer, one 1 MB
-        // part each, so an MMU fault there tells which one the engine reads
-        RmMem *const sparep = &gSpare; RmMem spare = *sparep; const unsigned sm = (unsigned)av1_env("ENC_AV1_SPARE", 0);
-        if (sm && !spare.hPhys && !rm_mem_alloc(&e->rm, sparep, 32 << 20, 0x10000, true, true, true)) { memset(sparep->cpu, 0, sparep->size); spare = *sparep; }
-        static const NvU32 sp[] = { NVC9B7_SET_IN_SSIMRDO_INPUT_DENORM, NVC9B7_SET_IN_SSIMRDO_OUTPUT_DENORM, NVC9B7_SET_IN_CEAHINTS_DATA,
-            NVC9B7_SET_IN_COLOC_DATA, NVC9B7_SET_OUT_COLOC_DATA, NVC9B7_SET_IN_MEPRED_DATA, NVC9B7_SET_OUT_MEPRED_DATA, NVC9B7_SET_IN_QP_MAP,
-            NVC9B7_SET_IN_PARTITION_BUF, NVC9B7_SET_OUT_SCALE_REF_PIC_LUMA, NVC9B7_SET_OUT_SCALE_REF_PIC_CHROMA, NVC9B7_SET_IO_DEBUG_STATUS,
-            NVC9B7_SET_IN_LAMBDA_MAP, NVC9B7_SET_OUT_HYBRID_RES, NVC9B7_SET_IN_VP9_PROBABILITY_DATA, NVC9B7_SET_IN_VP9_CUR_TEMPORAL_DATA,
-            NVC9B7_SET_IN_VP9_REF_TEMPORAL_DATA, NVC9B7_SET_IN_VP9_COMBINEDLINE_BUF, NVC9B7_SET_IN_VP9_FILTERLINE_BUF, NVC9B7_SET_IN_VP9_FILTERCOLLINE_BUF,
-            NVC9B7_SET_IN_VP9_MOCOMP_PIC_LUMA, NVC9B7_SET_IN_VP9_MOCOMP_PIC_CHROMA };
-        if (sm && spare.hPhys) for (unsigned i = 0; i < sizeof sp / sizeof sp[0]; i++) if (sm >> i & 1) {
-            chan_mthd(c, 0, sp[i], 1, (NvU32)((spare.gpu + ((NvU64)i << 20)) >> 8));
-            if (getenv("ENC_AV1_LOG") && e->seq == 0) fprintf(stderr, "av1: spare %u (method 0x%x) at %llx\n", i, sp[i], (unsigned long long)(spare.gpu + ((NvU64)i << 20)));
-        }
-        if (getenv("ENC_AV1_LOG") && e->seq == 0) {
-            fprintf(stderr, "av1: setup %llx in %llx bs %llx status %llx hist %llx recon %llx probIn %llx probOut %llx rcproc %llx rcdata %llx\n",
-                    (unsigned long long)setup->gpu, (unsigned long long)inVa, (unsigned long long)bs->gpu, (unsigned long long)status->gpu,
-                    (unsigned long long)e->hist.gpu, (unsigned long long)e->recon.gpu, (unsigned long long)e->av1ProbIn.gpu,
-                    (unsigned long long)e->av1ProbOut.gpu, (unsigned long long)e->rcproc.gpu, (unsigned long long)e->rcdata.gpu);
-            for (int i = 0; i < 6; i++) fprintf(stderr, "av1: line %d %llx\n", i, (unsigned long long)e->av1Line[i].gpu);
-        }
-    }
+    for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
     if (!idr) {
-        if (!hevc && !av1) chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));
+        if (!hevc) chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));
         chan_mthd(c, 0, NVC9B7_SET_IN_MEPRED_DATA, 1, (NvU32)(meIn->gpu >> 8));
         chan_mthd(c, 0, NVC9B7_SET_OUT_MEPRED_DATA, 1, (NvU32)(meOut->gpu >> 8));
         for (int i = 0; i < nRefs; i++) {
             // H.264: REF_PIC<n> by DPB slot (l0 = 2 x slot). HEVC: by position in list 0 (poc_entry_l0[i] = i), while l0
             // still carries 2 x slot (nullmoth's third picture: l0[0] 2, the reference in REF_PIC0; T6.07)
-            NvU32 n = hevc || av1 ? (NvU32)i : (NvU32)e->slotOf[i];
+            NvU32 n = hevc ? (NvU32)i : (NvU32)e->slotOf[i];
             NvU64 ra = e->recon.gpu + (NvU64)e->slotOf[i] * e->rSlot;
             chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * n, 1, (NvU32)(ra >> 8));
             chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * n, 1, (NvU32)((ra + e->rLuma) >> 8));
         }
     }
+execute:
     chan_mthd(c, 0, NVC9B7_EXECUTE, 1, 0u);
     NvU32 payload = ++e->seq;
     chan_mthd(c, 0, NVC9B7_SEMAPHORE_A, 3, (NvU32)(e->sem.gpu >> 32), (NvU32)e->sem.gpu, payload);
@@ -669,29 +624,31 @@ methods:
     return 0;
 }
 
-// AV1: the temporal unit around the engine's tiles. The frame header carries what the engine chose (status: base
-// quantizer index, loop filter level); one tile, the coding tools of setup_av1. Reference slots = reconstruction slots.
+// AV1: the temporal unit around the engine's tiles, with the headers NVIDIA's driver writes for this setup (docs/traces/
+// av1-linux): sequence header with CDEF and restoration on; frame header with the engine's base quantizer, loop filter
+// level and CDEF damping (status), the setup's two CDEF strengths (0, and luma primary 4), restoration off on every
+// plane, TX_MODE_SELECT; inter frames: switchable interpolation filters, reference_select, CDFs from LAST (primary
+// reference 0) and saved at the end of the frame. Reference slots = reconstruction slots; every reference index names the
+// previous frame (LAST).
 static int av1_assemble(Enc *e, int ds, EncFrame *out)
 {
-    const nvenc_av1_stat_data_s *sd = e->status[ds].cpu;
-    const nvenc_av1_pic_stat_s *st = &sd->pic_stat;
+    const NvU8 *sb = e->status[ds].cpu;
+    const nvenc_av1_pic_stat_s *st = (const void *)sb;
+    const NvU32 *ts = (const NvU32 *)(sb + 0x100);                 // tile statistics (tile_stat_offset 0x100): offset, size
     const bool key = e->pend[ds].idr;
-    Av1SeqParams sp = { .width = e->cfg.width, .height = e->cfg.height, .bit_depth = e->cfg.bit_depth, .full_range = e->cfg.full_range };
+    Av1SeqParams sp = { .width = e->cfg.width, .height = e->cfg.height, .bit_depth = e->cfg.bit_depth, .full_range = e->cfg.full_range,
+                        .enable_cdef = true, .enable_restoration = true };
+    const int lf = st->loop_filter_level;
     Av1FrameParams fp = { .frame_type = key ? 0 : 1, .order_hint = (int)e->pend[ds].poc, .refresh_frame_flags = 1 << e->pend[ds].slot,
-        .primary_ref_frame = 7, .disable_frame_end_update_cdf = true, .base_q_idx = st->av1_start_QP,
-        .lf_level = { st->loop_filter_level, st->loop_filter_level, st->loop_filter_level, st->loop_filter_level },
-        .tx_mode_select = true, .interp_filter = 0, .tile_size_bytes = 4 };
-    for (int i = 0; i < 7; i++) {
-        const int k = i < e->pend[ds].nRefs ? i : e->pend[ds].nRefs - 1;
-        fp.ref_frame_idx[i] = k >= 0 ? e->pend[ds].refs[k] : 0;
-    }
-    const nvenc_av1_tile_stat_s *ts = sd->tile_stat;
-    const uint8_t *tile = (const uint8_t *)e->bs[ds].cpu + ts[0].tile_offset; size_t tsz = ts[0].tile_size;
-    if (!st->num_tiles || !tsz) { tile = out->data; tsz = out->size; }
-    if (getenv("ENC_AV1_LOG")) fprintf(stderr, "av1: frame %u %s: %u bits, start q %u, lf %u, cdef damping %u, %u tiles, tile 0 at %u size %u, status %u/%u\n",
-                                       e->pend[ds].poc, key ? "key" : "inter", st->total_bit_count, st->av1_start_QP, st->loop_filter_level,
-                                       st->cdef_damping_minus_3 + 3, st->num_tiles, ts[0].tile_offset, ts[0].tile_size, st->error_status, st->ucode_error_status);
-    if (tsz + 1024 > e->av1TuCap) return -1;
+        .primary_ref_frame = key ? 7 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
+        .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = 1, .cdef_y = { 0, 16 }, .cdef_uv = { 0, 0 },
+        .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4 };
+    for (int i = 0; i < 7; i++) { fp.ref_frame_idx[i] = e->pend[ds].nRefs ? e->pend[ds].refs[0] : 0; fp.ref_order_hint[i] = (int)e->pend[ds].poc - 1; }
+    const uint8_t *tile = (const uint8_t *)e->bs[ds].cpu + ts[0]; size_t tsz = ts[1];
+    if (getenv("ENC_AV1_LOG")) fprintf(stderr, "av1: frame %u %s: %u bits, q %u, lf %u (asked %d), cdef damping %u, %u tiles, tile 0 at %u size %u\n",
+                                       e->pend[ds].poc, key ? "key" : "inter", st->total_bit_count, st->av1_start_QP, lf, e->pend[ds].lf,
+                                       st->cdef_damping_minus_3 + 3, st->num_tiles, ts[0], ts[1]);
+    if (st->num_tiles != 1 || !tsz || ts[0] + tsz > e->bs[ds].size || tsz + 1024 > e->av1TuCap) return -1;
     uint8_t *o = e->av1Tu[ds]; size_t n = av1_write_temporal_delimiter(o);
     if (key) n += av1_write_sequence_header(&sp, o + n);
     n += av1_write_frame(&sp, &fp, &tile, &tsz, 1, o + n);
@@ -722,19 +679,7 @@ int enc_wait(Enc *e, NvU32 ticket, EncFrame *out)
     e->waited = ticket;
 
     nvenc_pic_stat_s *st = e->status[ds].cpu;
-    if (getenv("ENC_AV1_LOG") && e->cfg.codec == ENC_AV1) {   // what the engine wrote (non-zero 4 KB pages)
-        struct { const char *n; RmMem *m; } bb[] = { { "bs", &e->bs[ds] }, { "hist", &e->hist }, { "probOut", &e->av1ProbOut }, { "line0", &e->av1Line[0] },
-            { "line1", &e->av1Line[1] }, { "line2", &e->av1Line[2] }, { "line3", &e->av1Line[3] }, { "line4", &e->av1Line[4] }, { "line5", &e->av1Line[5] },
-            { "spare", &gSpare }, { "rcproc", &e->rcproc }, { "half", &e->av1Half } };
-        for (size_t k = 0; k < sizeof bb / sizeof bb[0]; k++) {
-            const NvU8 *p = bb[k].m->cpu; if (!p) continue;
-            size_t pages = 0, first = (size_t)-1, last = 0;
-            for (size_t o = 0; o < bb[k].m->size; o += 4096) { bool nz = false; for (size_t i = 0; i < 4096 && !nz; i += 8) nz = *(const NvU64 *)(p + o + i) != 0;
-                if (nz) { pages++; if (first == (size_t)-1) first = o; last = o; } }
-            if (pages) fprintf(stderr, "wrote %s (gpu %llx): %zu pages, 0x%zx..0x%zx\n", bb[k].n, (unsigned long long)bb[k].m->gpu, pages, first, last + 4096);
-        }
-    }
-    if (getenv("ENC_AV1_LOG")) {
+    if (getenv("ENC_AV1_LOG") && e->cfg.codec == ENC_AV1) {
         const NvU32 *w = e->status[ds].cpu; fprintf(stderr, "status:");
         for (int i = 0; i < 32; i++) fprintf(stderr, "%s%08x", i % 8 ? " " : "\n  ", w[i]);
         fprintf(stderr, "\n");
