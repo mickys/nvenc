@@ -9,6 +9,7 @@
 #include <time.h>
 
 typedef struct { int poc, period, disp; } Pic;
+static double gReadMs;
 static Pic gPics[100000]; static int gNP;
 
 static int by_period_poc(const void *a, const void *b)
@@ -67,7 +68,13 @@ int main(int argc, char **argv)
         const unsigned w = (unsigned)d.cur_w, h = (unsigned)d.cur_h;
         if (!fs) { fs = (size_t)w * h * 3 / 2; ref = malloc(fs); out = malloc(fs); }
         eng += d.engine_ms;
-        h264dec_read_i420(&d, d.cur_surf, out, w, h);
+        // NV12 through the SIMD untile (what a VideoToolbox decoder hands out), timed; then to I420 for the comparison
+        static uint8_t *nv; static double rd = 0; if (!nv) nv = malloc(fs);
+        const double r0 = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e6;
+        h264dec_read_nv12(&d, d.cur_surf, nv, w, nv + (size_t)w * h, w, w, h);
+        rd += clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e6 - r0; gReadMs = rd;
+        memcpy(out, nv, (size_t)w * h);
+        for (size_t i = 0; i < (size_t)w * h / 4; i++) { out[(size_t)w * h + i] = nv[(size_t)w * h + 2 * i]; out[(size_t)w * h * 5 / 4 + i] = nv[(size_t)w * h + 2 * i + 1]; }
         const int disp = done < gNP ? gPics[done].disp : -1;
         double ps = 0;
         if (disp >= 0 && !fseeko(rf, (off_t)disp * (off_t)fs, SEEK_SET) && fread(ref, 1, fs, rf) == fs) {
@@ -83,8 +90,8 @@ int main(int argc, char **argv)
         done++;
     }
     const double t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e6;
-    printf("RESULT %d of %d pictures decoded, %d bit-exact, first difference at %d, worst %.2f dB; engine %.2f ms/picture (%.0f fps), total %.1f ms\n",
-           done, gNP, exact, first_bad, worst, done ? eng / done : 0, done ? 1000.0 * done / eng : 0, t1 - t0);
+    printf("RESULT %d of %d pictures decoded, %d bit-exact, first difference at %d, worst %.2f dB; engine %.2f ms/picture (%.0f fps), NV12 out %.2f ms/picture, total %.1f ms\n",
+           done, gNP, exact, first_bad, worst, done ? eng / done : 0, done ? 1000.0 * done / eng : 0, done ? gReadMs / done : 0, t1 - t0);
     h264dec_close(&d);
     return exact == gNP && done == gNP ? 0 : 1;
 }

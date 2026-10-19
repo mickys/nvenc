@@ -17,6 +17,8 @@ void bl_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t w
 size_t nvenc_in_offset(size_t x, size_t y, size_t pitch);
 size_t nvenc_in_plane_size(size_t pitch, size_t rows);
 void nvenc_in_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);
+// the inverse: a plane in that layout (pitch) to pitch-linear dst (dst_stride); NVDEC writes the same layout (M8)
+void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch);
 // BGRA (8-bit, 4 bytes per pixel) -> NV12 in NVENC's input layout, BT.709 video range, 2x2 chroma average; converted per
 // 16-row band in a cache-sized buffer, bands over two threads. dst_luma / dst_chroma: the two planes (pitch bytes per row).
 void nvenc_in_tile_bgra(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);

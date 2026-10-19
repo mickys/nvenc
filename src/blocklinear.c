@@ -39,6 +39,49 @@ size_t nvenc_in_offset(size_t x, size_t y, size_t pitch)
 
 size_t nvenc_in_plane_size(size_t pitch, size_t rows) { return pitch * ((rows + 15) / 16) * 16; }
 
+// ---- the other way: NVENC's input layout (also what NVDEC writes, tileFormat 1 / gob_height 0) to pitch-linear ----
+static void untile_band_slow(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t x0, size_t width, size_t y0, size_t y1, size_t pitch)
+{
+    for (size_t y = y0; y < y1; y++)
+        for (size_t x = x0; x < width; x += 16) {
+            size_t n = width - x < 16 ? width - x : 16;
+            memcpy(dst + y * dst_stride + x, src + nvenc_in_offset(x, y, pitch), n);
+        }
+}
+static void untile_band(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t band, size_t rows, size_t pitch)
+{
+    size_t y0 = band * 16, y1 = y0 + 16 < rows ? y0 + 16 : rows;
+    if (y1 - y0 < 16) { untile_band_slow(dst, dst_stride, src, 0, width, y0, y1, pitch); return; }
+    size_t full = width / 64;
+    uint8_t *d0 = dst + y0 * dst_stride;
+    for (size_t t = 0; t < full; t++) {
+        const __m128i *s = (const __m128i *)(src + band * pitch * 16 + t * 1024);   // one tile, read in order
+        uint8_t *d = d0 + t * 64;
+        for (int y8 = 0; y8 < 2; y8++)
+            for (int x32 = 0; x32 < 2; x32++)
+                for (int y4 = 0; y4 < 2; y4++)
+                    for (int x16 = 0; x16 < 2; x16++) {
+                        uint8_t *r = d + (size_t)(y8 * 8 + y4 * 4) * dst_stride + x32 * 32 + x16 * 16;
+                        _mm_storeu_si128((__m128i *)r, _mm_load_si128(s++));
+                        _mm_storeu_si128((__m128i *)(r + dst_stride), _mm_load_si128(s++));
+                        _mm_storeu_si128((__m128i *)(r + 2 * dst_stride), _mm_load_si128(s++));
+                        _mm_storeu_si128((__m128i *)(r + 3 * dst_stride), _mm_load_si128(s++));
+                    }
+    }
+    if (full * 64 < width) untile_band_slow(dst, dst_stride, src, full * 64, width, y0, y1, pitch);
+}
+void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch)
+{
+    size_t bands = (rows + 15) / 16;
+    if ((uintptr_t)src & 15) { untile_band_slow(dst, dst_stride, src, 0, width, 0, rows, pitch); return; }
+    if (bands >= 32) {
+        size_t chunks = 2, per = (bands + chunks - 1) / chunks;
+        dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+            for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch); });
+    } else
+        for (size_t b = 0; b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch);
+}
+
 static void tile_band_slow(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t x0, size_t width, size_t y0, size_t y1, size_t pitch)
 {
     for (size_t y = y0; y < y1; y++)

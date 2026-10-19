@@ -49,6 +49,12 @@ void h264dec_close(H264Dec *d)
 
 void h264dec_release(H264Dec *d, int surf) { if (surf >= 0 && surf < DEC_SURFACES) d->busy[surf] = false; }
 
+void h264dec_read_nv12(H264Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
+{
+    nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w, h, d->pitch);
+    nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, w, h / 2, d->pitch);
+}
+
 void h264dec_read_i420(H264Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h)
 {
     const uint8_t *L = d->luma[surf].cpu, *C = d->chroma[surf].cpu;

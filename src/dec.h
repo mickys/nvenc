@@ -43,5 +43,7 @@ int  h264dec_nal(H264Dec *d, const uint8_t *nal, size_t len);
 int  h264dec_flush(H264Dec *d);
 // The decoded picture's surface stays out of reuse until released (it may also stay a reference afterwards).
 void h264dec_release(H264Dec *d, int surf);
+// Copy a decoded surface out as NV12 (luma and interleaved chroma planes with their own strides; w x h, cropped size).
+void h264dec_read_nv12(H264Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h);
 // Copy a decoded surface out as I420 (w x h, the cropped size).
 void h264dec_read_i420(H264Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h);

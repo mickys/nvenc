@@ -70,13 +70,14 @@ int main(int argc, char **argv)
     const size_t pitch = (W + 63) & ~(size_t)63, bh = gob + 1;            // GOB_2 = blocks of 2 GOBs = block_height_log2 1
     const size_t lumaSize = bl_plane_size(pitch, H, (unsigned)bh) + 65536, chromaSize = bl_plane_size(pitch, H / 2, (unsigned)bh) + 65536;
     const size_t colocSize = (size_t)wmb * hmb * 256 * 2, histSize = (size_t)(getenv("DECODE1_HIST_MB") ? atoi(getenv("DECODE1_HIST_MB")) : 8) << 20;
-    RmMem setup, bsb, offs, status, coloc, hist, luma, chroma, sem, scratch, histo, mbhist;
+    RmMem setup, bsb, offs, status, coloc, hist, luma, chroma, sem, scratch, histo, mbhist, dispL, dispC;
     struct { RmMem *m; size_t size; const char *what; } bufs[] = {
         { &setup, 0x10000, "picture setup" }, { &bsb, (bsn + 0x10000) & ~(size_t)0xffff, "bitstream" }, { &offs, 0x1000, "slice offsets" },
         { &status, 0x1000, "status" }, { &coloc, colocSize, "co-located MVs (guess 256 B/MB)" }, { &hist, histSize, "history (guess 8 MB)" },
         { &luma, lumaSize, "luma surface" }, { &chroma, chromaSize, "chroma surface" }, { &sem, 0x1000, "semaphore" },
         { &scratch, 32u << 20, "picture scratch (guess 32 MB)" }, { &histo, 1u << 20, "histogram (guess 1 MB)" },
-        { &mbhist, 8u << 20, "H.264 MB history (guess 8 MB)" } };
+        { &mbhist, 8u << 20, "H.264 MB history (guess 8 MB)" },
+        { &dispL, (size_t)W * H + 0x100000, "display luma" }, { &dispC, (size_t)W * H / 2 + 0x100000, "display chroma" } };
     // DECODE1_PAD=<bit mask of buffers, in the order above>:<MB>: give those buffers that much extra (MMU fault hunt)
     unsigned padMask = 0, padMB = 0; if (getenv("DECODE1_PAD")) sscanf(getenv("DECODE1_PAD"), "%x:%u", &padMask, &padMB);
     for (size_t i = 0; i < sizeof bufs / sizeof bufs[0]; i++) if (padMask >> i & 1) bufs[i].size += (size_t)padMB << 20;
@@ -136,6 +137,15 @@ int main(int argc, char **argv)
     for (int i = 0; i < 6; i++) for (int k = 0; k < 16; k++) ((uint8_t *)ps->WeightScale[i])[h264_zigzag4x4[k]] = pps->scaling4x4[i][k];
     for (int i = 0; i < 2; i++) for (int k = 0; k < 64; k++) ((uint8_t *)ps->WeightScale8x8[i])[h264_zigzag8x8[k]] = pps->scaling8x8[i][k];
     ps->qpprime_y_zero_transform_bypass_flag = sps->qpprime_y_zero_transform_bypass_flag;
+    // DECODE1_TF=<TilingFormat>[:<OutStride>]: also let NVDEC's display DMA write the picture (T8.05 experiment)
+    int tf = -1; unsigned outStride = (unsigned)(pitch >> 8);
+    if (getenv("DECODE1_TF")) { sscanf(getenv("DECODE1_TF"), "%d:%u", &tf, &outStride); }
+    if (tf >= 0) {
+        ps->displayPara.enableTFOutput = 1; ps->displayPara.TilingFormat = (unsigned)tf; ps->displayPara.OutStride = outStride;
+        ps->displayPara.OutputStructure = 0;
+        ps->displayPara.OutputTop[0] = 0; ps->displayPara.OutputTop[1] = 0;
+        printf("display DMA: TilingFormat %d OutStride %u\n", tf, outStride);
+    }
     printf("setup: %zu bytes, POC %d/%d, tileFormat %u gob_height %u, pitch %zu, history %zu KB, coloc %zu KB\n",
            sizeof *ps, top, bot, tileFormat, gob, pitch, histSize >> 10, colocSize >> 10);
 
@@ -152,6 +162,11 @@ int main(int argc, char **argv)
     chan_mthd(&c, 0, NVC9B0_SET_HISTORY_OFFSET, 1, hi(hist.gpu));
     chan_mthd(&c, 0, NVC9B0_SET_NVDEC_STATUS_OFFSET, 1, hi(status.gpu));
     chan_mthd(&c, 0, NVC9B0_H264_SET_MBHIST_BUF_OFFSET, 1, hi(mbhist.gpu));
+    if (tf >= 0) {
+        chan_mthd(&c, 0, NVC9B0_SET_DISPLAY_BUF_SIZE, 1, (NvU32)dispL.size);
+        chan_mthd(&c, 0, NVC9B0_SET_DISPLAY_BUF_LUMA_OFFSET, 1, hi(dispL.gpu));
+        chan_mthd(&c, 0, NVC9B0_SET_DISPLAY_BUF_CHROMA_OFFSET, 1, hi(dispC.gpu));
+    }
     if (!getenv("DECODE1_NO_SCRATCH")) {   // not needed up to 1080p; 4K faulted at address 0 without them
         chan_mthd(&c, 0, NVC9B0_SET_PIC_SCRATCH_BUF_OFFSET, 1, hi(scratch.gpu));
         chan_mthd(&c, 0, NVC9B0_SET_HISTOGRAM_OFFSET, 1, hi(histo.gpu));
@@ -191,6 +206,16 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < (size_t)cw * ch / 4; i++) { u[i] = uv[2 * i]; v[i] = uv[2 * i + 1]; }
     const uint8_t *ry = ref, *ru = ref + (size_t)cw * ch, *rv = ru + (size_t)cw * ch / 4;
     printf("luma surface: %zu of %zu bytes non-zero\n", nonzero, (size_t)luma.size);
+    if (tf >= 0) {   // the display buffers, read as pitch-linear NV12 with stride OutStride*256
+        const uint8_t *DL = dispL.cpu, *DC = dispC.cpu; size_t nzl = 0, nzc = 0; const size_t ds = (size_t)outStride * 256;
+        for (size_t i = 0; i < dispL.size; i++) nzl += DL[i] != 0;
+        for (size_t i = 0; i < dispC.size; i++) nzc += DC[i] != 0;
+        uint8_t *py = malloc((size_t)cw * ch);
+        for (unsigned r = 0; r < ch; r++) memcpy(py + (size_t)r * cw, DL + (size_t)r * ds, cw);
+        FILE *g = fopen("/tmp/decode1-disp-luma.raw", "wb"); fwrite(DL, 1, dispL.size, g); fclose(g);
+        printf("RESULT display DMA TilingFormat %d: luma bytes written %zu, chroma %zu; as pitch-linear luma PSNR %.2f dB\n", tf, nzl, nzc,
+               psnr(py, ry, (size_t)cw * ch));
+    }
     printf("RESULT tileFormat %u gob %u: luma PSNR %.2f dB, chroma U %.2f V %.2f dB (99 = identical)\n", tileFormat, gob,
            psnr(y, ry, (size_t)cw * ch), psnr(u, ru, (size_t)cw * ch / 4), psnr(v, rv, (size_t)cw * ch / 4));
     return 0;
