@@ -205,7 +205,7 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
             CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(s->session);
             if (compat && dst) {
                 DLOG("our buffer compatible with the destination attributes: %d", (int)compat(pb, dst));
-                CFDictionaryRef pa = CVPixelBufferPoolGetPixelBufferAttributes(pool);
+                CFDictionaryRef pa = pool ? CVPixelBufferPoolGetPixelBufferAttributes(pool) : NULL;
                 CFStringRef ds = pa ? CFCopyDescription(pa) : NULL; char buf[1024] = "(none)";
                 if (ds) { CFStringGetCString(ds, buf, sizeof buf, kCFStringEncodingUTF8); CFRelease(ds); }
                 for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';

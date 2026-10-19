@@ -68,6 +68,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     AVAssetReader *rd = [AVAssetReader assetReaderWithAsset:as error:&err];
     AVAssetReaderTrackOutput *o = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:t
         outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) }];
+    if (getenv("AVWRITE_NOCOPY")) o.alwaysCopiesSampleData = NO;   // default YES: the reader copies every decoded frame
     [rd addOutput:o]; [rd startReading];
     int f = 0; double sum = 0, mn = 1e9;
     CMSampleBufferRef sb;
