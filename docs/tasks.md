@@ -134,11 +134,33 @@ decoders) frame by frame, with streams from more than one encoder.
 
 | Milestone | Codec | Tasks (each: done when it decodes/encodes bit-exact or ≥ the stated quality) | Status |
 |---|---|---|---|
-| M9 | **AV1 decode** (8/10-bit, `av01`) | T9.01 OBU parser (sequence header, frame header, tile info, reference frame state) · T9.02 one key frame through `nvdec_av1_pic_s` · T9.03 inter frames (reference slots, segmentation, loop filter, CDEF, loop restoration, film grain parameters) · T9.04 VideoToolbox `av01` decoder (av1C) + ffmpeg `-hwaccel videotoolbox` · streams from libaom, SVT-AV1, rav1e | planned |
-| M10 | **VP9 decode** (8/10/12-bit, `vp09`) | T10.01 uncompressed + compressed header parser · T10.02 key frame through `nvdec_vp9_pic_s` · T10.03 inter frames, probability contexts (forward updates, backward adaptation counts), reference refresh, scaled references · T10.04 VideoToolbox `vp09` decoder · streams from libvpx | planned |
+| M9 | **AV1 decode** (8/10-bit, `av01`) | T9.01 OBU parser (sequence header, frame header, tile info, reference frame state) · T9.02 one key frame through `nvdec_av1_pic_s` · T9.03 inter frames (reference slots, segmentation, loop filter, CDEF, loop restoration, film grain parameters) · T9.04 VideoToolbox `av01` decoder (av1C) + ffmpeg `-hwaccel videotoolbox` · streams from libaom, SVT-AV1, rav1e | blocked (CDF layout, see below) |
+| M10 | **VP9 decode** (8/10/12-bit, `vp09`) | T10.01 uncompressed + compressed header parser · T10.02 key frame through `nvdec_vp9_pic_s` · T10.03 inter frames, probability contexts (forward updates, backward adaptation counts), reference refresh, scaled references · T10.04 VideoToolbox `vp09` decoder · streams from libvpx | in progress (first; see below) |
 | M11 | **HEVC decode, ours** (Main, Main 10, Main 12, 4:4:4, `hvc1`) | T11.01 VPS/SPS/PPS/slice header reader (beside `hevchdr.c`) · T11.02 IDR · T11.03 P/B with RPS · T11.04 10/12-bit and 4:4:4 · T11.05 VideoToolbox `hvc1` decoder rated above nullmoth's (theirs: one mismatched frame in the x265 1080p test) | planned |
 | M12 | **AV1 encode** (8/10-bit) | T12.01 OBU writer (sequence and frame headers) · T12.02 one key frame through `nvenc_av1_drv_pic_setup_s` · T12.03 inter frames, references, rate control (CBR/VBR/low latency) · T12.04 10-bit · T12.05 VideoToolbox `av01` encoder | planned |
 | M13 | **4:4:4 encode** + encoder probe | T13.01 HEVC Range Extensions 4:4:4 (was T7.04) · T13.02 H.264 High 4:4:4 Predictive · T13.03 probe whether Ada NVENC accepts the VP8 / VP9 application IDs (not in NVIDIA's Ada support matrix; drop if refused) | planned |
 | M14 | **legacy decode** | T14.01 MPEG-2 (`mp2v`) and MPEG-1 · T14.02 MPEG-4 Part 2 (`mp4v`) · T14.03 VC-1 / WMV3 · T14.04 VP8 (`vp08`); VideoToolbox registration only where AVFoundation or ffmpeg can feed the codec | planned |
 
 Not codecs, out of scope: the optical flow accelerator (OFA, 0xc9fa). No JPEG engine on this card.
+
+**Order changed (2026-10-19): VP9 (M10) before AV1 (M9).** With headers only, AV1 is blocked: the engine reads its
+symbol probabilities (CDFs) from a buffer whose layout no public header gives (`nvdec_drv.h` has the AV1 picture setup
+but no CDF table structure), and NVDEC does not initialise or adapt them itself. VP9's probability tables and counters
+are public (`nvdec_vp9EntropyProbs_t`, `nvdec_vp9EntropyCounts_t`), so VP9 goes first; AV1 waits for a layout hypothesis
+to test (spec order, padded like VP9's tables).
+
+## M10: VP9 decode
+
+The driver parses both frame headers, keeps the four probability contexts, applies the compressed header's probability
+updates and, after each frame, adapts the probabilities from the counts the engine wrote (backward adaptation); NVDEC
+decodes the tiles. Source: VP9 Bitstream & Decoding Process Specification v0.7 (`vendor/specs/`, text via pdftotext),
+`nvdec_drv.h`, `clc9b0.h`. Streams: `scripts/make-vp9-streams.sh OUTDIR` (libvpx through ffmpeg, with ffmpeg's reference
+decodes).
+
+| Task | What | Done when | Status |
+|---|---|---|---|
+| T10.00 | Default probability tables from the spec text | every table's count matches its declared dimensions | done: `scripts/spec-tables.py vp9 vp9-spec.txt src/vp9tables.h` (strips page furniture and comments, joins wrapped declarations, checks counts; scan tables come out as uint16_t) |
+| T10.01 | Parser: uncompressed header, compressed header (boolean decoder, `diff_update_prob`, `decode_term_subexp`, `inv_remap_prob`, MV updates), superframes (Annex B), `setup_past_independence`, `reset_frame_context`, the four saved contexts, refresh_probs + adaptation (8.4) from NVDEC's counter layout | the header fields match ffmpeg's `trace_headers` on every frame of every test stream; each compressed header ends exactly on its zero padding | done (`src/vp9parse.c`, `tools/vp9parsetest`, `scripts/vp9-trace-compare.py`): 11 streams (alt-ref with hidden frames and superframes, 1080p alt-ref, tiles, tile rows, error resilient, frame-parallel, lossless, segmentation, 4K, 10-bit profile 2, 351x287), 0 differences in 10 820 compared fields, every compressed header padding all-zero. The adaptation is untested until T10.03 (needs the engine's counts). Assumed, to check there: NVDEC's coefficient counts are [ZERO, ONE, TWO+, no-more] with `countEobs` = more_coefs reads, its inter-mode counts are the tree's branch counts (ZEROMV, NEARESTMV, NEARMV/NEWMV); `ref_frame_sign_bias` is cleared by `setup_past_independence` also for error-resilient inter frames (7.2, as written) |
+| T10.02 | One key frame through `nvdec_vp9_pic_s`: probability table (`nvdec_vp9EntropyProbs_t`), segment, filter, tile-size and counter buffers | bit-exact against ffmpeg | planned |
+| T10.03 | Inter frames: reference slots, sign bias / compound, column MVs (previous frame), segmentation map read/write, backward adaptation from the counters, hidden frames, show_existing_frame, resolution changes / scaled references | all test streams bit-exact | planned |
+| T10.04 | VideoToolbox `vp09` decoder in `libnvencvt` (vpcC), 10-bit output | AVFoundation / ffmpeg `-hwaccel videotoolbox` decode VP9 with it | planned |
