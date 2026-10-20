@@ -32,6 +32,8 @@ typedef struct {
     int bit_depth;                  // HEVC: 8 (Main, default) or 10 (Main 10: 16-bit input samples, enc_load_p010)
     bool chroma444;                 // HEVC Main 4:4:4 / H.264 High 4:4:4 Predictive (enc_load_yuv444 / enc_load_nv24)
     bool lossless;                  // H.264 (High 4:4:4 Predictive, CAVLC) / HEVC: every macroblock / CU at QP 0, bypassed
+    bool quality;                   // H.264: NVIDIA's -preset p4 ME / MD / quant controls for I and P pictures (about +0.6 dB at
+                                    // equal rate on camera content, ~2.7 ms instead of ~1.5 ms per 1080p frame); default: fast
     int bframes;                    // H.264: B pictures between anchors announced (POC type 0, VUI reordering); the caller orders
                                     // the pictures and marks the B ones (enc_submit_ex). num_refs must be >= 2
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range

@@ -1,5 +1,6 @@
 // enc.c: see enc.h.
 #include "enc.h"
+#include "h264enctmpl.h"
 #include "blocklinear.h"
 #include "h264hdr.h"
 #include "hevchdr.h"
@@ -618,13 +619,17 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
         pc->l0[i] = (char)(2 * L0[i]); pc->temp_dist_l0[i] = (char)(((int)poc - (int)e->slotPoc[L0[i]]) / 2);
     }
     if (b) { pc->l1[0] = (char)(2 * e->slotOf[0]); pc->temp_dist_l1[0] = (char)(((int)poc - (int)e->slotPoc[e->slotOf[0]]) / 2); }
-    if (b && getenv("ENC_BL")) {   // experiment: list arrangements
-        const int v = atoi(getenv("ENC_BL"));
-        if (v == 1) { pc->l1[0] = (char)(2 * e->slotOf[1]); pc->l0[0] = (char)(2 * e->slotOf[0]); }                       // swapped
-        if (v == 2) { pc->temp_dist_l1[0] = (char)-pc->temp_dist_l1[0]; pc->temp_dist_l0[0] = (char)-pc->temp_dist_l0[0]; }  // signs
-        if (v == 3) { pc->diff_pic_order_cnt_zero[0] = 0xffffffffu; pc->diff_pic_order_cnt_zero[1] = 0xffffffffu; }
-        if (v == 4) { pc->l1[0] = (char)(2 * e->slotOf[0] + 1); }
-    }
+    // DistScaleFactor (8.4.1.2.3) per list 0 reference against list 1's first, 256 in P pictures, -1 unused (as NVIDIA's
+    // driver sets them, docs/traces/bframes-linux); diff_pic_order_cnt_zero copied from its B pictures (one L0, one L1)
+    for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) pc->dist_scale_factor[i][j] = b ? -1 : 256;   // [refidx1][refidx0]
+    if (b) {
+        for (int i = 0; i < nL0; i++) {
+            const int tb = pc->temp_dist_l0[i], td = pc->temp_dist_l0[i] - pc->temp_dist_l1[0];
+            const int tx = (16384 + (td < 0 ? -td : td) / 2) / td, dsf = (tb * tx + 32) >> 6;
+            pc->dist_scale_factor[0][i] = (short)(dsf < -1024 ? -1024 : dsf > 1023 ? 1023 : dsf);
+        }
+        pc->diff_pic_order_cnt_zero[0] = 0xff00ff00u; pc->diff_pic_order_cnt_zero[1] = 0xff00fffeu;
+    } else if (!idr) { pc->diff_pic_order_cnt_zero[0] = pc->diff_pic_order_cnt_zero[1] = 0xfcfcfcfcu; }
     pc->frame_num = (unsigned short)e->frame_num; pc->pic_order_cnt_lsb = (unsigned short)(poc & 0xff);
     pc->slice_control_offset = OFF_SLICE; pc->me_control_offset = OFF_ME; pc->md_control_offset = OFF_MD; pc->q_control_offset = OFF_Q;
     pc->hist_buf_size = (unsigned)e->hist.size; pc->bitstream_buf_size = (unsigned)bs->size;
@@ -644,27 +649,13 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
 
     setup_me((void *)((NvU8 *)setup->cpu + OFF_ME), !idr);
     setup_md((void *)((NvU8 *)setup->cpu + OFF_MD), !idr, e->cfg.h264_profile == 100 || e->cfg.chroma444);
-    if (b) {                                                  // B: list 1 and bi partitions, spatial direct with B skip
-        nvenc_h264_md_control_s *md = (void *)((NvU8 *)setup->cpu + OFF_MD);
-        md->l1_part_16x16_enable = 1; md->l1_part_16x8_enable = 1; md->l1_part_8x16_enable = 1; md->l1_part_8x8_enable = 1;
-        md->bi_part_16x16_enable = 1; md->bi_part_16x8_enable = 1; md->bi_part_8x16_enable = 1; md->bi_part_8x8_enable = 1;
-        md->bdirect_mode = 1; md->bskip_enable = 1; md->pskip_enable = 0;
-        md->bdirect_bias_multiplier = 2;
-        if (getenv("ENC_BCOLOC")) {   // experiment: co-located hints for the B picture's motion search
-            nvenc_h264_me_control_s *me = (void *)((NvU8 *)setup->cpu + OFF_ME);
-            const int v = atoi(getenv("ENC_BCOLOC"));
-            me->predsrc.coloc_enable = 1; me->predsrc.coloc_search = 1; me->predsrc.coloc_refine = (v & 1);
-            if (v & 2) { me->predsrc.const_mv_stamp_l1 = 2; me->predsrc.self_temporal_search = 0; }
-            if (v & 4) { me->fbm_op_winner_num_b_frame_l0 = 2; me->fbm_op_winner_num_b_frame_l1 = 2; }
-        }
-        if (getenv("ENC_BX")) {   // experiments: direct mode, multiplier, bias
-            int a = 0, m = 2, bb = 2; sscanf(getenv("ENC_BX"), "%d,%d,%d", &a, &m, &bb);
-            if (a) md->bdirect_mode = (unsigned)a; md->bdirect_bias_multiplier = (short)m; md->bias_bdir = (short)bb;
-            if (a == 7) { md->bi_part_16x16_enable = md->bi_part_16x8_enable = md->bi_part_8x16_enable = md->bi_part_8x8_enable = 0; md->bdirect_mode = 1; }
-            if (a == 8) { md->l1_part_16x16_enable = md->l1_part_16x8_enable = md->l1_part_8x16_enable = md->l1_part_8x8_enable = 0; md->bdirect_mode = 1; }
-            if (a == 6) { md->bi_part_16x8_enable = md->bi_part_8x16_enable = md->bi_part_8x8_enable = 0; md->l1_part_16x8_enable = md->l1_part_8x16_enable = md->l1_part_8x8_enable = 0; md->bdirect_mode = 1; }
-            if (a == 9) { md->l1_part_16x16_enable = md->l1_part_16x8_enable = md->l1_part_8x16_enable = md->l1_part_8x8_enable = 0;
-                          md->bi_part_16x16_enable = md->bi_part_16x8_enable = md->bi_part_8x16_enable = md->bi_part_8x8_enable = 0; md->bdirect_mode = 0; md->bskip_enable = 0; }
+    if (e->cfg.quality || b) {   // NVIDIA's controls for this picture type (docs/traces/bframes-linux, -preset p4; size-independent):
+        NvU8 *base = setup->cpu;       // B pictures always (temporal direct, list 1 / bi partitions); I / P with EncConfig.quality
+        memcpy(base + OFF_ME, idr ? h264_tmpl_me_idr : b ? h264_tmpl_me_b : h264_tmpl_me_p, 0x100);
+        memcpy(base + OFF_MD, idr ? h264_tmpl_md_idr : b ? h264_tmpl_md_b : h264_tmpl_md_p, 0x100);
+        memcpy(base + OFF_Q, h264_tmpl_q, 0x100);
+        if (e->cfg.h264_profile == 100 || e->cfg.chroma444) {   // High: the 8x8 transform's intra modes (the trace is Main profile)
+            nvenc_h264_md_control_s *md = (void *)(base + OFF_MD); md->intra_luma8x8_mode_enable = 0x1ff;
         }
     }
     }
@@ -719,6 +710,10 @@ execute:
         chan_mthd(c, 0, NVC56F_NON_STALL_INTERRUPT, 1, 0u);
     }
     memset(status->cpu, 0, av1 ? 0x880 : 256);
+    if (getenv("ENC_DUMP_SETUP")) {   // diagnostics: each picture setup (with its controls) as DIR/encN.bin
+        char path[256]; snprintf(path, sizeof path, "%s/enc%u.bin", getenv("ENC_DUMP_SETUP"), payload);
+        FILE *df = fopen(path, "wb"); if (df) { fwrite(setup->cpu, 1, SETUP_SIZE, df); fclose(df); }
+    }
     e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = av1 ? e->sinceIdr : poc;
     e->pend[ds].t0 = now_ms(); e->pend[ds].slot = slot; e->pend[ds].nRefs = nRefs;
     for (int i = 0; i < nRefs; i++) e->pend[ds].refs[i] = e->slotOf[i];
