@@ -10,7 +10,7 @@ F=/usr/local/bin/ffmpeg
 LIB=$PWD/libnvencvt.dylib
 for p in $PARTS; do case $p in
   enc)   # every encoder at one target rate per resolution; VMAF too
-    for s in crowd60:1920:1080:300:6000000 park1080_60:1920:1080:300:6000000 crowd2160_60:3840:2160:120:20000000 park2160_60:3840:2160:120:20000000; do
+    for s in crowd60:1920:1080:300:6000000 park1080_60:1920:1080:300:6000000 crowd2160_60:3840:2160:300:20000000 park2160_60:3840:2160:300:20000000; do
       IFS=: read -r n w h fr rate <<< "$s"
       echo "SOURCE $n ${w}x${h} $fr frames at $rate bit/s"
       BENCH_VMAF=1 bash scripts/guest/bench-enc.sh "$S/$n.nv12" $w $h 50 $fr $rate | grep RESULT
