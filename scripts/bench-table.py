@@ -34,7 +34,8 @@ def num(x, d=1):
     except (TypeError, ValueError): return "-"
 
 for (name, size, frames, rate), r in enc.items():
-    print(f"\n#### {name} {size}, {frames} frames, target {rate / 1e6:g} Mbit/s\n")
+    pretty = re.sub(r"(_?\d+p?)?(_60)?$", "", name).replace("crowd", "crowd_run").replace("park", "park_joy")
+    print(f"\n#### {pretty} {size}, {frames} frames, target {rate / 1e6:g} Mbit/s\n")
     print("| encoder | fps | Mbit/s | PSNR-Y dB | VMAF |\n|---|---:|---:|---:|---:|")
     for k, label in ENC_NAMES.items():
         if k in r:
