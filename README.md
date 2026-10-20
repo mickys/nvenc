@@ -11,6 +11,9 @@ encoder, loaded by nullmoth's Metal plugin (since driver 2.3.7, its own `NVMTL_N
 Next: M5, GPU-resident input. Milestones and design: [docs/design.md](docs/design.md); step-by-step tasks with reports:
 [docs/tasks.md](docs/tasks.md).
 
+**Benchmarks:** every encoder and decoder against Apple's, NullMoth's and ffmpeg's, with usage examples and a findings log:
+[docs/benchmarks.md](docs/benchmarks.md).
+
 Why: the driver's own encoder library is Blackwell-only and closed. With a layout fix it runs on an RTX 4090, but a
 4K frame still costs ~9 ms in CPU copies, tiling and spin-waiting, the bitrate setting is ignored, and only one session
 per process works ([measurements](https://github.com/mickys/kvm-tahoe-nvidia/blob/main/docs/nvenc-enable-plan.md)).
@@ -41,6 +44,7 @@ Releases ship inside the [mickys overlay](https://github.com/mickys/nvidia-macos
 | `scripts/` | `prbdecode.py` (RM protobuf records), `trace2blob.py`, `mixsetup.py` (setup bisection) |
 | `docs/design.md` | sources, design, milestones, lessons per milestone |
 | `docs/tasks.md`, `docs/reports/` | the milestones split into tasks; one report per finished task |
+| `docs/benchmarks.md`, `docs/bench/` | benchmarks (living document with a findings log) and their raw results; `scripts/guest/bench-*.sh` run them |
 | `docs/traces/` | captures of a working NVENC client (picture setups, logs) |
 | `scripts/fetch-vendor.sh` | NVIDIA's open-gpu-kernel-modules (RM API, 610.57.04) and open-gpu-doc (NVENC docs) into `vendor/` |
 

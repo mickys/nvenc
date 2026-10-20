@@ -2,7 +2,26 @@
 
 Every encoder and decoder of this project against what else a Mac has: Apple's VideoToolbox codecs (software on this
 Mac), NullMoth's own NVIDIA decoders, and ffmpeg's software codecs (x264, x265, libaom, dav1d, libvpx, its own MPEG
-decoders). Measured 2026-10-20 with nvenc at commit `d19f650` + the T7.06 fix; raw results in `docs/bench/`.
+decoders). The tables below are the current baseline (2026-10-20, nvenc `d19f650` + the T7.06 fix); raw results are in
+`docs/bench/`. This is a living document: new measurements and findings go into the log right below, newest first, and the
+tables are replaced when a full run is repeated (see "Updating this document" at the end).
+
+## Findings log
+
+Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
+
+- **2026-10-20, baseline run** (`docs/bench/2026-10-20-{enc,dec,lat-8k}.txt`): every encoder and decoder on crowd_run / park_joy
+  at 1080p and 4K, real-time latency, 8K. Summary: our AV1 is the best quality at every size (VMAF 3-6 above x265 medium) at
+  6-16x x265's speed; H.264 between x264 veryfast and medium (1080p), at or above medium (4K); HEVC 5-8 VMAF behind x265.
+  Decoders 4-5x NullMoth's for H.264, on par for HEVC, 10x dav1d for AV1.
+- **2026-10-20, MPEG-4 Part 2 above 1920 wide:** pictures correct (55-57 dB) but every macroblock flagged and ~1.3 us per
+  macroblock (4K: 24 fps). Buffer sizes are not the cause. Open (docs/tasks.md T14.02).
+- **2026-10-20, uninjected ffmpeg HEVC was undecodable** (Apple's parameter sets with our slices; fixed in T7.06): found when the
+  "Apple HEVC" row came out at our speed with broken files.
+- **2026-10-20, VM stalls:** single encodes sometimes stall for seconds (seen as 4-10x slower runs at random); every encode now
+  runs twice and the faster time counts.
+- **2026-10-20, 10-bit decode output:** asking VideoToolbox for 8-bit output from a 10-bit stream adds a CPU conversion (about 5x
+  slower at 1080p); the decode benchmark asks for `x420`.
 
 ## Setup
 
@@ -239,6 +258,15 @@ NVDEC decoders for H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1, M
 nvenc-run ffmpeg -hwaccel videotoolbox -i in.mkv -f null -      # ffmpeg through VideoToolbox (our decoders)
 ```
 
+## Updating this document
+
+- **A new finding or a single measurement:** add a dated entry at the top of the findings log (what, numbers, how measured); put
+  any raw output in `docs/bench/<date>-<topic>.txt`.
+- **A full rerun** (new driver, new encoder version, other hardware): run `bench-all.sh` as below, save the output as
+  `docs/bench/<date>-<part>.txt`, regenerate the tables with `scripts/bench-table.py` and replace the tables and the "What this
+  shows" notes; keep the old raw files and say in the log entry what moved.
+- Keep the setup section true for the run the tables come from (machine, driver, commits, sources, rates).
+
 ## Reproduce
 
 In the guest, after `./build.sh nvencvt vtencfile vtdecode encodeN vp8decodeN`, with the sources as NV12 in `~/vt-streams/natural`
@@ -247,6 +275,7 @@ In the guest, after `./build.sh nvencvt vtencfile vtdecode encodeN vp8decodeN`, 
 ```sh
 bash scripts/guest/bench-all.sh enc dec lat 8k > results.txt    # about 1.5 hours
 python3 scripts/bench-table.py results.txt                        # the tables above
+python3 scripts/bench-table.py docs/bench/2026-10-20-*.txt        # the current tables from the stored results
 ```
 
 `scripts/guest/bench-enc.sh` / `bench-dec.sh` run one source with chosen encoders / codecs.
