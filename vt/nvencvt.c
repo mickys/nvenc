@@ -16,6 +16,7 @@
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <objc/runtime.h>
 #include <malloc/malloc.h>
 #include <mach-o/dyld.h>
@@ -934,6 +935,27 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
         LOG("GPU is not Ada (no NVENC class c9b7): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
+    // Not when the driver plugin was loaded from inside VTCompressionSessionCreate: VideoToolbox enumerates the Metal devices
+    // while it creates a session, which loads the plugin (and so registers us) in processes without a Metal device of their
+    // own (command-line tools). That session already has Apple's encoder and the next one would get ours: ffmpeg opens one
+    // session for the parameter sets and another for the frames, and wrote Apple's parameter sets with our slices
+    // (undecodable files; T7.06). Such processes keep Apple's encoders; nvenc-run (injection) registers before any session.
+    // NVENCVT_BT=1 logs the call stack, NVENCVT_LATE=1 registers anyway.
+    {
+        void *bt[64]; const int nb = backtrace(bt, 64); bool inCreate = false;
+        for (int i = 0; i < nb; i++) {
+            Dl_info di;
+            if (!dladdr(bt[i], &di)) continue;
+            if (getenv("NVENCVT_BT")) LOG("bt %d %s %s", i, di.dli_fname && strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : "?", di.dli_sname ? di.dli_sname : "?");
+            if (di.dli_sname && strstr(di.dli_sname, "VTCompressionSessionCreate")) inCreate = true;
+        }
+        if (inCreate && !getenv("NVENCVT_LATE")) {
+            LOG("loaded inside VTCompressionSessionCreate (%s): not registering the encoders", getprogname());
+            extern OSStatus NVDecVT_Register(int rating);
+            NVDecVT_Register(rating);
+            return kVTCouldNotFindVideoEncoderErr;
+        }
+    }
     // "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.7.0": codec, the card, this project and its version (git describe)
     char nameAvc[160], nameHevc[160], nameAv1[160];
     const char *ver = NVENC_VERSION[0] == 'v' ? NVENC_VERSION + 1 : NVENC_VERSION;
@@ -947,7 +969,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     CFStringRef n1 = CFStringCreateWithCString(NULL, nameAv1, kCFStringEncodingUTF8);
     OSStatus s1 = getenv("NVENCVT_NO_AV1") ? kVTCouldNotFindVideoEncoderErr : register_one(CODEC_AV1, CFSTR(ENCODER_ID_AV1), n1, rating);
     CFRelease(na); CFRelease(nh); CFRelease(n1);
-    LOG("registered %s -> %d, %s -> %d, %s -> %d (rating %d)", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, ENCODER_ID_AV1, (int)s1, rating);
+    LOG("registered %s -> %d, %s -> %d, %s -> %d (rating %d) in %s", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, ENCODER_ID_AV1, (int)s1, rating, getprogname());
     const char *ids[3] = { ENCODER_ID }, *names[3] = { nameAvc }, *codecs[3] = { "H.264" }; int nreg = 1;
     if (!sh) { ids[nreg] = ENCODER_ID_HEVC; names[nreg] = nameHevc; codecs[nreg++] = "HEVC"; }
     if (!s1) { ids[nreg] = ENCODER_ID_AV1; names[nreg] = nameAv1; codecs[nreg++] = "AV1"; }

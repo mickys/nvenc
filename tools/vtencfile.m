@@ -4,6 +4,7 @@
 //   ./vtencfile av01|hvc1|avc1 W H FRAMES out.ivf src.nv12      VT_BITRATE=<bit/s>  VT_10BIT=1 (x420 input)  VT_REALTIME=1
 //   VT_444=1: 444v input (x444 with VT_10BIT; HEVC 10-bit asks for Main10), src written as planar yuv444p (M13)
 //   VT_CBR=<bit/s>: ConstantBitRate  VT_MAXRATE=<bit/s>: DataRateLimits [rate / 8 bytes, 1 s] (VBR with AverageBitRate)
+//   VT_FPS=<n>: frame rate (default 60: timestamps, ExpectedFrameRate, the rate budget per frame)
 //   VT_HDR=pq|hlg: BT.2020 PQ (+ HDR metadata) / HLG colour properties
 //   VT_REORDER=1: AllowFrameReordering (B pictures; checks decode / presentation time stamps)  VT_SRC=<file.nv12>: frames
 //   from a raw NV12 file (looped) instead of the synthetic pattern  VT_KEYINT=<n>: MaxKeyFrameInterval
@@ -15,7 +16,7 @@
 #include <time.h>
 static double now(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1e9; }
 
-static int W, H, N; static FILE *gOut; static int gFrames; static bool gTen, g444; static OSType gPf; static FILE *gSrcIn;
+static int W, H, N; static FILE *gOut; static int gFrames; static bool gTen, g444; static OSType gPf; static FILE *gSrcIn; static int gFps = 60;
 static CMTime gLastDts; static int gBad, gReordered, gSync;
 
 static void fill(CVPixelBufferRef pb, int f, FILE *src)
@@ -118,10 +119,11 @@ int main(int argc, char **argv)
         if (argc < 7) { fprintf(stderr, "usage: vtencfile av01|hvc1|avc1 W H FRAMES out src.nv12\n"); return 2; }
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); (void)dev;   // the driver's plugin registers encoders then
         const char *cs = argv[1]; CMVideoCodecType codec = (CMVideoCodecType)((uint32_t)cs[0] << 24 | (uint32_t)cs[1] << 16 | (uint32_t)cs[2] << 8 | (uint32_t)cs[3]);
+        if (getenv("VT_FPS")) gFps = atoi(getenv("VT_FPS"));
         W = atoi(argv[2]); H = atoi(argv[3]); N = atoi(argv[4]); gTen = getenv("VT_10BIT") != NULL; g444 = getenv("VT_444") != NULL;
         if (getenv("VT_PF") && strlen(getenv("VT_PF")) == 4) { const char *q = getenv("VT_PF"); gPf = (OSType)q[0] << 24 | (OSType)q[1] << 16 | (OSType)q[2] << 8 | (OSType)q[3]; }
         gOut = fopen(argv[5], "wb"); FILE *src = fopen(argv[6], "wb");
-        if (codec == 'av01') { uint8_t ih[32] = "DKIF"; ih[6] = 32; memcpy(ih + 8, "AV01", 4); ih[12] = W; ih[13] = W >> 8; ih[14] = H; ih[15] = H >> 8; ih[16] = 60; ih[20] = 1; ih[24] = N; fwrite(ih, 1, 32, gOut); }
+        if (codec == 'av01') { uint8_t ih[32] = "DKIF"; ih[6] = 32; memcpy(ih + 8, "AV01", 4); ih[12] = W; ih[13] = W >> 8; ih[14] = H; ih[15] = H >> 8; ih[16] = (uint8_t)gFps; ih[20] = 1; ih[24] = N; fwrite(ih, 1, 32, gOut); }
         NSDictionary *spec = @{ (id)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES };
         OSType pf = gTen ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
         if (g444) pf = gTen ? kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange;
@@ -155,7 +157,7 @@ int main(int argc, char **argv)
         if (getenv("VT_KEYINT")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(atoi(getenv("VT_KEYINT"))));
         if (getenv("VT_SRC")) gSrcIn = fopen(getenv("VT_SRC"), "rb");
         if (getenv("VT_REALTIME")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-        VTSessionSetProperty(enc, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
+        VTSessionSetProperty(enc, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(gFps));
         CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(enc);
         double t0 = now();
         for (int f = 0; f < N; f++) {
@@ -163,7 +165,7 @@ int main(int argc, char **argv)
             if (g444 || gPf) CVPixelBufferCreate(NULL, W, H, pf, (__bridge CFDictionaryRef)pbAttr, &pb);   // the pool has the encoder's first format
             else CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb);
             fill(pb, f, src);
-            st = VTCompressionSessionEncodeFrame(enc, pb, CMTimeMake(f, 60), CMTimeMake(1, 60), NULL, NULL, NULL);
+            st = VTCompressionSessionEncodeFrame(enc, pb, CMTimeMake(f, gFps), CMTimeMake(1, gFps), NULL, NULL, NULL);
             CVPixelBufferRelease(pb);
             if (st) { printf("EncodeFrame %d -> %d\n", f, (int)st); break; }
         }
