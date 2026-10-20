@@ -86,7 +86,7 @@ static PendMap gPend[64]; static int gNPend;
 // ---- NVENC channels ----
 typedef struct {
     NvHandle client, h; NvU32 engineType; NvU64 gpfifoVa; NvU32 entries, cur; NvU64 *snap;
-    NvU32 subclass[8]; NvU32 state[0x1400 / 4]; NvU8 set[0x1400 / 4]; int execs;
+    NvU32 subclass[8]; NvU32 state[0x1400 / 4]; NvU8 set[0x1400 / 4]; int execs; int dec;
 } Chan;
 static Chan gChan[16]; static int gNChan; static int gExecs;
 typedef struct { NvHandle client, h; NvU64 gpfifoVa; NvU32 entries; } ChanInfo;
@@ -117,6 +117,99 @@ static const char *nvenc_name(NvU32 m)
     return "";
 }
 static int is_addr_method(NvU32 m) { return (m >= 0x400 && m < 0x4c8) || (m >= 0x708 && m < 0x780 && m != 0x704); }
+
+// NVDEC (classes 0xXXb0; names from open-gpu-doc clc5b0.h, Turing): 0x4c8 is Ada's SET_INTRA_TOP_BUF_OFFSET (not in clc5b0)
+static const char *nvdec_name(NvU32 m)
+{
+    switch (m) {
+    case 0x000: return "SET_OBJECT";
+    case 0x100: return "NOP";
+    case 0x200: return "SET_APPLICATION_ID";
+    case 0x204: return "SET_WATCHDOG_TIMER";
+    case 0x240: return "SEMAPHORE_A";
+    case 0x244: return "SEMAPHORE_B";
+    case 0x248: return "SEMAPHORE_C";
+    case 0x24c: return "CTX_SAVE_AREA";
+    case 0x250: return "CTX_SWITCH";
+    case 0x300: return "EXECUTE";
+    case 0x304: return "SEMAPHORE_D";
+    case 0x400: return "SET_CONTROL_PARAMS";
+    case 0x404: return "SET_DRV_PIC_SETUP_OFFSET";
+    case 0x408: return "SET_IN_BUF_BASE_OFFSET";
+    case 0x40c: return "SET_PICTURE_INDEX";
+    case 0x410: return "SET_SLICE_OFFSETS_BUF_OFFSET";
+    case 0x414: return "SET_COLOC_DATA_OFFSET";
+    case 0x418: return "SET_HISTORY_OFFSET";
+    case 0x41c: return "SET_DISPLAY_BUF_SIZE";
+    case 0x420: return "SET_HISTOGRAM_OFFSET";
+    case 0x424: return "SET_NVDEC_STATUS_OFFSET";
+    case 0x428: return "SET_DISPLAY_BUF_LUMA_OFFSET";
+    case 0x42c: return "SET_DISPLAY_BUF_CHROMA_OFFSET";
+    case 0x430: return "SET_PICTURE_LUMA_OFFSET0";
+    case 0x434: return "SET_PICTURE_LUMA_OFFSET1";
+    case 0x438: return "SET_PICTURE_LUMA_OFFSET2";
+    case 0x43c: return "SET_PICTURE_LUMA_OFFSET3";
+    case 0x440: return "SET_PICTURE_LUMA_OFFSET4";
+    case 0x444: return "SET_PICTURE_LUMA_OFFSET5";
+    case 0x448: return "SET_PICTURE_LUMA_OFFSET6";
+    case 0x44c: return "SET_PICTURE_LUMA_OFFSET7";
+    case 0x450: return "SET_PICTURE_LUMA_OFFSET8";
+    case 0x454: return "SET_PICTURE_LUMA_OFFSET9";
+    case 0x458: return "SET_PICTURE_LUMA_OFFSET10";
+    case 0x45c: return "SET_PICTURE_LUMA_OFFSET11";
+    case 0x460: return "SET_PICTURE_LUMA_OFFSET12";
+    case 0x464: return "SET_PICTURE_LUMA_OFFSET13";
+    case 0x468: return "SET_PICTURE_LUMA_OFFSET14";
+    case 0x46c: return "SET_PICTURE_LUMA_OFFSET15";
+    case 0x470: return "SET_PICTURE_LUMA_OFFSET16";
+    case 0x474: return "SET_PICTURE_CHROMA_OFFSET0";
+    case 0x478: return "SET_PICTURE_CHROMA_OFFSET1";
+    case 0x47c: return "SET_PICTURE_CHROMA_OFFSET2";
+    case 0x480: return "SET_PICTURE_CHROMA_OFFSET3";
+    case 0x484: return "SET_PICTURE_CHROMA_OFFSET4";
+    case 0x488: return "SET_PICTURE_CHROMA_OFFSET5";
+    case 0x48c: return "SET_PICTURE_CHROMA_OFFSET6";
+    case 0x490: return "SET_PICTURE_CHROMA_OFFSET7";
+    case 0x494: return "SET_PICTURE_CHROMA_OFFSET8";
+    case 0x498: return "SET_PICTURE_CHROMA_OFFSET9";
+    case 0x49c: return "SET_PICTURE_CHROMA_OFFSET10";
+    case 0x4a0: return "SET_PICTURE_CHROMA_OFFSET11";
+    case 0x4a4: return "SET_PICTURE_CHROMA_OFFSET12";
+    case 0x4a8: return "SET_PICTURE_CHROMA_OFFSET13";
+    case 0x4ac: return "SET_PICTURE_CHROMA_OFFSET14";
+    case 0x4b0: return "SET_PICTURE_CHROMA_OFFSET15";
+    case 0x4b4: return "SET_PICTURE_CHROMA_OFFSET16";
+    case 0x4b8: return "SET_PIC_SCRATCH_BUF_OFFSET";
+    case 0x4bc: return "SET_EXTERNAL_MVBUFFER_OFFSET";
+    case 0x500: return "H264_SET_MBHIST_BUF_OFFSET";
+    case 0x540: return "VP8_SET_PROB_DATA_OFFSET";
+    case 0x544: return "VP8_SET_HEADER_PARTITION_BUF_BASE_OFFSET";
+    case 0x580: return "HEVC_SET_SCALING_LIST_OFFSET";
+    case 0x584: return "HEVC_SET_TILE_SIZES_OFFSET";
+    case 0x588: return "HEVC_SET_FILTER_BUFFER_OFFSET";
+    case 0x58c: return "HEVC_SET_SAO_BUFFER_OFFSET";
+    case 0x590: return "HEVC_SET_SLICE_INFO_BUFFER_OFFSET";
+    case 0x594: return "HEVC_SET_SLICE_GROUP_INDEX";
+    case 0x5c0: return "VP9_SET_PROB_TAB_BUF_OFFSET";
+    case 0x5c4: return "VP9_SET_CTX_COUNTER_BUF_OFFSET";
+    case 0x5c8: return "VP9_SET_SEGMENT_READ_BUF_OFFSET";
+    case 0x5cc: return "VP9_SET_SEGMENT_WRITE_BUF_OFFSET";
+    case 0x5d0: return "VP9_SET_TILE_SIZE_BUF_OFFSET";
+    case 0x5d4: return "VP9_SET_COL_MVWRITE_BUF_OFFSET";
+    case 0x5d8: return "VP9_SET_COL_MVREAD_BUF_OFFSET";
+    case 0x5dc: return "VP9_SET_FILTER_BUFFER_OFFSET";
+    case 0x600: return "OS_INTERRUPT_HALT_ENGINE";
+    case 0x700: return "OS_INTERRUPT_TRAP_NONSTALL";
+    case 0x4c8: return "SET_INTRA_TOP_BUF_OFFSET(c9b0)";
+    }
+    return "";
+}
+static int is_dec_addr(NvU32 m)
+{
+    if (m < 0x404 || m >= 0x800 || m == 0x40c || m == 0x594) return 0;
+    const char *n = nvdec_name(m);
+    return !*n || strstr(n, "OFFSET") != NULL;
+}
 
 static void mem_desc(NvU64 va)
 {
@@ -155,21 +248,24 @@ static void dump_unmapped(Mem *mm, NvU64 va, const char *dir, NvU32 m)
 static void on_execute(Chan *c, NvU32 data)
 {
     c->execs++; gExecs++;
-    L("  ==== EXECUTE #%d (global #%d, 0x%x) on channel 0x%08x, NVENC state:\n", c->execs, gExecs, data, c->h);
+    L("  ==== EXECUTE #%d (global #%d, 0x%x) on channel 0x%08x, %s state:\n", c->execs, gExecs, data, c->h, c->dec ? "NVDEC" : "NVENC");
     for (int i = 0; i < 0x1400 / 4; i++) {
         if (!c->set[i]) continue;
         NvU32 m = (NvU32)i * 4, v = c->state[i];
-        L("    %03x %-30s 0x%08x", m, nvenc_name(m), v);
-        if (is_addr_method(m)) { L("  -> 0x%llx ", (unsigned long long)v << 8); mem_desc((NvU64)v << 8); }
+        L("    %03x %-30s 0x%08x", m, c->dec ? nvdec_name(m) : nvenc_name(m), v);
+        if (c->dec ? is_dec_addr(m) : is_addr_method(m)) { L("  -> 0x%llx ", (unsigned long long)v << 8); mem_desc((NvU64)v << 8); }
         L("\n");
     }
-    void *ps = c->set[0x710 / 4] ? va2cpu((NvU64)c->state[0x710 / 4] << 8) : NULL;
+    const NvU32 psm = c->dec ? 0x404 : 0x710;
+    void *ps = c->set[psm / 4] ? va2cpu((NvU64)c->state[psm / 4] << 8) : NULL;
     if (ps) { L("    picture setup (4 KB, zero rows skipped):\n"); hexi("      ", ps, 0x1000); }
     else L("    picture setup not CPU-visible\n");
     const char *dir = getenv("NVTRACE_DIR");
     for (int i = 0; dir && i < 0x1400 / 4; i++) {
         NvU32 m = (NvU32)i * 4;
-        if (!c->set[i] || !is_addr_method(m)) continue;
+        if (!c->set[i] || !(c->dec ? is_dec_addr(m) : is_addr_method(m))) continue;
+        // NVTRACE_ONLY=404,5c0: dump only these methods' buffers (keeps up with a client that runs ahead)
+        if (getenv("NVTRACE_ONLY")) { char mm3[8]; snprintf(mm3, sizeof mm3, "%03x", m); if (!strstr(getenv("NVTRACE_ONLY"), mm3)) continue; }
         NvU64 va = (NvU64)c->state[i] << 8; Mem *mm = mem_by_gpu(va); void *b = va2cpu(va);
         if (mm && !b && getenv("NVTRACE_VIDMEM")) { dump_unmapped(mm, va, dir, m); continue; }
         if (!mm || !b) continue;
@@ -189,9 +285,10 @@ static void decode_push(Chan *c, const NvU32 *p, NvU32 n)
             NvU32 d = op == 4 ? (h >> 16) & 0x1fff : p[i++];
             NvU32 m = op == 1 ? mthd + 4 * k : op == 5 && k ? mthd + 4 : mthd;
             if (m == 0) c->subclass[sub] = d;
-            int enc = (c->subclass[sub] & 0xff) == 0xb7;
-            L("    sc%u %03x %-30s 0x%08x%s\n", sub, m, enc || m < 0x100 ? nvenc_name(m) : "", d, op == 4 ? " (immd)" : "");
-            if (enc && m < 0x1400) { c->state[m / 4] = d; c->set[m / 4] = 1; if (m == 0x300) on_execute(c, d); }
+            int enc = (c->subclass[sub] & 0xff) == 0xb7, dec = (c->subclass[sub] & 0xff) == 0xb0;
+            L("    sc%u %03x %-30s 0x%08x%s\n", sub, m, dec ? nvdec_name(m) : enc || m < 0x100 ? nvenc_name(m) : "", d, op == 4 ? " (immd)" : "");
+            if (dec) c->dec = 1;
+            if ((enc || dec) && m < 0x1400) { c->state[m / 4] = d; c->set[m / 4] = 1; if (m == 0x300) on_execute(c, d); }
         }
     }
 }
@@ -239,7 +336,7 @@ static void log_alloc(const char *who, NvHandle client, NvHandle parent, NvHandl
 {
     if (!status && (cls == 0x3e || cls == 0x40 || cls == 0x71)) { Mem *x = mem_get(client, obj, 1); x->parent = parent; x->ctlFd = gCurFd; }
     L("ALLOC %-24s client 0x%08x parent 0x%08x new 0x%08x class 0x%04x size %u -> 0x%x\n", who, client, parent, obj, cls, psz, status);
-    if ((cls & 0xff) == 0xb7 && !status) {   // NVENC object (no parameters): follow its channel
+    if (((cls & 0xff) == 0xb7 || (cls & 0xff) == 0xb0) && !status) {   // NVENC / NVDEC object: follow its channel
         for (int i = gNAll - 1; i >= 0; i--) if (gAll[i].client == client && gAll[i].h == parent && gNChan < 16) {
             Chan *c = &gChan[gNChan++]; memset(c, 0, sizeof *c);
             c->client = client; c->h = parent; c->gpfifoVa = gAll[i].gpfifoVa; c->entries = gAll[i].entries;

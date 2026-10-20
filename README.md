@@ -1,6 +1,6 @@
 # nvenc
 
-Hardware video encoders and decoders for macOS on NVIDIA RTX 40 (Ada) GPUs, running on
+Hardware video encoders and decoders for macOS on NVIDIA RTX 40 (Ada) GPUs and the GTX 1650 (TU117), running on
 [NullMoth's NVIDIA driver](https://github.com/nullmoth/nvidia-macos-driver) and offered to apps through VideoToolbox.
 It drives the GPU's NVENC and NVDEC engines directly from user space (an RM client, GPFIFO channels and NVIDIA's
 documented picture setups), with no closed codec library in between.
@@ -9,6 +9,10 @@ documented picture setups), with no closed codec library in between.
 |---|---|
 | **Encode** (NVENC) | H.264 (Main / High, CABAC, 4:4:4, lossless, up to 8K), HEVC (Main, Main 10, 4:4:4, lossless), AV1 (8 / 10-bit, tiles up to 8K) |
 | **Decode** (NVDEC) | H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1 (8 / 10-bit, film grain), MPEG-1/2, MPEG-4 Part 2 through VideoToolbox; VP8 and VC-1 in the library and tools only (nothing on macOS asks VideoToolbox for them) |
+
+On the GTX 1650 (TU117, the only Turing card tested; other RTX 20 / 30 cards keep NullMoth's encoders): no AV1 (the
+hardware has none), HEVC encodes without B pictures (NVENC 6.6 has none), VP9 decodes from 65x65 up; details in
+[docs/tasks.md](docs/tasks.md) M15.
 
 Encoders: B pictures (two between anchors; real-time sessions stay P-only), CBR / VBR with NVIDIA's rate-control
 settings, quality presets taken from NVIDIA's own driver where the frame rate allows, colour description and HDR10

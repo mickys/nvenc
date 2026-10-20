@@ -24,7 +24,7 @@ typedef struct {
     int seg_prev, mv_prev;          // which seg[] holds PrevSegmentIds, which colmv[] the previous frame's MVs
     int last_w, last_h, last_show;  // the previous decoded frame (compute_image_size, 7.2.6)
     bool have_last;
-    bool seg_warned;                // the segmentation map warning was printed (Turing)
+    bool turing;                    // NVDEC 0xc4b0 (GTX 1650): no SET_INTRA_TOP_BUF_OFFSET
     size_t flt_above, flt_bsd;      // offsets in the filter buffer
     NvU32 semval;
     bool verbose;

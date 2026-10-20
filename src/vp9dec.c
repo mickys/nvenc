@@ -19,6 +19,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     memset(d, 0, sizeof *d);
     d->rm = rm; d->maxW = (maxW + 63) & ~63u; d->maxH = (maxH + 63) & ~63u;
     d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1;
+    d->turing = rm_class(rm, RM_CLS_NVDEC) == 0xc4b0;
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     for (int i = 0; i < 8; i++) d->ref[i] = -1;
     vp9_init(&d->st);
@@ -26,9 +27,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "vp9dec: channel failed\n"); return -1; }
     const size_t sbs = (size_t)(d->maxW / 64) * (d->maxH / 64);
     // sizes measured (T10.02): column MVs 1024 bytes per superblock, the intra top line ~4 bytes per pixel of width
-    // (15 352 at 3840; 8 per pixel allocated for 10-bit), the filter "above" area ~57 bytes per row at 4K. Turing's NVDEC
-    // (GTX 1650, 0xc4b0) fills the intra top buffer with 32 bytes per superblock (8 and 10-bit), and faulted (no completion)
-    // once that passed the end: 2048x1088, 1280x1440 and 4K failed, 1920x1080 fitted in the page rounding
+    // (15 352 at 3840; 8 per pixel allocated for 10-bit), the filter "above" area ~57 bytes per row at 4K
     // filter buffer: deblocking top + left lines (nvdec_drv.h's sizes), then the filter "above" and BSD control areas,
     // whose sizes the headers do not give (generous: 16 bytes per row per tile column, 64 tile columns; 4 per row)
     const size_t top = VP9_DBLK_TOP_BUF_SIZE(d->maxW), left = VP9_DBLK_LEFT_BUF_SIZE(d->maxH);
@@ -40,7 +39,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
         { &d->setup, 0x2000 }, { &d->bs, bsCap }, { &d->probs, sizeof(nvdec_vp9EntropyProbs_t) },
         { &d->counts, sizeof(nvdec_vp9EntropyCounts_t) }, { &d->seg[0], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE },
         { &d->seg[1], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE }, { &d->tiles, 0x1000 }, { &d->colmv[0], sbs * 1024 },
-        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps + sbs * 32 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
+        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "vp9dec: alloc failed\n"); return -1; }
         memset(b[i].m->cpu, 0, b[i].m->size);
@@ -196,17 +195,8 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     if (f->width > 8192 || f->height > 8192) { fprintf(stderr, "vp9dec: %dx%d is beyond NVDEC's VP9 limit (8192)\n", f->width, f->height); return -1; }
     // Turing's NVDEC (GTX 1650, 0xc4b0) answers status 0x10 for frames of one superblock row or column (NVIDIA lists 128x128
     // as VP9's minimum; 66x66 and larger decode bit-exact); Ada decodes down to 8x8
-    const bool turing = rm_class(d->rm, RM_CLS_NVDEC) == 0xc4b0;
-    if (turing && (f->width <= 64 || f->height <= 64)) {
+    if (d->turing && (f->width <= 64 || f->height <= 64)) {
         fprintf(stderr, "vp9dec: %dx%d is below this engine's VP9 minimum (65x65)\n", f->width, f->height); return -1; }
-    // Turing also decodes a frame that keeps the previous segmentation map (segmentation_update_map 0) as if segmentation were
-    // off: the same pictures whatever the segment buffers hold (wrong quantizers with alternate Q, broken parsing with the skip
-    // feature; libvpx vectors 15-segkey_adpq, 19-skip). Nothing in the setup changed it; said once per session.
-    if (turing && f->seg_enabled && !f->seg_update_map && !d->seg_warned) {
-        bool feat = false;
-        for (int i = 0; i < 8; i++) for (int j = 0; j < 4; j++) feat |= d->st.seg_feature_enabled[i][j] != 0;
-        if (feat) { fprintf(stderr, "vp9dec: frames keeping the segmentation map decode with segment 0 on this engine\n"); d->seg_warned = true; }
-    }
     if ((unsigned)f->width > d->maxW || (unsigned)f->height > d->maxH) { fprintf(stderr, "vp9dec: %dx%d is larger than the session\n", f->width, f->height); return -1; }
     if (!f->subsampling_x || !f->subsampling_y) { fprintf(stderr, "vp9dec: only 4:2:0 (NVDEC has no VP9 4:2:2 / 4:4:4)\n"); return -1; }
     if (f->bit_depth != d->bit_depth) { fprintf(stderr, "vp9dec: %d-bit frame in a %d-bit session\n", f->bit_depth, d->bit_depth); return -1; }
@@ -297,7 +287,10 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     chan_mthd(c, 0, NVC9B0_VP9_SET_COL_MVWRITE_BUF_OFFSET, 1, hi(d->colmv[d->mv_prev ^ 1].gpu));
     chan_mthd(c, 0, NVC9B0_VP9_SET_COL_MVREAD_BUF_OFFSET, 1, hi(d->colmv[d->mv_prev].gpu));
     chan_mthd(c, 0, NVC9B0_VP9_SET_FILTER_BUFFER_OFFSET, 1, hi(d->filter.gpu));
-    chan_mthd(c, 0, NVC9B0_SET_INTRA_TOP_BUF_OFFSET, 1, hi(d->intra.gpu));    // without it: MMU fault at address 0 (T10.02)
+    // Ada: without it an MMU fault at address 0 (T10.02). Turing's class (0xc4b0) has no such method and NVIDIA's Linux driver
+    // sends none (docs/traces/vp9dec-gtx1650-linux); given one, that engine used the buffer as 32 bytes per superblock, decoded
+    // frames that keep the segmentation map as if segmentation were off and faulted when the buffer was smaller than that
+    if (!d->turing) chan_mthd(c, 0, NVC9B0_SET_INTRA_TOP_BUF_OFFSET, 1, hi(d->intra.gpu));
     const int sfc[4] = { rs[0], rs[1], rs[2], surf };          // VP9_LAST/GOLDEN/ALTREF/CURR_FRAME_SFC
     for (int i = 0; i < 4; i++) {
         chan_mthd(c, 0, NVC9B0_SET_PICTURE_LUMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->luma[sfc[i]].gpu));
