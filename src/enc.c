@@ -756,6 +756,9 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
         r->Ravg = r->R = (int)(perFrame / pixels * 256);       // bits per pixel per frame, 23.8
         if (e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17) r->R = (int)((double)e->cfg.max_bitrate / e->cfg.fps / pixels * 256);   // VBR: R = maximum (as HEVC)
         r->Bmin = 0; r->iSizeRatioX = 1; r->iSizeRatioY = 1;
+        // NVIDIA's CBR fields, as for HEVC (docs/traces/quality-linux hcbr, T7.08): with 2 B pictures +0.7-0.8 VMAF
+        r->hrd_type = 34; r->rhopbi[0] = 286; r->rhopbi[1] = 317; r->rhopbi[2] = 256;
+        r->Np = e->cfg.idr_period > 0 ? e->cfg.idr_period - 1 : 0x7fffffff; r->Bmin = (int)(r->buffersize / 81920); r->Ravg = 0;
         // single_frame_VBV stays 0: set to 1 (with a one-frame VBV) the rate went to 3x the target at QP 5 (T3.08). A
         // one-frame VBV by itself works: frames stay under bitrate/fps.
     }
