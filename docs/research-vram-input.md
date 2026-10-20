@@ -365,3 +365,21 @@ No difference at these sizes: both hold the display rate, and WindowServer's tot
 patch moves some of it from user to system time). The gain is specific to large (4K-class) CPU-drawn windows. A
 native 1080p@60 desktop would lift the 50 Hz cap; NVRMFB only offers rasters at or above the firmware's (4K here),
 hence the fork-only `nvfbsmall=1` experiment.
+
+## Driver 2.4.3: still worth it? (2026-10-20)
+
+Yes, for large windows: NullMoth 2.4.x changed nothing on the surface-in path. `vm/tahoe/bench/desk-ab.sh`, stock 2.4.3 plugin
+against the release build of fork `dev` (2.4.3 + 4868217, overlay `v2.4.3-mickys.1 --desktop`), passes alternating stock /
+ours, 3 x 20 s each, Safari `motion.html`; logs `notes/desk-ab-20261020-1650.log` (full screen) and `-1700.log` (3200x1800).
+
+| window | plugin | updates/s (6 samples) | WindowServer CPU | WebKit GPU process |
+|---|---|---|---|---|
+| 3840x2110 (full screen) | stock 2.4.3 | 20.6 (20.5-20.9) | 73 % | 459 % |
+| 3840x2110 (full screen) | ours | 34.6 (33.9-35.6), +67 % | 55 % | 255 % |
+| 3200x1800 | stock 2.4.3 | 40.3 (39.0-42.5) | 58 % | 215 % |
+| 3200x1800 | ours | 42.9 (42.4-43.6), +6 % | 55 % | 198 % |
+
+The same as on 2.3.7 (20.9 -> 34.3 full screen, 40.5 -> 40.9 at 3200x1800). Measurement traps found on the way: after a
+relogin the guest session now comes back locked (`CGSSessionScreenIsLocked`; the lock screen's animated wallpaper then
+gives ~41 updates/s with Safari idle, and the display sleeps after a while, reading 0); `desk-run.sh` keeps the display
+awake and `desk-ab.sh` unlocks through QMP when needed.
