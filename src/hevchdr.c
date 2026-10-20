@@ -57,7 +57,7 @@ size_t hevc_write_vps(const HevcParams *p, uint8_t *out)
     put(&b, 0xffff, 16);                                        // vps_reserved_0xffff_16bits
     profile_tier_level(&b, level(p), p->bit_depth > 8, p->chroma444);
     put(&b, 1, 1);                                              // vps_sub_layer_ordering_info_present_flag
-    ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, 0); ue(&b, 0);   // max_dec_pic_buffering_minus1, no reorder, no latency limit
+    ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, (unsigned)p->num_reorder); ue(&b, 0);   // max_dec_pic_buffering_minus1, reorder, no latency limit
     put(&b, 0, 6); ue(&b, 0);                                   // vps_max_layer_id, vps_num_layer_sets_minus1
     put(&b, 0, 1);                                              // vps_timing_info_present_flag
     put(&b, 0, 1);                                              // vps_extension_flag
@@ -83,7 +83,7 @@ size_t hevc_write_sps(const HevcParams *p, uint8_t *out)
     ue(&b, bd); ue(&b, bd);                                     // bit depth luma / chroma - 8
     ue(&b, (unsigned)p->log2_max_poc_lsb_minus4);
     put(&b, 1, 1);                                              // sps_sub_layer_ordering_info_present_flag
-    ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, 0); ue(&b, 0);
+    ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, (unsigned)p->num_reorder); ue(&b, 0);
     ue(&b, 1); ue(&b, 1);                                       // min CB 16 (log2 - 3 = 1), max CB 32 (diff 1)
     ue(&b, 0); ue(&b, 3);                                       // min TB 4 (log2 - 2 = 0), max TB 32 (diff 3)
     ue(&b, 3); ue(&b, 3);                                       // max_transform_hierarchy_depth inter / intra

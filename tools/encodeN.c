@@ -62,7 +62,7 @@ int main(int argc, char **argv)
         fwrite(ih, 1, 32, fh);
     }
     uint8_t *y = malloc((size_t)W * H), *uv = malloc((size_t)W * CH);
-    if (cfg.bframes > 0 && !av1 && !hevc) {   // BFRAMES=n (H.264): IDR, then each anchor followed by the n B pictures before it
+    if (cfg.bframes > 0 && !av1) {   // BFRAMES=n (H.264, HEVC): IDR, then each anchor followed by the n B pictures before it
         for (int f = 0; f < N; f++) { frame(y, uv, W, H, f); fwrite(y, 1, (size_t)W * H, fs); fwrite(uv, 1, (size_t)W * CH, fs); }
         int fails = 0; double bits = 0, ms = 0; int prev = 0, coded = 0;
         for (int a = 0; a < N && !fails; ) {   // a: the next anchor in display order

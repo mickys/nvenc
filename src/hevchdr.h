@@ -12,6 +12,7 @@ typedef struct {
     int level_idc;                  // 30 x level (93 = 3.1, 123 = 4.1, 153 = 5.1); 0 = from the picture size at 60 fps
     int log2_max_poc_lsb_minus4;    // 4 (as nullmoth's)
     int max_dec_pic_buffering;      // DPB size in pictures (references + current)
+    int num_reorder;                // sps_max_num_reorder_pics (B pictures: 1)
     int sps_rps_negative;           // pictures in the SPS's one short-term RPS (deltas 1, none used by the current picture)
     int num_ref_idx_l0_default;     // PPS default active references in list 0
     int pic_init_qp;                // 26 + init_qp_minus26
