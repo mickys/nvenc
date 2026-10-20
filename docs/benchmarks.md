@@ -2,15 +2,25 @@
 
 Every encoder and decoder of this project against what else a Mac has: Apple's VideoToolbox codecs (software on this
 Mac), NullMoth's own NVIDIA decoders, and ffmpeg's software codecs (x264, x265, libaom, dav1d, libvpx, its own MPEG
-decoders). The tables below are from the full run of 2026-10-20 (nvenc `e29f761`: T7.06 to T7.08, 300 frames at 4K), with our encoder rows
-re-measured after T7.09 (nvenc `def6292`); raw results are in `docs/bench/` (`2026-10-20-rerun.txt`, `2026-10-20-ours-t709.txt`;
-the first baseline: `2026-10-20-{enc,dec,lat-8k}.txt`). This is a living document: new measurements and findings go into the log right below, newest first, and the
-tables are replaced when a full run is repeated (see "Updating this document" at the end).
+decoders), **per card**: the RTX 4090 (Ada) and the GTX 1650 (TU117). Raw results are in `docs/bench/`, named by date and
+part. This is a living document: new measurements and findings go into the log right below, newest first, and a card's
+tables are replaced when its full run is repeated (see "Updating this document" at the end).
+
+| card | encoders (VideoToolbox) | decoders (VideoToolbox) | sections |
+|---|---|---|---|
+| RTX 4090 (Ada: NVENC 8.2 x2, NVDEC 0xc9b0) | H.264, HEVC (8 / 10-bit), AV1 (8 / 10-bit); B pictures; up to 8K | H.264, HEVC, VP9, AV1, MPEG-1/2, MPEG-4 Part 2 (+ VP8, VC-1 in the library) | encode, decode, latency, 8K |
+| GTX 1650 (TU117: NVENC 6.6 x1, NVDEC 0xc4b0) | H.264 (B pictures), HEVC (8 / 10-bit, P only); one reference picture; no AV1 | the same without AV1; VP9 from 65x65 | encode, decode, latency |
+
 
 ## Findings log
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, GTX 1650 encode benchmark and per-card layout:** the document is now split per card. On the GTX 1650: H.264 with B
+  pictures level with x264 medium (1080p) and above it (4K) as on the 4090; HEVC (P only on NVENC 6.6) 59.1 / 60.5 VMAF at 1080p
+  vs x265 fast 61.6 / 65.7; real-time latency 4.2-4.5 ms (1080p) / 15-17 ms (4K). Found on the way: ffmpeg `-bf 2` with HEVC on
+  this card failed with "DTS is invalid" (libnvencvt wrote no decode time stamp without reordering; fixed in 3fd516d), and HEVC
+  Main 10 is 2.6-3.9 VMAF below 8-bit on NVENC 6.6. `docs/bench/2026-10-21-gtx1650-enc-lat.txt`.
 - **2026-10-21, HEVC quality on the GTX 1650 (T15.06):** P only (no HEVC B pictures on NVENC 6.6), 1080p at 6 Mbit/s: 55.2 /
   56.6 VMAF (crowd_run / park_joy) vs x265 fast 56.9 / 61.4, and vs x265 fast without B pictures 55.0 / 58.2 at 12-16 % more
   rate. Nothing tried helped (NVIDIA's own controls for this card, quality controls, two-pass, references, AQ, VBV, I/P QP
@@ -18,7 +28,7 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
   `docs/bench/2026-10-21-gtx1650-hevc-quality.txt`.
 - **2026-10-20, GTX 1650 (TU117) decoders (T15):** after the Turing fixes (HEVC filter areas, VP9 intra buffer) every
   decoder but AV1 (none on TU117) runs through VideoToolbox. Ours vs NullMoth's: H.264 447 / 154 fps at 1080p, 121 / 36 at 4K;
-  HEVC 609 / 574 and 183 / 192; HEVC Main 10 level. VP9 4K 180 fps. Table in "Decode" below;
+  HEVC 609 / 574 and 183 / 192; HEVC Main 10 level. VP9 4K 180 fps. Table in "GTX 1650 (TU117)" > "Decode" below;
   `docs/bench/2026-10-20-gtx1650-dec.txt`.
 - **2026-10-20, HEVC 4K quality tier (T7.10):** NVIDIA's p7 controls without 8x8 coding units cost 10 ms per 4K frame (with
   them 22) for most of their gain; libnvencvt uses them where the full set does not keep up (4K up to ~80 fps). 4K 50 fps through
@@ -71,8 +81,12 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 ## Setup
 
 - **Machine:** macOS 26.7.1 (Tahoe) as a KVM guest on an AMD Ryzen 9 3950X (8 cores / 16 threads given to the guest, 32 GB),
-  with a GeForce RTX 4090 passed through (NullMoth's driver 2.3.7, PCIe 4.0 x8). Software encoders and decoders run on those
-  16 threads; ours run on NVENC / NVDEC with a little CPU for the frame copy.
+  one NVIDIA card passed through at a time (PCIe x8 slot). Software encoders and decoders run on those 16 threads, so their
+  rows only change between the card sections by run-to-run noise; ours run on NVENC / NVDEC with a little CPU for the frame
+  copy.
+  - **RTX 4090** tables: NullMoth's driver 2.3.7 (2026-10-20, nvenc `e29f761` / `def6292`, 4K HEVC after T7.10).
+  - **GTX 1650** tables: NullMoth's driver 2.4.3, overlay `v2.4.3-mickys.2` (nvenc 0.9.0 and later, 2026-10-20 / -21).
+
 - **Sources:** the first 59-60 frames of Xiph's `crowd_run` and `park_joy` (SVT test set; 1080p50 and 2160p50, both hard to
   code), looped to 300 frames. Every encoder gets the same frames and the same target rate (6 Mbit/s at 1080p,
   20 Mbit/s at 4K), with a 250-frame key interval.
@@ -85,7 +99,12 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
   less), 300 frames. Ours, NullMoth's and Apple's through VTDecompressionSession (`tools/vtdecode VTDECODE_SPEED`, frames released
   at once); ffmpeg's with 16 threads (wall time). VP8 has no VideoToolbox consumer: our CLI decoder's engine time.
 
-## Encode
+## RTX 4090 (Ada)
+
+GeForce RTX 4090 (AD102): two NVENC engines (8.2, class 0xc9b7), one NVDEC exposed (0xc9b0). Raw results: `docs/bench/2026-10-20-rerun.txt`,
+`2026-10-20-ours-t709.txt`, `2026-10-20-hevc4k-t710.txt` (encode), `2026-10-20-dec.txt` / the rerun (decode), `2026-10-20-lat-8k.txt`.
+
+### Encode
 
 #### crowd_run 1920x1080, 300 frames, target 6 Mbit/s
 
@@ -184,7 +203,7 @@ HEVC rows after T7.10, `docs/bench/2026-10-20-hevc4k-t710.txt`):
   6-second clips (before T7.09: 7-9 %), AV1 with B pictures 2-7 % over; x264 / x265 within 2-5 %.
 - Apple's VideoToolbox encoders run in software on this Mac (no Apple video hardware in a VM): 50 fps H.264, 6-7 fps HEVC at 1080p.
 
-## Decode
+### Decode
 
 #### Decode 1920x1080 (frames per second)
 
@@ -225,9 +244,127 @@ What this shows:
 - 10-bit decodes are measured with 10-bit output (`x420`); asking for 8-bit output adds a CPU conversion in VideoToolbox (about
   5x slower at 1080p).
 
-#### GTX 1650 (TU117), decode in frames per second
+### Real-time latency
 
-The same streams on a GTX 1650 (NVDEC 0xc4b0, one NVDEC; nvenc `628d0d6`; raw: `docs/bench/2026-10-20-gtx1650-dec.txt`).
+#### Real-time encode latency (encodeFrame to encoded frame, libnvencvt statistics)
+
+| codec | size | latency ms | engine ms |
+|---|---|---:|---:|
+| H.264 | 1920x1080 | 1.85 | 1.19 |
+| HEVC | 1920x1080 | 1.93 | 1.23 |
+| AV1 | 1920x1080 | 1.72 | 1.05 |
+| H.264 | 3840x2160 | 5.67 | 4.34 |
+| HEVC | 3840x2160 | 5.84 | 4.50 |
+| AV1 | 3840x2160 | 5.00 | 3.71 |
+
+From `VTCompressionSessionEncodeFrame` to the encoded frame in the app's callback, real time (2-frame VBV, P only); the engine
+part is the hardware time. AV1 is the fastest of the three on Ada.
+
+### 8K (7680x4320)
+
+| codec | encode ms / frame (engine) | decode fps (VideoToolbox) |
+|---|---:|---:|
+| AV1 | 14.3 | 64 |
+| HEVC | 16.1 | 66 |
+| H.264 | 15.3 | 11 (NullMoth's: NVDEC decodes H.264 up to 4096 wide, so ours declines) |
+
+The 4K `crowd_run` frames scaled up; encoded with `tools/encodeN` (AV1 with 4 tiles), decoded through VideoToolbox.
+
+## GTX 1650 (TU117)
+
+ASUS Phoenix GeForce GTX 1650 OC 4 GB (TU117): one NVENC (6.6, class 0xb4b7, the Volta generation), one NVDEC (0xc4b0). The
+hardware has no AV1 (encode or decode), no HEVC B pictures and one reference picture (NVIDIA's driver reports the same;
+docs/tasks.md M15). NullMoth has no encoder for it, so the encode tables compare ours with the software encoders only.
+
+### Encode
+
+#### crowd_run 1920x1080, 300 frames, target 6 Mbit/s
+
+| encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
+|---|---:|---:|---:|---:|
+| ours H.264, real time (P only) | 161 | 5.99 | 26.57 | 49.7 |
+| ours H.264 (2 B, quality) | 151 | 6.03 | 27.20 | 58.5 |
+| ours HEVC, real time | 147 | 5.99 | 27.15 | 58.7 |
+| ours HEVC (quality; P only on this card) | 172 | 6.01 | 27.09 | 59.1 |
+| ours HEVC Main 10 (quality; P only) | 203 | 6.02 | 26.53 | 55.2 |
+| Apple H.264 (software, VideoToolbox) | 49 | 6.27 | 25.74 | 47.0 |
+| Apple HEVC (software, VideoToolbox) | 7 | 6.58 | 27.57 | 61.8 |
+| x264 veryfast | 188 | 6.13 | 26.27 | 50.1 |
+| x264 medium | 86 | 6.14 | 26.55 | 57.6 |
+| x265 fast | 47 | 5.96 | 27.72 | 61.6 |
+| x265 medium | 45 | 5.93 | 27.55 | 60.9 |
+
+#### park_joy 1920x1080, 300 frames, target 6 Mbit/s
+
+| encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
+|---|---:|---:|---:|---:|
+| ours H.264, real time (P only) | 175 | 5.91 | 26.75 | 53.1 |
+| ours H.264 (2 B, quality) | 162 | 6.09 | 27.36 | 62.8 |
+| ours HEVC, real time | 165 | 5.90 | 27.23 | 60.5 |
+| ours HEVC (quality; P only on this card) | 199 | 6.06 | 27.24 | 60.5 |
+| ours HEVC Main 10 (quality; P only) | 199 | 6.06 | 26.83 | 57.8 |
+| Apple H.264 (software, VideoToolbox) | 53 | 6.23 | 25.53 | 45.8 |
+| Apple HEVC (software, VideoToolbox) | 6 | 6.42 | 27.52 | 62.8 |
+| x264 veryfast | 182 | 6.16 | 26.93 | 57.6 |
+| x264 medium | 79 | 6.18 | 26.83 | 63.4 |
+| x265 fast | 39 | 6.03 | 27.98 | 65.7 |
+| x265 medium | 34 | 6.04 | 27.92 | 65.8 |
+
+#### crowd_run 3840x2160, 300 frames, target 20 Mbit/s
+
+| encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
+|---|---:|---:|---:|---:|
+| ours H.264, real time (P only) | 59 | 20.02 | 30.69 | 62.0 |
+| ours H.264 (2 B, quality) | 46 | 20.56 | 31.20 | 68.1 |
+| ours HEVC, real time | 62 | 20.01 | 31.55 | 71.5 |
+| ours HEVC (quality; P only on this card) | 84 | 20.14 | 31.64 | 72.2 |
+| ours HEVC Main 10 (quality; P only) | 83 | 19.95 | 31.10 | 68.4 |
+| Apple H.264 (software, VideoToolbox) | 15 | 20.84 | 29.88 | 58.1 |
+| Apple HEVC (software, VideoToolbox) | 3 | 21.34 | 31.73 | 70.4 |
+| x264 veryfast | 50 | 20.59 | 29.20 | 52.6 |
+| x264 medium | 19 | 20.96 | 29.77 | 59.7 |
+| x265 fast | 18 | 19.87 | 31.92 | 72.1 |
+| x265 medium | 10 | 19.90 | 31.91 | 72.2 |
+
+#### park_joy 3840x2160, 300 frames, target 20 Mbit/s
+
+| encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
+|---|---:|---:|---:|---:|
+| ours H.264, real time (P only) | 61 | 19.82 | 30.68 | 61.8 |
+| ours H.264 (2 B, quality) | 40 | 20.57 | 31.00 | 67.8 |
+| ours HEVC, real time | 63 | 19.77 | 31.56 | 71.2 |
+| ours HEVC (quality; P only on this card) | 86 | 20.55 | 31.67 | 71.8 |
+| ours HEVC Main 10 (quality; P only) | 82 | 20.51 | 31.29 | 69.2 |
+| Apple H.264 (software, VideoToolbox) | 16 | 20.85 | 29.54 | 54.8 |
+| Apple HEVC (software, VideoToolbox) | 3 | 21.21 | 31.72 | 70.1 |
+| x264 veryfast | 46 | 20.83 | 30.08 | 59.1 |
+| x264 medium | 19 | 21.03 | 30.18 | 64.7 |
+| x265 fast | 16 | 20.42 | 32.13 | 74.1 |
+| x265 medium | 12 | 20.44 | 32.12 | 74.8 |
+
+Raw: `docs/bench/2026-10-21-gtx1650-enc-lat.txt` (nvenc 0.9.0 + 3fd516d; the 1080p HEVC quality rows re-run after that fix). The
+software rows are the same encoders on the same CPU as in the RTX 4090 section and agree with them within run-to-run noise.
+
+What this shows:
+- **Speed:** H.264 / HEVC 147-199 fps at 1080p and 46-86 fps at 4K end to end, about half the RTX 4090's at 1080p and 50-110 %
+  of it at 4K (one older NVENC; the 4090's 4K quality tier is slower). H.264 runs at 1.8-3.2x x264 medium's speed, HEVC at 3.6-8x
+  x265's and 25-30x Apple's software HEVC.
+  The quality rows run faster than real time because real time hands back every frame before taking the next one.
+- **H.264** with B pictures and the quality controls: level with x264 medium at 1080p (58.5 / 62.8 vs 57.6 / 63.4 VMAF) and well
+  above it at 4K (68.1 / 67.8 vs 59.7 / 64.7), about what the RTX 4090 gives (59.5 / 63.2, 69.1 / 68.7).
+- **HEVC** is P only on this card (no HEVC B pictures on NVENC 6.6), so quality mode adds only 0.0-0.7 VMAF over real time: 1080p
+  59.1 / 60.5 vs x265 fast 61.6 / 65.7 and the RTX 4090's 62.3 / 65.1 (with B pictures); 4K 72.2 / 71.8 vs x265 fast 72.1 / 74.1.
+  The limit is the missing B pictures (docs/tasks.md T15.06).
+- **HEVC Main 10 is 2.6-3.9 VMAF below 8-bit** here (0.4-0.55 dB PSNR, at the same rate), while on the RTX 4090 it is 0.4-1
+  above. At the same fixed QP the engine spends fewer bits and loses more quality in 10-bit (QP 34: 8 % fewer bytes, 1.7 dB
+  lower), from the first picture on (not drift); our setup matches NVIDIA's own Main 10 setup on this card, so this looks like
+  NVENC 6.6. Use 8-bit HEVC on this card unless the content needs 10-bit.
+
+### Decode
+
+#### Decode, frames per second
+
+The streams of the RTX 4090 decode tables on the GTX 1650 (nvenc `628d0d6`; raw: `docs/bench/2026-10-20-gtx1650-dec.txt`).
 TU117 has no AV1 decoder. NullMoth's H.264 / HEVC decoders work on it; its encoders do not.
 
 | codec | ours 1080p | NullMoth 1080p | Apple sw 1080p | ffmpeg sw 1080p | ours 4K | NullMoth 4K | Apple sw 4K | ffmpeg sw 4K |
@@ -246,31 +383,20 @@ TU117 has no AV1 decoder. NullMoth's H.264 / HEVC decoders work on it; its encod
 - **VP9:** only ours in hardware, 180 fps at 4K.
 - Roughly 40-65 % of the RTX 4090's rates (one older NVDEC).
 
-## Real-time latency
+### Real-time latency
 
 #### Real-time encode latency (encodeFrame to encoded frame, libnvencvt statistics)
 
 | codec | size | latency ms | engine ms |
 |---|---|---:|---:|
-| H.264 | 1920x1080 | 1.85 | 1.19 |
-| HEVC | 1920x1080 | 1.93 | 1.23 |
-| AV1 | 1920x1080 | 1.72 | 1.05 |
-| H.264 | 3840x2160 | 5.67 | 4.34 |
-| HEVC | 3840x2160 | 5.84 | 4.50 |
-| AV1 | 3840x2160 | 5.00 | 3.71 |
+| H.264 | 1920x1080 | 4.47 | 3.91 |
+| HEVC | 1920x1080 | 4.17 | 3.64 |
+| H.264 | 3840x2160 | 17.30 | 15.54 |
+| HEVC | 3840x2160 | 15.30 | 13.79 |
 
-From `VTCompressionSessionEncodeFrame` to the encoded frame in the app's callback, real time (2-frame VBV, P only); the engine
-part is the hardware time. AV1 is the fastest of the three on Ada.
-
-## 8K (7680x4320)
-
-| codec | encode ms / frame (engine) | decode fps (VideoToolbox) |
-|---|---:|---:|
-| AV1 | 14.3 | 64 |
-| HEVC | 16.1 | 66 |
-| H.264 | 15.3 | 11 (NullMoth's: NVDEC decodes H.264 up to 4096 wide, so ours declines) |
-
-The 4K `crowd_run` frames scaled up; encoded with `tools/encodeN` (AV1 with 4 tiles), decoded through VideoToolbox.
+The same measurement as on the RTX 4090 (2-frame VBV, P only, the frame back in the app's callback): 4.2-4.5 ms per 1080p
+frame and 15-17 ms per 4K frame (RTX 4090: 1.9 / 5.7). 1080p real time has plenty of headroom; 4K real time manages about
+60 fps.
 
 ## Examples
 
@@ -316,7 +442,7 @@ The repository's `tools/vtencfile` does the same from a raw NV12 file and writes
 
 ### OBS Studio
 
-Settings > Output > Recording (Advanced): Video Encoder "NVENC - H.264 / HEVC - (NVIDIA RTX 4090) - mickys/nvenc - <version>"
+Settings > Output > Recording (Advanced): Video Encoder "NVENC - H.264 / HEVC - (NVIDIA <card>) - mickys/nvenc - <version>"
 (OBS lists them as "Dynamically Registered ... Video Encoder" in some versions). Rate control CBR / VBR / CRF-like quality,
 B-frames on for recordings (off for streaming keeps the latency at one frame).
 
@@ -334,10 +460,12 @@ nvenc-run ffmpeg -hwaccel videotoolbox -i in.mkv -f null -      # ffmpeg through
 
 - **A new finding or a single measurement:** add a dated entry at the top of the findings log (what, numbers, how measured); put
   any raw output in `docs/bench/<date>-<topic>.txt`.
-- **A full rerun** (new driver, new encoder version, other hardware): run `bench-all.sh` as below, save the output as
-  `docs/bench/<date>-<part>.txt`, regenerate the tables with `scripts/bench-table.py` and replace the tables and the "What this
-  shows" notes; keep the old raw files and say in the log entry what moved.
-- Keep the setup section true for the run the tables come from (machine, driver, commits, sources, rates).
+- **A full rerun** (new driver, new encoder version): run `bench-all.sh` as below on that card, save the output as
+  `docs/bench/<date>-<card>-<part>.txt`, regenerate the tables with `scripts/bench-table.py` and replace that card's tables
+  and "What this shows" notes; keep the old raw files and say in the log entry what moved.
+- **Another card:** a new `## <card>` section with the same subsections (encode, decode, latency, 8K where the card has it),
+  a row in the table at the top, and its driver / commit in the setup section.
+- Keep the setup section true for the runs the tables come from (machine, driver, commits, sources, rates).
 
 ## Reproduce
 
@@ -345,9 +473,13 @@ In the guest, after `./build.sh nvencvt vtencfile vtdecode encodeN vp8decodeN`, 
 (`ffmpeg -i crowd_run_1080p50.y4m -frames:v 60 -pix_fmt nv12 -f rawvideo crowd60.nv12`, and so on):
 
 ```sh
-bash scripts/guest/bench-all.sh enc dec lat 8k > results.txt    # about 1.5 hours
+bash scripts/guest/bench-all.sh enc dec lat 8k > results.txt    # about 1.5 hours (RTX 4090: every part)
+# a card without AV1 (GTX 1650): those encoders and latency codecs only, no 8K
+BENCH_ENCODERS="ours-h264-rt ours-h264 ours-hevc-rt ours-hevc ours-hevc10 apple-h264 apple-hevc x264-veryfast x264-medium x265-fast x265-medium" \
+  BENCH_LAT_CODECS="avc1 hvc1" bash scripts/guest/bench-all.sh enc lat > results.txt
 python3 scripts/bench-table.py results.txt                        # the tables above
-python3 scripts/bench-table.py docs/bench/2026-10-20-*.txt        # the current tables from the stored results
+python3 scripts/bench-table.py docs/bench/2026-10-20-rerun.txt   # stored results, e.g. the RTX 4090 run
+python3 scripts/bench-table.py docs/bench/2026-10-21-gtx1650-enc-lat.txt
 ```
 
 `scripts/guest/bench-enc.sh` / `bench-dec.sh` run one source with chosen encoders / codecs.

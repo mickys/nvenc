@@ -3,6 +3,9 @@
 # RESULT lines (bench-enc.sh / bench-dec.sh formats, plus latency and 8K lines) to stdout; docs/benchmarks.md is made
 # from them. Sources: Xiph crowd_run / park_joy, first 60 frames as NV12 (1080p50 and 2160p50), looped.
 #   bench-all.sh [enc] [dec] [lat] [8k]     (default: all four parts)
+# BENCH_ENCODERS="..." limits the encoders (bench-enc.sh names), BENCH_LAT_CODECS="avc1 hvc1" the latency codecs; e.g. a
+# card without AV1 (GTX 1650): BENCH_ENCODERS="ours-h264-rt ours-h264 ours-hevc-rt ours-hevc ours-hevc10 apple-h264 apple-hevc
+# x264-veryfast x264-medium x265-fast x265-medium" BENCH_LAT_CODECS="avc1 hvc1" bench-all.sh enc lat
 set -uo pipefail
 S=$HOME/vt-streams/natural
 PARTS=${*:-enc dec lat 8k}
@@ -13,7 +16,7 @@ for p in $PARTS; do case $p in
     for s in crowd60:1920:1080:300:6000000 park1080_60:1920:1080:300:6000000 crowd2160_60:3840:2160:300:20000000 park2160_60:3840:2160:300:20000000; do
       IFS=: read -r n w h fr rate <<< "$s"
       echo "SOURCE $n ${w}x${h} $fr frames at $rate bit/s"
-      BENCH_VMAF=1 bash scripts/guest/bench-enc.sh "$S/$n.nv12" $w $h 50 $fr $rate | grep RESULT
+      BENCH_VMAF=1 bash scripts/guest/bench-enc.sh "$S/$n.nv12" $w $h 50 $fr $rate ${BENCH_ENCODERS:-} | grep RESULT
     done ;;
   dec)
     bash scripts/guest/bench-dec.sh "$S/crowd60.nv12" 1920 1080 50 300 crowd1080 | grep RESULT
@@ -21,7 +24,7 @@ for p in $PARTS; do case $p in
   lat)   # real-time sessions (as Parsec / OBS streaming): time from encodeFrame to the encoded frame, libnvencvt's statistics
     for s in crowd60:1920:1080 crowd2160_60:3840:2160; do
       IFS=: read -r n w h <<< "$s"
-      for c in avc1 hvc1 av01; do
+      for c in ${BENCH_LAT_CODECS:-avc1 hvc1 av01}; do
         rm -f /tmp/lat.log
         env DYLD_INSERT_LIBRARIES=$LIB NVENCVT_STATS=/tmp/lat.log VT_REALTIME=1 VT_FPS=60 VT_BITRATE=$(( w * h * 10 )) VT_SRC="$S/$n.nv12" \
           ./vtencfile $c $w $h 600 /tmp/lat.out /dev/null > /dev/null 2>&1
