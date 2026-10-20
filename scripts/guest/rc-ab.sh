@@ -12,6 +12,7 @@ FS=$((W * H * 3 / 2)); SRCN=$(( $(stat -f %z "$SRC") / FS )); LOOPS=$(( (N + SRC
 REF=$T/ref-$(basename "$SRC" .nv12)-${W}x${H}-$N.nv12
 [ -s "$REF" ] || $F -nostdin -v error -y -f rawvideo -pix_fmt nv12 -s ${W}x${H} -stream_loop $LOOPS -i "$SRC" -frames:v $N -f rawvideo "$REF"
 case $CODEC in hevc) a=(-hevc); fmt=hevc; q=(28 30) ;; av1) a=(-av1); fmt=ivf; q=(100 120) ;; *) a=(); fmt=h264; q=(26 28) ;; esac
+[ -n "${AB_Q:-}" ] && q=($AB_Q)   # AB_Q="I P": the QP pair (constant QP with AB_RC=0)
 R=(-f rawvideo -pix_fmt nv12 -s ${W}x${H} -r 60)
 for v in "$@"; do
   out=$(env $v SRC="$SRC" RC=${AB_RC:-18} BITRATE=$RATE IDR_PERIOD=${AB_GOP:-250} ${AB_ENV:-} ./encodeN ${a[@]+"${a[@]}"} $W $H $N "${q[@]}" ${AB_REFS:-1} $T/ab.bin /dev/null 2>&1)

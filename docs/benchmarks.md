@@ -11,6 +11,11 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, HEVC quality on the GTX 1650 (T15.06):** P only (no HEVC B pictures on NVENC 6.6), 1080p at 6 Mbit/s: 55.2 /
+  56.6 VMAF (crowd_run / park_joy) vs x265 fast 56.9 / 61.4, and vs x265 fast without B pictures 55.0 / 58.2 at 12-16 % more
+  rate. Nothing tried helped (NVIDIA's own controls for this card, quality controls, two-pass, references, AQ, VBV, I/P QP
+  offsets, non-reference P pictures): the encoder is at what P-only HEVC gives on this hardware.
+  `docs/bench/2026-10-21-gtx1650-hevc-quality.txt`.
 - **2026-10-20, GTX 1650 (TU117) decoders (T15):** after the Turing fixes (HEVC filter areas, VP9 intra buffer) every
   decoder but AV1 (none on TU117) runs through VideoToolbox. Ours vs NullMoth's: H.264 447 / 154 fps at 1080p, 121 / 36 at 4K;
   HEVC 609 / 574 and 183 / 192; HEVC Main 10 level. VP9 4K 180 fps. Table in "Decode" below;
