@@ -157,6 +157,21 @@ but no CDF table structure), and NVDEC does not initialise or adapt them itself.
 are public (`nvdec_vp9EntropyProbs_t`, `nvdec_vp9EntropyCounts_t`), so VP9 goes first; AV1 waits for a layout hypothesis
 to test (spec order, padded like VP9's tables).
 
+## M15: GTX 1650 (Turing TU117), 2026-10-20
+
+The RTX 4090 was swapped for an ASUS Phoenix GTX 1650 OC (TU117: NVENC 6.6 = class 0xb4b7, the Volta generation; NVDEC
+0xc4b0; host classes c46f / c461). NullMoth 2.4.3 has no encoder for it (its Turing encoders do not register), so ours fill
+the gap. User: "start with 1, move to 2 then 3" (1 = trace NVIDIA's Linux driver for the HEVC encode fault, 2 = decoder
+gaps, 3 = libnvencvt on TU117 + benchmark against NullMoth's decoders). Report: [reports/T15.md](reports/T15.md).
+
+| Task | What | Done when | Status |
+|---|---|---|---|
+| T15.01 | RM: use the classes the GPU has (`rm_class`: NVENC / NVDEC / channel / usermode from the class list; setup magic from the NVENC class) | probe, hello, dechello on the 1650 | done (7ef78f9) |
+| T15.02 | HEVC encode on NVENC 6.6 | P pictures, CBR, 1-3 refs, 4K, Main 10 decode cleanly | done (688821a): **references by DPB slot** (as H.264; Ada: by list position; the MMU fault on the second P picture), history 768 x CTB columns x (CTB rows + 1/2), **no HEVC B pictures** (NVIDIA's driver refuses them too); found by the fourth Linux-driver trace (`docs/traces/gtx1650-linux`). H.264 incl. B pictures and 4:4:4 (HEVC / H.264, lossless round trip exact) work unchanged |
+| T15.03 | Decoders on NVDEC 0xc4b0 | the suites as on Ada, or the gaps explained | done: **HEVC** x265 30/33 and conformance **178/186, the same 8 as on Ada** after two filter-buffer fixes (98150ab: filter-above / SAO-above by the larger dimension, Turing splits pictures wider than ~3072 into columns; SAO-left 8x, 3+ tile columns and rows ran into the BSD area); **VP9** 15/15 + libvpx vectors 27/29 (35c0218: the intra-top buffer holds 32 bytes per superblock on Turing, 4K faulted without; a0261ae: frames of 64 or less refused (status 0x10), and frames that keep the previous segmentation map decode as if segmentation were off: `15-segkey_adpq`, `19-skip`; no setup field, buffer or content changed that, our adapted probabilities match libvpx's, so an engine limit as far as the headers go); **H.264** JVT 172/175, **VP8** 19/19, **VC-1** 6/6 as on Ada; **AV1** refused (64934b2: NVDEC 0xc4b0 has none, nor NVENC 6.6) |
+| T15.04 | libnvencvt on TU117 | VideoToolbox encodes and decodes on the 1650 | done (628d0d6): registers on PCI IDs 0x1f80-0x1fff besides Ada (RM fallback: class 0xb4b7); AV1 encoder / decoder only on Ada; VP9 sessions of 64 or less refused; the session follows enc_open's B-picture decision (HEVC P-only); a second session falls back to NVENC0 when there is no NVENC1. H.264 / HEVC encodes (P, B for H.264, quality and fast controls) decode cleanly; decoding through VideoToolbox bit-exact against ffmpeg (Apple's software HEVC decoder itself varies from run to run on the last frames) |
+| T15.05 | Decoder benchmark against NullMoth's decoders on the 1650 | numbers in benchmarks.md | done (benchmarks.md "GTX 1650"): H.264 ours 447 / NullMoth 154 fps at 1080p, 121 / 36 at 4K; HEVC level (609 / 574, 183 / 192), HEVC Main 10 level; VP9 4K 180 fps (only ours); MPEG-2 / MPEG-4 / VP8 below ffmpeg's 16-thread software decoders, as on Ada |
+
 ## M11: HEVC decode
 
 Unlike VP9 and AV1, NVDEC parses HEVC slice data and slice headers itself (`nvdec_hevc_pic_s` is DXVA-like): the driver

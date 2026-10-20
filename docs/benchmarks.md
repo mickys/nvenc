@@ -11,6 +11,10 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, GTX 1650 (TU117) decoders (T15):** after the Turing fixes (HEVC filter areas, VP9 intra buffer) every
+  decoder but AV1 (none on TU117) runs through VideoToolbox. Ours vs NullMoth's: H.264 447 / 154 fps at 1080p, 121 / 36 at 4K;
+  HEVC 609 / 574 and 183 / 192; HEVC Main 10 level. VP9 4K 180 fps. Table in "Decode" below;
+  `docs/bench/2026-10-20-gtx1650-dec.txt`.
 - **2026-10-20, HEVC 4K quality tier (T7.10):** NVIDIA's p7 controls without 8x8 coding units cost 10 ms per 4K frame (with
   them 22) for most of their gain; libnvencvt uses them where the full set does not keep up (4K up to ~80 fps). 4K 50 fps through
   VideoToolbox: crowd_run 72.0 -> 72.6 VMAF, park_joy 72.0 -> 72.7 (Main 10 73.3 / 73.1), at 74-80 fps instead of 120-126.
@@ -215,6 +219,27 @@ What this shows:
   2032x2032; such streams are rare (ASP's highest level is 720x576).
 - 10-bit decodes are measured with 10-bit output (`x420`); asking for 8-bit output adds a CPU conversion in VideoToolbox (about
   5x slower at 1080p).
+
+#### GTX 1650 (TU117), decode in frames per second
+
+The same streams on a GTX 1650 (NVDEC 0xc4b0, one NVDEC; nvenc `628d0d6`; raw: `docs/bench/2026-10-20-gtx1650-dec.txt`).
+TU117 has no AV1 decoder. NullMoth's H.264 / HEVC decoders work on it; its encoders do not.
+
+| codec | ours 1080p | NullMoth 1080p | Apple sw 1080p | ffmpeg sw 1080p | ours 4K | NullMoth 4K | Apple sw 4K | ffmpeg sw 4K |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| H.264 | 447 | 154 | 90 | 580 | 121 | 36 | 25 | 170 |
+| HEVC | 609 | 574 | 336 | 290 | 183 | 192 | 190 | 164 |
+| HEVC Main 10 | 351 | 349 | 304 | 262 | 94 | 93 | 152 | 132 |
+| VP9 | 580 | - | - | 337 | 180 | - | - | 171 |
+| MPEG-2 | 528 | - | - | 1095 | 162 | - | - | 503 |
+| MPEG-4 Part 2 | 518 | - | - | 958 | 22 | - | - | 368 |
+| VP8 (engine time) | 735 | - | - | 867 | 174 | - | - | 354 |
+
+- **H.264:** 2.9-3.3x NullMoth's decoder on the same card, as on Ada.
+- **HEVC:** level with NullMoth's (+6 % at 1080p, -5 % at 4K); the card itself is the limit. At 4K, HEVC Main 10 runs at about 94 fps on
+  either hardware decoder, below Apple's and ffmpeg's software decoders on this 16-thread CPU.
+- **VP9:** only ours in hardware, 180 fps at 4K.
+- Roughly 40-65 % of the RTX 4090's rates (one older NVDEC).
 
 ## Real-time latency
 
