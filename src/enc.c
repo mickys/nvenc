@@ -680,7 +680,7 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, bool isB, int q
         r.buffersize = r.nal_cpb_size = r.vcl_cpb_size = (unsigned)e->cfg.vbv_bits;
         r.nal_bitrate = r.vcl_bitrate = (unsigned)(vbr ? e->cfg.max_bitrate : e->cfg.bitrate);
         r.gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
-        r.Np = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period - 1 : 0;
+        r.Np = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period - 1 : 0;   // as the driver (the anchor formula: -0.3 VMAF, T7.09)
         r.Ravg = (unsigned)(perFrame / pixels * 256); r.R = (unsigned)((double)r.nal_bitrate / e->cfg.fps / pixels * 256);
         r.Bmin = vbr ? 0 : r.buffersize / 81920;                     // the driver's CBR value (122 for a 10 Mbit buffer)
         r.i_size_ratio_x = 1; r.i_size_ratio_y = 1;

@@ -83,7 +83,11 @@ typedef struct {
     unsigned frames, errors;
     double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
+    // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
+    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
+    unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
 } DState;
+typedef struct OutJob OutJob;
 
 static DState *dstate(VTVideoDecoderRef o) { return *(DState **)CMBaseObjectGetDerivedStorage(o); }
 
@@ -165,10 +169,17 @@ static int open_vp9(DState *s, unsigned w, unsigned h, int depth)
 }
 
 // ---- base object ----
+static void out_drain(DState *s);
 static OSStatus b_invalidate(CMBaseObjectRef o)
 {
     DState *s = dstate(o); if (!s) return noErr;
     pthread_mutex_lock(&s->lock);
+    if (s->thrOn && !pthread_equal(pthread_self(), s->thr)) {   // the waiting pictures out, then the output thread ends
+        out_drain(s);
+        s->stop = true; pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->lock); pthread_join(s->thr, NULL); pthread_mutex_lock(&s->lock);
+        s->thrOn = false;
+    }
     if (s->opened) {
         if (s->codec == CODEC_VP9) { park_vp9(s->vrm, s->vp9); s->vrm = NULL; s->vp9 = NULL; }
         else if (s->codec == CODEC_AV1) { park_av1(s->vrm, s->av1); s->vrm = NULL; s->av1 = NULL; }
@@ -189,7 +200,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
 static void b_finalize(CMBaseObjectRef o)
 {
     DState *s = dstate(o); if (!s) return;
-    b_invalidate(o); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
+    b_invalidate(o); pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
     *(DState **)CMBaseObjectGetDerivedStorage(o) = NULL;
 }
 static CFStringRef b_desc(CMBaseObjectRef o)
@@ -482,6 +493,102 @@ static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRe
     return r;
 }
 
+// ---- output (T8.09) ----
+// A decoded picture is copied into its pixel buffer (untiled), emitted, and its surface released. Clients that allow
+// asynchronous decompression (kVTDecodeFrame_EnableAsynchronousDecompression: AVFoundation) get that from an output
+// thread while the engine decodes the next picture; synchronous ones (ffmpeg) inside decodeFrame. Every frame of an
+// asynchronous run goes through the queue (errors and dropped frames too), so they come out in decode order.
+static void out_copy(DState *s, OutJob *j)
+{
+    if (!j->pb || j->surf < 0 || j->res) return;
+    const double tc = nowms();
+    CVPixelBufferRef pb = j->pb;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    if (s->codec == CODEC_VP9) vp9dec_read_nv12(s->vp9, j->surf, y, ys, uv, uvs, j->w, j->h);
+    else if (s->codec == CODEC_AV1) av1dec_read_nv12(s->av1, j->surf, y, ys, uv, uvs, j->w, j->h);
+    else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_read_nv12(s->hevc, j->surf, y, ys, uv, uvs, j->w, j->h, j->cx, j->cy);
+    else if (is_mpeg12(s->codec)) mpeg2dec_read_nv12(s->m2, j->surf, y, ys, uv, uvs, j->w, j->h);
+    else if (s->codec == kCMVideoCodecType_MPEG4Video) mpeg4dec_read_nv12(s->m4, j->surf, y, ys, uv, uvs, j->w, j->h);
+    else h264dec_read_nv12(&s->dec, j->surf, y, ys, uv, uvs, j->w, j->h);
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
+    j->usCopy = (unsigned)((nowms() - tc) * 1000);
+}
+
+static void out_release(DState *s, const OutJob *j)   // lock held
+{
+    if (j->rel < 0) return;
+    if (s->codec == CODEC_VP9) vp9dec_release(s->vp9, j->rel);
+    else if (s->codec == CODEC_AV1) av1dec_release(s->av1, j->rel);
+    else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_release(s->hevc, j->rel);
+    else if (is_mpeg12(s->codec)) mpeg2dec_release(s->m2, j->rel);
+    else if (s->codec == kCMVideoCodecType_MPEG4Video) mpeg4dec_release(s->m4, j->rel);
+    else h264dec_release(&s->dec, j->rel);
+}
+
+static void out_emit(DState *s, OutJob *j)
+{
+    const double te = nowms();
+    VTDecoderSessionEmitDecodedFrame(s->session, j->frame, j->res, j->fl, j->pb);
+    if (j->pb) CVPixelBufferRelease(j->pb);
+    j->pb = NULL; j->usEmit = (unsigned)((nowms() - te) * 1000);
+}
+
+static void *out_thread(void *arg)
+{
+    DState *s = arg;
+    pthread_mutex_lock(&s->lock);
+    for (;;) {
+        while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->lock);
+        if (s->qh == s->qt) break;
+        OutJob j = s->q[s->qh % 4];
+        pthread_mutex_unlock(&s->lock);
+        const bool copied = j.pb && j.surf >= 0 && !j.res;
+        out_copy(s, &j); out_emit(s, &j);
+        pthread_mutex_lock(&s->lock);
+        out_release(s, &j);
+        if (copied) s->tCopy += j.usCopy / 1000.0;
+        s->tEmit += j.usEmit / 1000.0;
+        s->qh++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+static void out_drain(DState *s) { while (s->qh != s->qt) pthread_cond_wait(&s->cv, &s->lock); }   // lock held
+
+// hand a frame's output over (lock held): queued in an asynchronous run, else done here
+static void out_deliver(DState *s, OutJob *j)
+{
+    if (s->async) {
+        if (!s->thrOn) { s->stop = false; s->thrOn = pthread_create(&s->thr, NULL, out_thread, s) == 0; }
+        if (s->thrOn) {
+            while (s->qt - s->qh >= 2) pthread_cond_wait(&s->cv, &s->lock);   // at most two pictures waiting
+            s->q[s->qt % 4] = *j; s->qt++;
+            pthread_cond_broadcast(&s->cv);
+            return;
+        }
+    }
+    out_drain(s);
+    const bool copied = j->pb && j->surf >= 0 && !j->res;
+    out_copy(s, j); out_release(s, j); out_emit(s, j);
+    if (copied) s->tCopy += j->usCopy / 1000.0;
+    s->tEmit += j->usEmit / 1000.0;
+}
+
+// asynchronous output needs a surface beyond what the stream holds as references: not for streams that use (nearly) all
+static bool out_async_ok(DState *s)
+{
+    if (s->codec == kCMVideoCodecType_HEVC) return s->hevc && s->hevc->max_dec_pic <= HEVC_SURFACES - 2;
+    if (s->codec == CODEC_VP9 || s->codec == CODEC_AV1 || is_mpeg12(s->codec) || s->codec == kCMVideoCodecType_MPEG4Video) return true;
+    int refs = 0;
+    for (int i = 0; i < 32; i++) if (s->dec.params.sps[i].max_num_ref_frames > refs) refs = s->dec.params.sps[i].max_num_ref_frames;
+    return refs <= DEC_SURFACES - 3;
+}
+
 // VP9: one sample is one chunk (in MP4 / WebM a superframe: hidden frames, then the one shown frame); emits the shown
 // picture. A sample that shows nothing emits the frame it decoded: ffmpeg splits superframes and feeds hidden frames one
 // by one, keeps each returned picture as that frame and shows it itself on show_existing_frame (T10.04; reporting such a
@@ -497,30 +604,18 @@ static OSStatus decode_vp9(DState *s, VTVideoDecoderFrame frame, const uint8_t *
         if (r == 1) { if (shown >= 0) vp9dec_release(s->vp9, shown); shown = s->vp9->cur_surf; }
     }
     if (!res && shown < 0 && s->vp9->dec_surf >= 0 && nf > 0) { shown = s->vp9->dec_surf; s->vp9->busy[shown] = true; }
-    CVPixelBufferRef pb = NULL;
+    OutJob j = { .frame = frame, .surf = -1, .rel = -1 };
     if (!res && shown >= 0) {
-        const unsigned w = s->vp9->w[shown], h = s->vp9->h[shown];
-        double tp = nowms();
-        const OSStatus cst = output_buffer(s, w, h, &pb);
-        if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
-        else {
-            double tc = nowms(); s->tPool += tc - tp;
-            CVPixelBufferLockBaseAddress(pb, 0);
-            vp9dec_read_nv12(s->vp9, shown, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                             CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1), w, h);
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
-            s->tCopy += nowms() - tc;
-        }
-        vp9dec_release(s->vp9, shown);
+        j.w = s->vp9->w[shown]; j.h = s->vp9->h[shown]; j.rel = shown;
+        const double tp = nowms();
+        if (output_buffer(s, j.w, j.h, &j.pb) || !j.pb) res = kVTVideoDecoderMalfunctionErr; else j.surf = shown;
+        s->tPool += nowms() - tp;
         s->frames++;
     }
     if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes, %d frames -> %d, shown %d, status 0x%x, %.2f ms", frame, len, nf,
                                               (int)res, shown, s->vp9->err_status, s->vp9->engine_ms);
-    const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && shown < 0) ? kVTDecodeInfo_FrameDropped : 0, pb);
-    if (pb) CVPixelBufferRelease(pb);
-    s->tEmit += nowms() - te;
+    j.res = res; j.fl = (!res && shown < 0) ? kVTDecodeInfo_FrameDropped : 0;
+    out_deliver(s, &j);
     return res;
 }
 
@@ -539,30 +634,18 @@ static OSStatus decode_av1(DState *s, VTVideoDecoderFrame frame, const uint8_t *
             s->av1->busy[shown] = true;
         }
     }
-    CVPixelBufferRef pb = NULL;
+    OutJob j = { .frame = frame, .surf = -1, .rel = -1 };
     if (!res && shown >= 0) {
-        const unsigned w = s->av1->w[shown], h = s->av1->h[shown];
-        double tp = nowms();
-        const OSStatus cst = output_buffer(s, w, h, &pb);
-        if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
-        else {
-            double tc = nowms(); s->tPool += tc - tp;
-            CVPixelBufferLockBaseAddress(pb, 0);
-            av1dec_read_nv12(s->av1, shown, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                             CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1), w, h);
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
-            s->tCopy += nowms() - tc;
-        }
-        av1dec_release(s->av1, shown);
+        j.w = s->av1->w[shown]; j.h = s->av1->h[shown]; j.rel = shown;
+        const double tp = nowms();
+        if (output_buffer(s, j.w, j.h, &j.pb) || !j.pb) res = kVTVideoDecoderMalfunctionErr; else j.surf = shown;
+        s->tPool += nowms() - tp;
         s->frames++;
     }
     if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes -> %d, shown %d, status 0x%x, %.2f ms", frame, len, (int)res, shown,
                                               s->av1->err_status, s->av1->engine_ms);
-    const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && shown < 0) ? kVTDecodeInfo_FrameDropped : 0, pb);
-    if (pb) CVPixelBufferRelease(pb);
-    s->tEmit += nowms() - te;
+    j.res = res; j.fl = (!res && shown < 0) ? kVTDecodeInfo_FrameDropped : 0;
+    out_deliver(s, &j);
     return res;
 }
 
@@ -575,34 +658,22 @@ static OSStatus decode_hevc(DState *s, VTVideoDecoderFrame frame, const uint8_t 
     while (r >= 0 && hevc_next_lenpfx(p, len, s->nalLen, &pos, &nal, &n)) { int q = hevcdec_nal(d, nal, n); if (q) r = q; }
     if (r >= 0) { int q = hevcdec_flush(d); if (q) r = q; }
     if (r < 0) res = kVTVideoDecoderBadDataErr;
-    CVPixelBufferRef pb = NULL; bool out = false;
+    OutJob j = { .frame = frame, .surf = -1, .rel = -1 }; bool out = false;
     if (!res && r == 1) {
         s->tEngine += d->engine_ms;
-        out = d->cur_output;
+        out = d->cur_output; j.rel = d->cur_surf;
         if (out) {
-            double tp = nowms();
-            const OSStatus cst = output_buffer(s, (unsigned)d->cur_w, (unsigned)d->cur_h, &pb);
-            if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
-            else {
-                double tc = nowms(); s->tPool += tc - tp;
-                CVPixelBufferLockBaseAddress(pb, 0);
-                hevcdec_read_nv12(d, d->cur_surf, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                                  CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
-                                  (unsigned)d->cur_w, (unsigned)d->cur_h, (unsigned)d->cur_crop[0], (unsigned)d->cur_crop[2]);
-                CVPixelBufferUnlockBaseAddress(pb, 0);
-                if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
-                s->tCopy += nowms() - tc;
-            }
+            j.w = (unsigned)d->cur_w; j.h = (unsigned)d->cur_h; j.cx = (unsigned)d->cur_crop[0]; j.cy = (unsigned)d->cur_crop[2];
+            const double tp = nowms();
+            if (output_buffer(s, j.w, j.h, &j.pb) || !j.pb) res = kVTVideoDecoderMalfunctionErr; else j.surf = d->cur_surf;
+            s->tPool += nowms() - tp;
         }
-        hevcdec_release(d, d->cur_surf);
         s->frames++;
     }
     if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes -> %d, picture %d (POC %d%s), status 0x%x, %.2f ms", frame, len, (int)res, r,
                                               d->cur_poc, out ? "" : ", not output", d->err_status, d->engine_ms);
-    const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && !out) ? kVTDecodeInfo_FrameDropped : 0, pb);
-    if (pb) CVPixelBufferRelease(pb);
-    s->tEmit += nowms() - te;
+    j.res = res; j.fl = (!res && !out) ? kVTDecodeInfo_FrameDropped : 0;
+    out_deliver(s, &j);
     return res;
 }
 
@@ -620,29 +691,18 @@ static OSStatus decode_mpeg2(DState *s, VTVideoDecoderFrame frame, const uint8_t
     }
     if (r >= 0) { const int q = mpeg2dec_flush(d); if (q) r = q; }
     if (r < 0) res = kVTVideoDecoderBadDataErr;
-    CVPixelBufferRef pb = NULL; const bool out = !res && r == 1;
+    OutJob j = { .frame = frame, .surf = -1, .rel = -1 }; const bool out = !res && r == 1;
     if (out) {
-        s->tEngine += d->engine_ms; double tp = nowms();
-        const OSStatus cst = output_buffer(s, (unsigned)d->cur_w, (unsigned)d->cur_h, &pb);
-        if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
-        else {
-            double tc = nowms(); s->tPool += tc - tp;
-            CVPixelBufferLockBaseAddress(pb, 0);
-            mpeg2dec_read_nv12(d, d->cur_surf, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                               CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1), (unsigned)d->cur_w, (unsigned)d->cur_h);
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
-            s->tCopy += nowms() - tc;
-        }
-        mpeg2dec_release(d, d->cur_surf);
+        s->tEngine += d->engine_ms; const double tp = nowms();
+        j.w = (unsigned)d->cur_w; j.h = (unsigned)d->cur_h; j.rel = d->cur_surf;
+        if (output_buffer(s, j.w, j.h, &j.pb) || !j.pb) res = kVTVideoDecoderMalfunctionErr; else j.surf = d->cur_surf;
+        s->tPool += nowms() - tp;
         s->frames++;
     }
     if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes, %d units (first 0x%02x) -> %d, picture %d (%c), status 0x%x, %.2f ms", frame, len, units,
                                               first & 0xff, (int)res, r, " IPBD"[d->cur_type & 7], d->err_status, d->engine_ms);
-    const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && !out) ? kVTDecodeInfo_FrameDropped : 0, pb);
-    if (pb) CVPixelBufferRelease(pb);
-    s->tEmit += nowms() - te;
+    j.res = res; j.fl = (!res && !out) ? kVTDecodeInfo_FrameDropped : 0;
+    out_deliver(s, &j);
     return res;
 }
 
@@ -654,38 +714,31 @@ static OSStatus decode_mpeg4(DState *s, VTVideoDecoderFrame frame, const uint8_t
     size_t pos = 0; const uint8_t *st; size_t n;
     while (r >= 0 && mpeg4_next_unit(p, len, &pos, &st, &n)) { const int q = mpeg4dec_unit(d, st, n); if (q < 0) r = q; else if (q == 1) { r = 1; pics++; } }
     if (r < 0) res = kVTVideoDecoderBadDataErr;
-    CVPixelBufferRef pb = NULL; const bool out = !res && r == 1 && d->cur_shown;
+    OutJob j = { .frame = frame, .surf = -1, .rel = -1 }; const bool out = !res && r == 1 && d->cur_shown;
+    if (!res && r == 1) j.rel = d->cur_surf;
     if (out) {
-        s->tEngine += d->engine_ms; double tp = nowms();
-        const OSStatus cst = output_buffer(s, (unsigned)d->cur_w, (unsigned)d->cur_h, &pb);
-        if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
-        else {
-            double tc = nowms(); s->tPool += tc - tp;
-            CVPixelBufferLockBaseAddress(pb, 0);
-            mpeg4dec_read_nv12(d, d->cur_surf, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                               CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1), (unsigned)d->cur_w, (unsigned)d->cur_h);
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
-            s->tCopy += nowms() - tc;
-        }
+        s->tEngine += d->engine_ms; const double tp = nowms();
+        j.w = (unsigned)d->cur_w; j.h = (unsigned)d->cur_h;
+        if (output_buffer(s, j.w, j.h, &j.pb) || !j.pb) res = kVTVideoDecoderMalfunctionErr; else j.surf = d->cur_surf;
+        s->tPool += nowms() - tp;
         s->frames++;
     }
-    if (!res && r == 1) mpeg4dec_release(d, d->cur_surf);
     if (gDLog && (s->frames <= 3 || res || pics > 1)) DLOG("decodeFrame %p: %zu bytes -> %d, %d VOP(s) (%c%s), status 0x%x, %.2f ms", frame, len, (int)res, pics,
                                               "IPBSN"[d->cur_type % 5], out ? "" : ", not shown", d->err_status, d->engine_ms);
-    const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && !out) ? kVTDecodeInfo_FrameDropped : 0, pb);
-    if (pb) CVPixelBufferRelease(pb);
-    s->tEmit += nowms() - te;
+    j.res = res; j.fl = (!res && !out) ? kVTDecodeInfo_FrameDropped : 0;
+    out_deliver(s, &j);
     return res;
 }
 
 static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CMSampleBufferRef sb, VTDecodeFrameFlags flags, VTDecodeInfoFlags *info)
 {
-    DState *s = dstate(o); (void)flags;
+    DState *s = dstate(o);
     if (info) *info = 0;
     const double tA = nowms();
     pthread_mutex_lock(&s->lock);
+    // asynchronous output when the client allows it (NVDEC_SYNC=1: never)
+    s->async = (flags & kVTDecodeFrame_EnableAsynchronousDecompression) && s->opened && !getenv("NVDEC_SYNC") && out_async_ok(s);
+    if (s->async && info) *info |= kVTDecodeInfo_Asynchronous;
     if (s->tLast > 0) s->tOut += tA - s->tLast;
     OSStatus res = noErr; CVPixelBufferRef pb = NULL;
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
@@ -743,27 +796,19 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
                 free(ks); free(vs);
             } else DLOG("CVPixelBufferIsCompatibleWithAttributes %s", compat ? "found, no destination attributes" : "not found");
         }
+        OutJob j = { .frame = frame, .surf = -1, .rel = s->dec.cur_surf, .pb = pb };
         if (cst || !pb) res = kVTVideoDecoderMalfunctionErr;
-        else {
-            double tc = nowms(); s->tPool += tc - tp;
-            CVPixelBufferLockBaseAddress(pb, 0);
-            h264dec_read_nv12(&s->dec, s->dec.cur_surf, CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                              CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
-                              (unsigned)CVPixelBufferGetWidth(pb), (unsigned)CVPixelBufferGetHeight(pb));
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
-            s->tCopy += nowms() - tc;
-        }
-        h264dec_release(&s->dec, s->dec.cur_surf);
-        s->frames++;
+        else { s->tPool += nowms() - tp; j.surf = s->dec.cur_surf; j.w = (unsigned)CVPixelBufferGetWidth(pb); j.h = (unsigned)CVPixelBufferGetHeight(pb); }
+        pb = NULL; s->frames++;
+        j.res = res; out_deliver(s, &j);
+    } else {
+        OutJob j = { .frame = frame, .res = res, .fl = !res ? kVTDecodeInfo_FrameDropped : 0, .surf = -1, .rel = -1 };
+        out_deliver(s, &j);
     }
     if (res) s->errors++;
     if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes -> %d, picture %d, %u MBs ok, %u err, %.2f ms", frame, len, (int)res, r,
                                               s->dec.mbs_ok, s->dec.mbs_err, s->dec.engine_ms);
-    const double te = nowms();
-    VTDecoderSessionEmitDecodedFrame(s->session, frame, res, (!res && r != 1) ? kVTDecodeInfo_FrameDropped : 0, pb);
-    if (pb) CVPixelBufferRelease(pb);
-    s->tLast = nowms(); s->tEmit += s->tLast - te; s->tIn += s->tLast - tA;
+    s->tLast = nowms(); s->tIn += s->tLast - tA;
     pthread_mutex_unlock(&s->lock);
     return res;
 }
@@ -789,7 +834,12 @@ static OSStatus d_copySerializable(VTVideoDecoderRef o, CFAllocatorRef al, CFDic
     return noErr;
 }
 static Boolean d_canAccept(VTVideoDecoderRef o, CMFormatDescriptionRef f) { (void)o; DLOG("canAcceptFormatDescription %p: no", f); return false; }
-static OSStatus d_finishDelayed(VTVideoDecoderRef o) { (void)o; DLOG("finishDelayedFrames"); return noErr; }
+static OSStatus d_finishDelayed(VTVideoDecoderRef o)
+{
+    DState *s = dstate(o); DLOG("finishDelayedFrames");
+    pthread_mutex_lock(&s->lock); if (!s->thrOn || !pthread_equal(pthread_self(), s->thr)) out_drain(s); pthread_mutex_unlock(&s->lock);
+    return noErr;
+}
 
 static CMBaseClass gDBase = { .version = 1, .derivedStorageSize = sizeof(void *), .invalidate = b_invalidate, .finalize = b_finalize,
                               .copyDebugDescription = b_desc, .copyProperty = b_copyProperty, .setProperty = b_setProperty };
@@ -808,7 +858,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
     if (st) return st;
     DState *s = calloc(1, sizeof *s);
-    pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
     s->codec = codec;
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;

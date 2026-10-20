@@ -9,6 +9,7 @@
 //   VTDECODE_PF=x420: ask for that output format (default 420v)
 //   VTDECODE_ATT=1: print the first decoded frame's attachments (colour, HDR metadata)
 //   VTDECODE_SPEED=hw|sw: only the decode speed of the hardware / software decoder (frames released at once)
+//   VTDECODE_ASYNC=1: allow asynchronous decompression (as AVFoundation does)
 //   VTDECODE_SUPP=1: opt in to VP9 first (VTRegisterSupplementalVideoDecoderIfAvailable), as WebKit and ffmpeg do
 // Build: clang -fobjc-arc -O2 vtdecode.m -o vtdecode -framework Foundation -framework AVFoundation -framework CoreMedia
 //        -framework CoreVideo -framework VideoToolbox -framework Metal
@@ -47,7 +48,7 @@ static int decode(NSArray *samples, CMFormatDescriptionRef fd, bool hw, Out *o, 
     o->frames = [NSMutableArray array]; o->pts = [NSMutableArray array];
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     for (id x in samples) {
-        VTDecodeFrameFlags fl = 0; VTDecodeInfoFlags info = 0;
+        VTDecodeFrameFlags fl = getenv("VTDECODE_ASYNC") ? kVTDecodeFrame_EnableAsynchronousDecompression : 0; VTDecodeInfoFlags info = 0;
         st = VTDecompressionSessionDecodeFrame(s, (__bridge CMSampleBufferRef)x, fl, NULL, &info);
         if (st) { o->err = st; break; }
     }

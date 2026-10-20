@@ -11,6 +11,9 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, asynchronous decode (T8.09):** clients that allow asynchronous decompression (AVFoundation players and readers)
+  now get the copy-out overlapped with the next decode: 4K H.264 189 -> 213 fps, HEVC 302 -> 356, HEVC Main 10 164 -> 207, VP9
+  302 -> 337, AV1 309 -> 382, MPEG-2 211 -> 238 (`vtdecode VTDECODE_ASYNC=1`). The decode tables are synchronous (as ffmpeg).
 - **2026-10-20, rate control (T7.09):** NVIDIA's two-pass and lookahead traced and tried. Two-pass: -0.25..+0.65 VMAF at equal rate
   over 900 frames for 2x (H.264) / +7 % (HEVC) engine time, off by default (`NVENCVT_TWOPASS=1`). The real gain came from
   initializing the RC process buffer as the driver does (ours was zero, so the first IDR took ~37 frames' budget): +0.6-1.0 VMAF
