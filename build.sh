@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 G=${NVENC_GUEST:-tahoe}
 [ -d vendor/open-gpu-kernel-modules ] && [ -d vendor/open-gpu-doc ] || { echo "run scripts/fetch-vendor.sh first"; exit 1; }
-tools=${*:-$(ls tools/*.c tools/*.m trace/*.c vt/*.c | grep -v '^vt/.*_' | xargs -n1 basename | sed 's/\.[cm]$//')}
+tools=${*:-$(ls tools/*.c tools/*.m trace/*.c vt/*.c | grep -v '^vt/.*_' | xargs -n1 basename | sed 's/\.[cm]$//' | tr '\n' ' ')}
 tar -C vendor/open-gpu-kernel-modules -chf - src/common/sdk/nvidia/inc src/nvidia/arch/nvalloc/unix/include \
   | ssh "$G" 'rm -rf ~/nvenc-dev/inc && mkdir -p ~/nvenc-dev/inc/ogkm && tar -xf - -C ~/nvenc-dev/inc/ogkm'
 tar -C vendor/open-gpu-doc -chf - classes/video | ssh "$G" 'mkdir -p ~/nvenc-dev/inc/ogd && tar -xf - -C ~/nvenc-dev/inc/ogd'
