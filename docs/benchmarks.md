@@ -181,8 +181,8 @@ What this shows:
 - **MPEG-2 / MPEG-4 / VP8:** ffmpeg's software decoders are faster on 16 threads (these codecs are cheap); ours mainly frees the
   CPU (and Apple's decoder refuses MPEG-4 ASP). Our VideoToolbox rate for them is bound by copying each picture out (~1 ms at 4K).
 - **MPEG-4 Part 2 above 1920 pixels wide:** the engine still decodes correctly (55-57 dB against ffmpeg with the same IDCT) but
-  flags every macroblock and takes ~1.3 us per macroblock (4K: 24 fps). Not understood yet; such streams are rare (ASP's highest
-  level is 720x576).
+  flags every macroblock and takes ~1.3 us per macroblock (4K: 24 fps). NVIDIA documents MPEG-4 Part 2 decoding up to
+  2032x2032; such streams are rare (ASP's highest level is 720x576).
 - 10-bit decodes are measured with 10-bit output (`x420`); asking for 8-bit output adds a CPU conversion in VideoToolbox (about
   5x slower at 1080p).
 
