@@ -26,7 +26,9 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "vp9dec: channel failed\n"); return -1; }
     const size_t sbs = (size_t)(d->maxW / 64) * (d->maxH / 64);
     // sizes measured (T10.02): column MVs 1024 bytes per superblock, the intra top line ~4 bytes per pixel of width
-    // (15 352 at 3840; 8 per pixel allocated for 10-bit), the filter "above" area ~57 bytes per row at 4K
+    // (15 352 at 3840; 8 per pixel allocated for 10-bit), the filter "above" area ~57 bytes per row at 4K. Turing's NVDEC
+    // (GTX 1650, 0xc4b0) fills the intra top buffer with 32 bytes per superblock (8 and 10-bit), and faulted (no completion)
+    // once that passed the end: 2048x1088, 1280x1440 and 4K failed, 1920x1080 fitted in the page rounding
     // filter buffer: deblocking top + left lines (nvdec_drv.h's sizes), then the filter "above" and BSD control areas,
     // whose sizes the headers do not give (generous: 16 bytes per row per tile column, 64 tile columns; 4 per row)
     const size_t top = VP9_DBLK_TOP_BUF_SIZE(d->maxW), left = VP9_DBLK_LEFT_BUF_SIZE(d->maxH);
@@ -38,7 +40,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
         { &d->setup, 0x2000 }, { &d->bs, bsCap }, { &d->probs, sizeof(nvdec_vp9EntropyProbs_t) },
         { &d->counts, sizeof(nvdec_vp9EntropyCounts_t) }, { &d->seg[0], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE },
         { &d->seg[1], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE }, { &d->tiles, 0x1000 }, { &d->colmv[0], sbs * 1024 },
-        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
+        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps + sbs * 32 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "vp9dec: alloc failed\n"); return -1; }
         memset(b[i].m->cpu, 0, b[i].m->size);
