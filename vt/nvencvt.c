@@ -63,6 +63,8 @@ static bool gLog;
 static FILE *gLogF;   // NVENCVT_LOG: stderr; flag file /tmp/nvencvt.log (apps started by launchd): /tmp/nvencvt-<pid>.log
 #define LOG(...) do { if (gLog) { FILE *lf_ = gLogF ? gLogF : stderr; fprintf(lf_, "nvencvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
 
+enum { VT_MAX_B = 3 };
+
 typedef struct {
     pthread_mutex_t lock;
     VTEncoderSessionRef session;
@@ -84,9 +86,17 @@ typedef struct {
     // diagnostic dump (flag file /tmp/nvencvt.dump): encoded stream from a forced IDR on, and the first 30 input frames
     FILE *dumpEs, *dumpYuv; int dumpYuvLeft; bool dumpIdr;
     bool realTime;
+    bool reorder;                   // AllowFrameReordering (true unless the client turns it off)
     unsigned frames;
+    // B pictures (T7.03; AllowFrameReordering true and RealTime not true, H.264 Main/High 4:2:0 and HEVC): up to bf
+    // input frames wait (retained) for the anchor after them; the anchor is encoded first, then they are as B pictures
+    int bf;                         // B pictures between anchors, 0 = off
+    struct { VTEncoderFrameRef frame; CVPixelBufferRef img; CMTime pts, dur; double tEntry; int disp; } pend[VT_MAX_B + 1];
+    int npend, disp, sinceKey;
+    CMTime ptsRing[64];             // input presentation times by display index: decode time stamps come from them
+    unsigned coded;                 // pictures submitted (= the decode position of the next one)
     // frames in flight: encodeFrame submits, the completion thread waits (in order) and emits
-    struct { VTEncoderFrameRef frame; CMTime pts, dur; NvU32 ticket; bool ok; double tEntry, tCall, tTile; } q[ENC_MAX_DEPTH];
+    struct { VTEncoderFrameRef frame; CMTime pts, dur, dts; NvU32 ticket; bool ok, b; double tEntry, tCall, tTile; } q[ENC_MAX_DEPTH];
     // statistics (NVENCVT_STATS=<file> or the flag file /tmp/nvencvt.stats: a line every 2 s to that file /
     // /tmp/nvencvt-stats.log)
     FILE *statsFile; double statsT0; unsigned sN, sIdr, sFail; double sCall, sCallMax, sTile, sEng, sEngMax, sTotal, sTotalMax, sBytes;
@@ -212,7 +222,7 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) s->refs = num(v, 0);
     else if (CFEqual(key, kVTCompressionPropertyKey_Quality)) { double q = 0; if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(v, kCFNumberDoubleType, &q); s->quality = (int)(q * 100); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
-    else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) { if (v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) LOG("frame reordering requested: not supported, no B-frames"); }
+    else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) s->reorder = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !profile_ok(s, v)) st = kVTPropertyNotSupportedErr;
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->hevc && !s->av1) {
         char pr[64] = ""; CFStringGetCString(v, pr, sizeof pr, kCFStringEncodingUTF8);
@@ -247,11 +257,11 @@ static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRe
     else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) { n = s->fps; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) { n = s->enc.cfg.num_refs ? s->enc.cfg.num_refs : (s->refs ? s->refs : ENC_MAX_REFS); v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) v = CFRetain(s->realTime ? kCFBooleanTrue : kCFBooleanFalse);
-    else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) v = CFRetain(kCFBooleanFalse);
+    else if (CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)) v = CFRetain((s->opened ? s->bf > 0 : s->reorder) ? kCFBooleanTrue : kCFBooleanFalse);
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->av1) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
                                                                              : h264_high(s) ? kVTProfileLevel_H264_High_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel);
     else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc && !s->av1) v = CFRetain(h264_cabac(s) ? kVTH264EntropyMode_CABAC : kVTH264EntropyMode_CAVLC);
-    else if (CFEqual(key, kVTCompressionPropertyKey_NumberOfPendingFrames)) { n = 0; v = CFNumberCreate(al, kCFNumberIntType, &n); }
+    else if (CFEqual(key, kVTCompressionPropertyKey_NumberOfPendingFrames)) { n = s->npend; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder)) v = CFRetain(kCFBooleanTrue);
     else { if (gLog) { char k[128]; CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); LOG("copy %s: not available", k); } return kCMBaseObjectError_ValueNotAvailable; }
     *(CFTypeRef *)out = v;
@@ -326,6 +336,14 @@ static OSStatus open_encoder(State *s)
     EncConfig c = { .codec = s->av1 ? ENC_AV1 : s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange,
                     .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s), .chroma444 = s->c444 };
+    // B pictures when the client allows reordering and is not real time (OBS / AVAssetWriter recordings, not Parsec): 2 by
+    // default (NVENCVT_BFRAMES=0..3). H.264 needs Main or High in 4:2:0 (Baseline and 4:4:4 stay P-only), AV1 has none yet.
+    // Not real time also gets NVIDIA's slower ME / MD controls (H.264 quality preset, ~+0.6 dB)
+    s->bf = s->reorder && !s->realTime && !s->av1 && !s->c444 && (s->hevc || s->h264Profile != 66)
+          ? (getenv("NVENCVT_BFRAMES") ? atoi(getenv("NVENCVT_BFRAMES")) : 2) : 0;
+    s->bf = s->bf < 0 ? 0 : s->bf > VT_MAX_B ? VT_MAX_B : s->bf;
+    if (s->bf && refs < 2) refs = 2;
+    c.num_refs = refs; c.bframes = s->bf; c.quality = !s->realTime && !getenv("NVENCVT_FAST");
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
@@ -371,8 +389,8 @@ static OSStatus open_encoder(State *s)
     OSStatus st = cnt != want ? kVTVideoEncoderMalfunctionErr : s->hevc
         ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pl, 4, NULL, &s->fmt)
         : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, pl, 4, &s->fmt);
-    LOG("%s%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s profile %d cabac %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", s->c444 ? " 4:4:4" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video", s->hevc ? 0 : s->enc.cfg.chroma444 ? 244 : c.h264_profile, s->hevc ? 0 : (int)s->enc.cfg.cabac,
-        c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
+    LOG("%s%s%s encoder open on NVENC%d: %dx%d refs %d dpb+%d range %s profile %d cabac %d rc_mode %d bitrate %d vbv %d qp %d/%d idr_period %d fps %d bframes %d quality %d -> fmt %d", s->hevc ? "HEVC" : "H.264", s->ten ? " Main10" : "", s->c444 ? " 4:4:4" : "", c.engine, c.width, c.height, c.num_refs, c.dpb_extra, c.full_range ? "full" : "video", s->hevc ? 0 : s->enc.cfg.chroma444 ? 244 : c.h264_profile, s->hevc ? 0 : (int)s->enc.cfg.cabac,
+        c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, c.bframes, (int)c.quality, (int)st);
     if (st) { enc_close(&s->enc); return st; }
 opened:
     s->opened = true;
@@ -384,7 +402,7 @@ opened:
     return noErr;
 }
 
-static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, const EncFrame *fr, OSStatus err)
+static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, CMTime dts, bool b, const EncFrame *fr, OSStatus err)
 {
     if (err) { VTEncoderSessionEmitEncodedFrame(s->session, frame, err, 0, NULL); return; }
     if (s->dumpEs) { fwrite(fr->data, 1, fr->size, s->dumpEs); fflush(s->dumpEs); }
@@ -403,7 +421,7 @@ static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, cons
     if (!s->av1 && start != SIZE_MAX) { uint32_t l = (uint32_t)(fr->size - start - 4); buf[start] = l >> 24; buf[start + 1] = l >> 16; buf[start + 2] = l >> 8; buf[start + 3] = l; }
     CMBlockBufferRef bb = NULL; CMSampleBufferRef sb = NULL;
     OSStatus st = CMBlockBufferCreateWithMemoryBlock(NULL, buf, fr->size, kCFAllocatorMalloc, NULL, 0, fr->size - skip, 0, &bb);
-    CMSampleTimingInfo ti = { .duration = dur, .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
+    CMSampleTimingInfo ti = { .duration = dur, .presentationTimeStamp = pts, .decodeTimeStamp = dts };
     size_t sz = fr->size - skip;
     if (!st) st = CMSampleBufferCreateReady(NULL, bb, s->fmt, 1, 1, &ti, 1, &sz, &sb);
     if (!st) {
@@ -411,6 +429,7 @@ static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, cons
         CFMutableDictionaryRef a = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
         CFDictionarySetValue(a, kCMSampleAttachmentKey_NotSync, fr->idr ? kCFBooleanFalse : kCFBooleanTrue);
         CFDictionarySetValue(a, kCMSampleAttachmentKey_DependsOnOthers, fr->idr ? kCFBooleanFalse : kCFBooleanTrue);
+        if (s->bf) CFDictionarySetValue(a, kCMSampleAttachmentKey_IsDependedOnByOthers, b ? kCFBooleanFalse : kCFBooleanTrue);
     }
     VTEncoderSessionEmitEncodedFrame(s->session, frame, st, 0, st ? NULL : sb);
     if (sb) CFRelease(sb);
@@ -425,14 +444,14 @@ static void *completion(void *arg)
         while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->lock);
         if (s->qh == s->qt) break;
         unsigned i = s->qh % s->depth;
-        VTEncoderFrameRef frame = s->q[i].frame; CMTime pts = s->q[i].pts, dur = s->q[i].dur; NvU32 t = s->q[i].ticket; bool ok = s->q[i].ok;
+        VTEncoderFrameRef frame = s->q[i].frame; CMTime pts = s->q[i].pts, dur = s->q[i].dur, dts = s->q[i].dts; NvU32 t = s->q[i].ticket; bool ok = s->q[i].ok, b = s->q[i].b;
         double tEntry = s->q[i].tEntry, tCall = s->q[i].tCall, tTile = s->q[i].tTile;
         pthread_mutex_unlock(&s->lock);
         EncFrame fr; memset(&fr, 0, sizeof fr);
         int rc = ok ? enc_wait(&s->enc, t, &fr) : -1;
         if (rc) LOG("frame %u: encode failed (ucode error %u)", t, fr.ucode_error);
-        else if (gLog && (t <= 3 || fr.idr)) LOG("frame %u %s: %zu bytes, %.3f ms, avgQP %u", t, fr.idr ? "IDR" : "P", fr.size, fr.ms, fr.avg_qp);
-        emit(s, frame, pts, dur, &fr, rc ? kVTVideoEncoderMalfunctionErr : noErr);   // fr.data stays valid until qh moves on
+        else if (gLog && (t <= 3 || fr.idr)) LOG("frame %u %s: %zu bytes, %.3f ms, avgQP %u", t, fr.idr ? "IDR" : b ? "B" : "P", fr.size, fr.ms, fr.avg_qp);
+        emit(s, frame, pts, dur, dts, b, &fr, rc ? kVTVideoEncoderMalfunctionErr : noErr);   // fr.data stays valid until qh moves on
         pthread_mutex_lock(&s->lock);
         stats_frame(s, tCall, tTile, fr.ms, now_ms() - tEntry, rc ? 0 : fr.size, fr.idr, rc != 0);
         s->qh++;
@@ -443,6 +462,63 @@ static void *completion(void *arg)
 }
 
 static void drain(State *s) { while (s->qh != s->qt) pthread_cond_wait(&s->cv, &s->lock); }   // lock held
+
+// Load a frame into the encoder's next input buffer (lock held; the format was checked by e_encodeFrame)
+static void load_image(State *s, CVPixelBufferRef img)
+{
+    OSType pf = CVPixelBufferGetPixelFormatType(img);
+    bool bgra = pf == kCVPixelFormatType_32BGRA;
+    bool p010 = pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+    bool l10r = pf == kCVPixelFormatType_ARGB2101010LEPacked;
+    bool nv24 = pf == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange || pf == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange;
+    bool x444 = pf == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange || pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+    if (nv24) enc_load_nv24(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                            CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    else if (x444) enc_load_x444(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                                 CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    else if (l10r) enc_load_l10r(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
+    else if (p010) enc_load_p010(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                            CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    else if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
+    else enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
+                       CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+    CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+}
+
+// Wait for a free slot, load the frame and start encoding it (lock held). disp < 0: no reordering (enc_submit)
+static void submit(State *s, VTEncoderFrameRef frame, CVPixelBufferRef img, CMTime pts, CMTime dur, double tEntry, bool idr, bool b, int disp)
+{
+    while (s->qt - s->qh >= s->depth) pthread_cond_wait(&s->cv, &s->lock);   // a free input slot
+    double tTile0 = now_ms();
+    load_image(s, img);
+    unsigned i = s->qt % s->depth;
+    s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur; s->q[i].b = b;
+    // decode time stamps with reordering: the presentation time one picture earlier in display order (num_reorder_frames
+    // 1: a B picture decodes when it is shown, an anchor one picture before the first B picture that waits for it)
+    CMTime d = CMTIME_IS_NUMERIC(dur) ? dur : CMTimeMake(1, s->fps > 0 ? s->fps : 60);
+    s->q[i].dts = disp < 0 ? kCMTimeInvalid : s->coded == 0 ? CMTimeSubtract(pts, d) : s->ptsRing[(s->coded - 1) % 64];
+    s->q[i].tEntry = tEntry; s->q[i].tTile = now_ms() - tTile0;
+    s->q[i].ok = (disp < 0 ? enc_submit(&s->enc, idr, &s->q[i].ticket) : enc_submit_ex(&s->enc, idr, b, disp, &s->q[i].ticket)) == 0;
+    s->q[i].tCall = now_ms() - tEntry;
+    s->qt++; s->coded++;
+    pthread_cond_broadcast(&s->cv);
+}
+
+// Encode the waiting frames (lock held): the newest as the anchor, then the others as B pictures in display order. After
+// an encode error the encoder starts over with an IDR (enc.c): then they go in display order as IDR / P pictures.
+static void flush_group(State *s)
+{
+    int n = s->npend; s->npend = 0;
+    __typeof__(s->pend[0]) g[VT_MAX_B + 1];
+    memcpy(g, s->pend, sizeof g[0] * (size_t)n);
+    const bool restart = s->enc.forceIdr;
+    for (int k = 0; k < n; k++) {
+        int j = restart ? k : k == 0 ? n - 1 : k - 1;
+        submit(s, g[j].frame, g[j].img, g[j].pts, g[j].dur, g[j].tEntry, false, !restart && k > 0, g[j].disp);
+        CVPixelBufferRelease(g[j].img);
+    }
+}
 
 static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVImageBufferRef img, CMTime pts, CMTime dur,
                               CFDictionaryRef props, VTEncodeInfoFlags *infoOut)
@@ -477,8 +553,6 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTPixelTransferNotSupportedErr, 0, NULL);
         return noErr;
     }
-    while (s->qt - s->qh >= s->depth) pthread_cond_wait(&s->cv, &s->lock);   // a free input slot
-    double tTile0 = now_ms();
     if (gLog && s->frames == 0) { OSType be = CFSwapInt32HostToBig(pf); CFTypeRef m = CVBufferCopyAttachment(img, kCVImageBufferYCbCrMatrixKey, NULL), t = CVBufferCopyAttachment(img, kCVImageBufferTransferFunctionKey, NULL);
         char ms[64] = "-", ts[64] = "-"; if (m) { CFStringGetCString(m, ms, sizeof ms, kCFStringEncodingUTF8); CFRelease(m); } if (t) { CFStringGetCString(t, ts, sizeof ts, kCFStringEncodingUTF8); CFRelease(t); }
         LOG("first frame %.4s %zux%zu matrix %s transfer %s", (char *)&be, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img), ms, ts); }
@@ -499,26 +573,29 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         }
         if (--s->dumpYuvLeft == 0) { fclose(s->dumpYuv); s->dumpYuv = NULL; }
     }
-    if (nv24) enc_load_nv24(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
-                            CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
-    else if (x444) enc_load_x444(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
-                                 CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
-    else if (l10r) enc_load_l10r(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
-    else if (p010) enc_load_p010(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
-                            CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
-    else if (bgra) enc_load_bgra(&s->enc, CVPixelBufferGetBaseAddress(img), CVPixelBufferGetBytesPerRow(img));
-    else enc_load_nv12(&s->enc, CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 0),
-                       CVPixelBufferGetBaseAddressOfPlane(img, 1), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
     CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     bool forceIdr = false;
     if (props) { CFTypeRef k = CFDictionaryGetValue(props, kVTEncodeFrameOptionKey_ForceKeyFrame); forceIdr = k && CFGetTypeID(k) == CFBooleanGetTypeID() && CFBooleanGetValue(k); }
-    unsigned i = s->qt % s->depth;
-    s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur;
-    s->q[i].tEntry = tEntry; s->q[i].tTile = now_ms() - tTile0;
-    s->q[i].ok = enc_submit(&s->enc, forceIdr || s->dumpIdr, &s->q[i].ticket) == 0; s->dumpIdr = false;
-    s->q[i].tCall = now_ms() - tEntry;
-    s->qt++; s->frames++;
-    pthread_cond_broadcast(&s->cv);
+    if (s->bf) {   // reordering (T7.03): anchors wait for nothing, the frames before one wait for it
+        s->ptsRing[s->disp % 64] = pts;
+        const int period = s->enc.cfg.idr_period;
+        const bool key = forceIdr || s->dumpIdr || s->disp == 0 || (period > 0 && s->sinceKey >= period);
+        s->dumpIdr = false;
+        if (key) { flush_group(s); submit(s, frame, img, pts, dur, tEntry, true, false, s->disp); s->sinceKey = 1; }
+        else {
+            CVPixelBufferRetain(img);
+            s->pend[s->npend].frame = frame; s->pend[s->npend].img = img; s->pend[s->npend].pts = pts; s->pend[s->npend].dur = dur;
+            s->pend[s->npend].tEntry = tEntry; s->pend[s->npend].disp = s->disp; s->npend++;
+            s->sinceKey++;
+            if (s->npend > s->bf) flush_group(s);
+        }
+        s->disp++; s->frames++;
+        pthread_mutex_unlock(&s->lock);
+        if (infoOut) *infoOut = kVTEncodeInfo_Asynchronous;
+        return noErr;
+    }
+    submit(s, frame, img, pts, dur, tEntry, forceIdr || s->dumpIdr, false, -1); s->dumpIdr = false;
+    s->frames++;
     // RealTime (streaming): return only once this frame is emitted, so the output reaches the app inside its encode call.
     // Parsec picks up output when it encodes the next frame otherwise: one frame period of extra latency (T5.05).
     bool sync = s->realTime || getenv("NVENCVT_SYNC");
@@ -532,7 +609,7 @@ static OSStatus e_completeFrames(VTVideoEncoderRef e, CMTime until)
 {
     (void)until;
     State *s = state(e);
-    pthread_mutex_lock(&s->lock); drain(s); pthread_mutex_unlock(&s->lock);
+    pthread_mutex_lock(&s->lock); if (s->opened) flush_group(s); drain(s); pthread_mutex_unlock(&s->lock);
     return noErr;
 }
 static OSStatus e_copySupported(VTVideoEncoderRef e, CFDictionaryRef *out) { (void)e; *out = CFRetain(supported()); return noErr; }
@@ -542,6 +619,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     State *s = state(o);
     pthread_mutex_lock(&s->lock);
     if (s->threadOn) {
+        if (s->opened) flush_group(s);
         drain(s); s->stop = true; pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->lock); pthread_join(s->thread, NULL); pthread_mutex_lock(&s->lock);
         s->threadOn = false;
@@ -581,6 +659,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_CreateInstance(FourCharC
     if (st) return st;
     State *s = calloc(1, sizeof *s);
     s->entropy = -1;
+    s->reorder = true;   // VideoToolbox's default for AllowFrameReordering (AVAssetWriter leaves it unset and gets B pictures)
     pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
     s->hevc = codec == kCMVideoCodecType_HEVC; s->av1 = codec == CODEC_AV1;
     *(State **)CMBaseObjectGetDerivedStorage(obj) = s;

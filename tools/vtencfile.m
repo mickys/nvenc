@@ -3,6 +3,8 @@
 // Prints the encoder VideoToolbox picked and the format description's extensions; also writes the source frames.
 //   ./vtencfile av01|hvc1|avc1 W H FRAMES out.ivf src.nv12      VT_BITRATE=<bit/s>  VT_10BIT=1 (x420 input)  VT_REALTIME=1
 //   VT_444=1: 444v input (x444 with VT_10BIT; HEVC 10-bit asks for Main10), src written as planar yuv444p (M13)
+//   VT_REORDER=1: AllowFrameReordering (B pictures; checks decode / presentation time stamps)  VT_SRC=<file.nv12>: frames
+//   from a raw NV12 file (looped) instead of the synthetic pattern  VT_KEYINT=<n>: MaxKeyFrameInterval
 //   VT_PF=<fourcc>: grey frames in that format (what does VideoToolbox hand the encoder? NVENCVT_LOG=1 shows it)
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -11,7 +13,8 @@
 #include <time.h>
 static double now(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1e9; }
 
-static int W, H, N; static FILE *gOut; static int gFrames; static bool gTen, g444; static OSType gPf;
+static int W, H, N; static FILE *gOut; static int gFrames; static bool gTen, g444; static OSType gPf; static FILE *gSrcIn;
+static CMTime gLastDts; static int gBad, gReordered, gSync;
 
 static void fill(CVPixelBufferRef pb, int f, FILE *src)
 {
@@ -24,6 +27,14 @@ static void fill(CVPixelBufferRef pb, int f, FILE *src)
     }
     uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    if (gSrcIn) {   // VT_SRC: the next NV12 frame of the file (from the start again at its end); copied to src as it is
+        uint8_t *buf = malloc((size_t)W * H * 3 / 2);
+        if (fread(buf, 1, (size_t)W * H * 3 / 2, gSrcIn) != (size_t)W * H * 3 / 2) { rewind(gSrcIn); if (fread(buf, 1, (size_t)W * H * 3 / 2, gSrcIn)) {} }
+        for (int r = 0; r < H; r++) memcpy(y + r * ys, buf + (size_t)r * W, (size_t)W);
+        for (int r = 0; r < H / 2; r++) memcpy(uv + r * uvs, buf + (size_t)W * H + (size_t)r * W, (size_t)W);
+        fwrite(buf, 1, (size_t)W * H * 3 / 2, src); free(buf);
+        CVPixelBufferUnlockBaseAddress(pb, 0); return;
+    }
     uint8_t *row = malloc((size_t)W);
     for (int r = 0; r < H; r++) {
         for (int c = 0; c < W; c++) {
@@ -59,6 +70,18 @@ static void fill(CVPixelBufferRef pb, int f, FILE *src)
 static void out_cb(void *ref, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb)
 {
     if (st || !sb) { printf("frame error %d\n", (int)st); return; }
+    {   // time stamps: decode times increase, no sample decodes after it is shown
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb), dts = CMSampleBufferGetDecodeTimeStamp(sb);
+        if (CMTIME_IS_NUMERIC(dts)) {
+            if (CMTimeCompare(dts, pts) > 0 || (gFrames && CMTimeCompare(dts, gLastDts) <= 0)) { gBad++; if (gBad <= 5) printf("bad time stamps: sample %d pts %lld/%d dts %lld/%d\n", gFrames, pts.value, pts.timescale, dts.value, dts.timescale); }
+            if (CMTimeCompare(dts, pts) < 0 && gFrames) gReordered++;
+            gLastDts = dts;
+        }
+        CFArrayRef a = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+        CFBooleanRef ns = a && CFArrayGetCount(a) ? CFDictionaryGetValue(CFArrayGetValueAtIndex(a, 0), kCMSampleAttachmentKey_NotSync) : NULL;
+        if (!ns || !CFBooleanGetValue(ns)) gSync++;
+        if (getenv("VT_TS")) printf("sample %d: pts %lld dts %lld size %zu%s\n", gFrames, pts.value, CMTIME_IS_NUMERIC(dts) ? dts.value : -999, CMSampleBufferGetTotalSampleSize(sb), !ns || !CFBooleanGetValue(ns) ? " sync" : "");
+    }
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb); size_t n = CMBlockBufferGetDataLength(bb);
     uint8_t *d = malloc(n + 2); CMBlockBufferCopyDataBytes(bb, 0, n, d + 2);
     CMVideoCodecType c = CMFormatDescriptionGetMediaSubType(CMSampleBufferGetFormatDescription(sb));
@@ -81,7 +104,8 @@ static void out_cb(void *ref, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSa
     }
     if (gFrames == 0) {
         CFDictionaryRef ext = CMFormatDescriptionGetExtensions(CMSampleBufferGetFormatDescription(sb));
-        NSLog(@"format description extensions: %@", ext);
+        double t = now(); fprintf(stderr, "format description extensions: %s\n", [[(__bridge NSDictionary *)ext description] UTF8String]);
+        if (now() - t > 0.1) printf("printing the extensions took %.1f s\n", now() - t);
     }
     gFrames++; free(d);
 }
@@ -109,6 +133,10 @@ int main(int argc, char **argv)
         printf("encoder: %s\n", eid ? CFStringGetCStringPtr(eid, kCFStringEncodingUTF8) : "?");
         if (getenv("VT_BITRATE")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(atoi(getenv("VT_BITRATE"))));
         if (gTen && codec == 'hvc1') VTSessionSetProperty(enc, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel);
+        if (getenv("VT_REORDER")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
+        else VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+        if (getenv("VT_KEYINT")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(atoi(getenv("VT_KEYINT"))));
+        if (getenv("VT_SRC")) gSrcIn = fopen(getenv("VT_SRC"), "rb");
         if (getenv("VT_REALTIME")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
         VTSessionSetProperty(enc, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@60);
         CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(enc);
@@ -126,7 +154,7 @@ int main(int argc, char **argv)
         double ms = (now() - t0) * 1000;
         VTCompressionSessionInvalidate(enc); CFRelease(enc);
         fclose(gOut); fclose(src);
-        printf("RESULT %d of %d frames in %.1f ms (%.0f fps)\n", gFrames, N, ms, gFrames * 1000.0 / ms);
+        printf("RESULT %d of %d frames in %.1f ms (%.0f fps), %d reordered, %d sync, %d bad time stamps\n", gFrames, N, ms, gFrames * 1000.0 / ms, gReordered, gSync, gBad);
     }
     return 0;
 }

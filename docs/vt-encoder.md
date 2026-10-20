@@ -55,3 +55,21 @@ functions; slots 5+ are NULL and never called by VideoToolbox in the flows tried
 Other exports a full encoder will want: `VTEncoderSessionSetPixelBufferAttributes` (ask for NV12),
 `VTEncoderSessionCreateVideoFormatDescription`, `VTEncoderSessionCreateCMBlockBuffer`. The format description can
 also come from the public `CMVideoFormatDescriptionCreateFromH264ParameterSets`, as the probe does.
+
+## B pictures (T7.03)
+
+`libnvencvt` reorders when `AllowFrameReordering` is true (VideoToolbox's default; AVAssetWriter never sets it, OBS sets it
+from its "B-frames" box) and `RealTime` is not true (Parsec sets it), for H.264 Main / High in 4:2:0 and HEVC; not for
+Baseline, 4:4:4 or AV1. Two B pictures between anchors (`NVENCVT_BFRAMES=0..3`); not real time also turns on NVIDIA's slower
+H.264 ME / MD controls (`EncConfig.quality`; `NVENCVT_FAST=1` keeps the fast ones).
+
+- `encodeFrame` retains the pixel buffer of a frame that is not an anchor and returns (asynchronous). When `bframes + 1`
+  frames wait, the newest is encoded first (P), then the others in display order as B pictures (`enc_submit_ex` with their
+  display index; POC type 0). A key frame (first frame, `ForceKeyFrame`, `MaxKeyFrameInterval`) first encodes the waiting
+  frames as a shorter group, then itself as an IDR alone, so no B picture refers across it. `completeFrames` and
+  invalidate encode a partial group the same way. After an encode error (enc.c then starts over with an IDR) the waiting
+  frames go in display order as IDR / P.
+- Samples come out in decode order with a decode time stamp = the presentation time of the picture one before in
+  display order (the first: its PTS minus one duration). With non-reference B pictures `num_reorder_frames` is 1: a B
+  picture decodes when it is shown, an anchor one picture before the first B picture that waits for it. B samples carry
+  `IsDependedOnByOthers = false`.

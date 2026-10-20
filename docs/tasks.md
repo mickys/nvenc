@@ -97,7 +97,7 @@ first.
 | T7.00 | Registration without a Metal device (CLI apps like ffmpeg get -12908): VT plug-in bundle or another hook | `ffmpeg -c:v hevc_videotoolbox` uses our encoder without injection | done another way: no supported registration exists (reports/T7.00-cli-and-extensions.md, T7.03-coremedia-codesign-summary.md); CLI tools use the overlay's `nvenc-run` wrapper (injection), released in v2.3.6-mickys.9 (names: reports/T7.00-names.md) |
 | T7.01 | Full-range input (420f/xf20) signalled in the VUI (H.264 and HEVC) | Parsec's 420f stream decodes to the same levels as the source | done (ffmpeg, OBS) |
 | T7.02 | H.264 High profile, CABAC, 8x8 transform (observe nullmoth's libnvenc_h264) | ~10 % less bitrate at equal PSNR; decodes | done: 4K 32 -> 49 dB at 20 Mbit/s |
-| T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | open |
+| T7.03 | B-frames when RealTime is off (AllowFrameReordering): reordering, POC, DPB, output order | OBS/AVAssetWriter recordings with B-frames decode | done 2026-10-20 (`vt/nvencvt.c`, docs/vt-encoder.md "B pictures", report T7.03-bframes.md): 2 B pictures (H.264 Main/High 4:2:0, HEVC) unless RealTime or AllowFrameReordering false; non-real-time H.264 also gets the quality preset. crowd_run 1080p at 12 Mbit/s: H.264 28.47 dB (P only, fast) -> 29.08 (B + quality), HEVC 28.94 -> 29.19; 1080p 185-199 fps through VideoToolbox. vtencfile (time stamps checked, 300 frames, key interval 0 / 25), AVAssetWriter (1, 2, 7, 120 frames) and OBS recordings decode without errors |
 | T7.04 | HEVC 4:4:4 (Range Extensions) | a 4:4:4 stream decodes | moved to M13 (T13.01) |
 
 ## M8: H.264 hardware decoder (2026-10-19)
