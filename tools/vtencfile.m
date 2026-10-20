@@ -3,6 +3,8 @@
 // Prints the encoder VideoToolbox picked and the format description's extensions; also writes the source frames.
 //   ./vtencfile av01|hvc1|avc1 W H FRAMES out.ivf src.nv12      VT_BITRATE=<bit/s>  VT_10BIT=1 (x420 input)  VT_REALTIME=1
 //   VT_444=1: 444v input (x444 with VT_10BIT; HEVC 10-bit asks for Main10), src written as planar yuv444p (M13)
+//   VT_CBR=<bit/s>: ConstantBitRate  VT_MAXRATE=<bit/s>: DataRateLimits [rate / 8 bytes, 1 s] (VBR with AverageBitRate)
+//   VT_HDR=pq|hlg: BT.2020 PQ (+ HDR metadata) / HLG colour properties
 //   VT_REORDER=1: AllowFrameReordering (B pictures; checks decode / presentation time stamps)  VT_SRC=<file.nv12>: frames
 //   from a raw NV12 file (looped) instead of the synthetic pattern  VT_KEYINT=<n>: MaxKeyFrameInterval
 //   VT_PF=<fourcc>: grey frames in that format (what does VideoToolbox hand the encoder? NVENCVT_LOG=1 shows it)
@@ -132,7 +134,22 @@ int main(int argc, char **argv)
         CFStringRef eid = NULL; VTSessionCopyProperty(enc, kVTCompressionPropertyKey_EncoderID, NULL, &eid);
         printf("encoder: %s\n", eid ? CFStringGetCStringPtr(eid, kCFStringEncodingUTF8) : "?");
         if (getenv("VT_BITRATE")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(atoi(getenv("VT_BITRATE"))));
+        if (getenv("VT_CBR")) printf("ConstantBitRate -> %d\n", (int)VTSessionSetProperty(enc, kVTCompressionPropertyKey_ConstantBitRate, (__bridge CFNumberRef)@(atoi(getenv("VT_CBR")))));
+        if (getenv("VT_MAXRATE")) printf("DataRateLimits -> %d\n", (int)VTSessionSetProperty(enc, kVTCompressionPropertyKey_DataRateLimits, (__bridge CFArrayRef)@[ @(atoi(getenv("VT_MAXRATE")) / 8), @1 ]));
         if (gTen && codec == 'hvc1') VTSessionSetProperty(enc, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel);
+        if (getenv("VT_HDR")) {   // VT_HDR=pq|hlg: BT.2020 with that transfer, plus mastering display / content light level for pq
+            const bool pq = !strcmp(getenv("VT_HDR"), "pq");
+            VTSessionSetProperty(enc, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_2020);
+            VTSessionSetProperty(enc, kVTCompressionPropertyKey_TransferFunction, pq ? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ : kCVImageBufferTransferFunction_ITU_R_2100_HLG);
+            VTSessionSetProperty(enc, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_2020);
+            if (pq) {
+                static const uint8_t m[24] = { 0x33, 0xc2, 0x86, 0xc4, 0x1d, 0x4c, 0x0b, 0xb8, 0x84, 0xd0, 0x3e, 0x80, 0x3d, 0x13, 0x40, 0x42, 0x00, 0x98, 0x96, 0x80, 0x00, 0x00, 0x00, 0x32 }, c[4] = { 0x03, 0xe8, 0x01, 0x90 };
+                CFDataRef md = CFDataCreate(NULL, m, 24), cd = CFDataCreate(NULL, c, 4);
+                printf("MasteringDisplayColorVolume -> %d, ContentLightLevelInfo -> %d\n", (int)VTSessionSetProperty(enc, kVTCompressionPropertyKey_MasteringDisplayColorVolume, md),
+                       (int)VTSessionSetProperty(enc, kVTCompressionPropertyKey_ContentLightLevelInfo, cd));
+                CFRelease(md); CFRelease(cd);
+            }
+        }
         if (getenv("VT_REORDER")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
         else VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
         if (getenv("VT_KEYINT")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(atoi(getenv("VT_KEYINT"))));

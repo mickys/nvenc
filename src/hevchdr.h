@@ -16,8 +16,9 @@ typedef struct {
     int sps_rps_negative;           // pictures in the SPS's one short-term RPS (deltas 1, none used by the current picture)
     int num_ref_idx_l0_default;     // PPS default active references in list 0
     int pic_init_qp;                // 26 + init_qp_minus26
-    int vui;                        // write VUI: square pixels, BT.709 colour description
+    int vui;                        // write VUI: square pixels, colour description
     int full_range;                 // VUI video_full_range_flag
+    int colour[3];                  // VUI colour_primaries, transfer_characteristics, matrix_coefficients (H.273); 0 = BT.709 (1)
     int bit_depth;                  // 8 (Main) or 10 (Main 10); 0 = 8
     int chroma444;                  // 4:4:4 (Main 4:4:4 / Main 4:4:4 10, Range Extensions profile)
     int lossless;                   // transquant_bypass_enabled_flag (the engine bypasses every CU at QP 0)

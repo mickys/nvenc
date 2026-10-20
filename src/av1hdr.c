@@ -22,7 +22,7 @@ static size_t obu(int type, const uint8_t *payload, size_t n, uint8_t *out)
     memmove(out + o, payload, n);
     return o + n;
 }
-enum { OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME_HEADER = 3, OBU_FRAME = 6 };
+enum { OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME_HEADER = 3, OBU_METADATA = 5, OBU_FRAME = 6 };
 
 int av1_level_for(int width, int height)   // Annex A.3: MaxPicSize per level; the .1 levels for 60 fps
 {
@@ -55,7 +55,7 @@ size_t av1_write_sequence_header(const Av1SeqParams *s, uint8_t *out)   // 5.5
     put(&b, 0, 1); put(&b, s->enable_cdef, 1); put(&b, s->enable_restoration, 1);   // enable_superres, cdef, restoration
     // color_config (5.5.2): profile 0
     put(&b, s->bit_depth > 8, 1); put(&b, 0, 1);               // high_bitdepth, mono_chrome
-    put(&b, 1, 1); put(&b, 1, 8); put(&b, 1, 8); put(&b, 1, 8);   // color description: BT.709 primaries, transfer, matrix
+    put(&b, 1, 1); for (int i = 0; i < 3; i++) put(&b, (unsigned)(s->colour[i] ? s->colour[i] : 1), 8);   // color description
     put(&b, s->full_range, 1); put(&b, 0, 2); put(&b, 0, 1);   // color_range, chroma_sample_position unknown, separate_uv_delta_q
     put(&b, 0, 1);                                             // film_grain_params_present
     trailing(&b);
@@ -187,4 +187,33 @@ size_t av1_write_show_existing(int slot, uint8_t *out)   // 5.9.2 with show_exis
     put(&b, 1, 1); put(&b, (unsigned)slot, 3);                 // show_existing_frame, frame_to_show_map_idx
     trailing(&b);
     return obu(OBU_FRAME_HEADER, p, b.bits / 8, out);
+}
+
+size_t av1_write_hdr_metadata(const uint8_t *mdcv, const uint8_t *cll, uint8_t *out)   // 5.8.4 / 5.8.5, 6.7.4 / 6.7.3
+{
+    size_t n = 0;
+    #define BE16(p) ((unsigned)(p)[0] << 8 | (p)[1])
+    #define BE32(p) ((uint32_t)(p)[0] << 24 | (uint32_t)(p)[1] << 16 | (uint32_t)(p)[2] << 8 | (p)[3])
+    if (mdcv) {   // SEI: G B R primaries, white point (0.00002), max / min luminance (0.0001 cd/m2); AV1: R G B, 0.16, 24.8, 18.14
+        uint8_t p[32] = { 0 }; Bw b = { p, 0 };
+        put(&b, 2, 8);                                         // metadata_type HDR_MDCV (leb128, one byte)
+        static const int order[3] = { 2, 0, 1 };              // R G B from the SEI's G B R
+        for (int i = 0; i < 3; i++) {
+            put(&b, (unsigned)(((uint64_t)BE16(mdcv + 4 * order[i]) * 131072ull + 50000) / 100000u), 16);
+            put(&b, (unsigned)(((uint64_t)BE16(mdcv + 4 * order[i] + 2) * 131072ull + 50000) / 100000u), 16);
+        }
+        put(&b, (unsigned)(((uint64_t)BE16(mdcv + 12) * 131072ull + 50000) / 100000u), 16); put(&b, (unsigned)(((uint64_t)BE16(mdcv + 14) * 131072ull + 50000) / 100000u), 16);
+        put(&b, (unsigned)(((uint64_t)BE32(mdcv + 16) * 256 + 5000) / 10000), 32); put(&b, (unsigned)(((uint64_t)BE32(mdcv + 20) * 16384 + 5000) / 10000), 32);
+        trailing(&b);
+        n += obu(OBU_METADATA, p, b.bits / 8, out + n);
+    }
+    if (cll) {
+        uint8_t p[8] = { 0 }; Bw b = { p, 0 };
+        put(&b, 1, 8); put(&b, BE16(cll), 16); put(&b, BE16(cll + 2), 16);   // metadata_type HDR_CLL, max_cll, max_fall
+        trailing(&b);
+        n += obu(OBU_METADATA, p, b.bits / 8, out + n);
+    }
+    #undef BE16
+    #undef BE32
+    return n;
 }

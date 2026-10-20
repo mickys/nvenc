@@ -13,6 +13,7 @@ typedef struct {
     int width, height;              // frame size (AV1 codes any size; the decoder crops to it)
     int bit_depth;                  // 8 or 10 (profile 0, 4:2:0)
     bool full_range;                // color_range
+    int colour[3];                  // color_primaries, transfer_characteristics, matrix_coefficients (H.273); 0 = BT.709 (1)
     int seq_level_idx;              // 0 = from the size at 60 fps
     bool enable_cdef, enable_restoration;
     int order_hint_bits;            // 1..8 (0 = 7)
@@ -47,5 +48,8 @@ size_t av1_write_sequence_header(const Av1SeqParams *s, uint8_t *out);    // < 3
 // A frame OBU: the frame header, then a tile group with ntiles tiles (raster order); returns the bytes written
 size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uint8_t *const *tile, const size_t *tile_size,
                        int ntiles, uint8_t *out);
+// Metadata OBUs (6.7) for HDR: mastering display colour volume and content light level, from the H.264 / HEVC SEI
+// payloads (as VideoToolbox holds them: G B R primaries in 0.00002, luminance in 0.0001 cd/m2); either may be NULL
+size_t av1_write_hdr_metadata(const uint8_t *mdcv, const uint8_t *cll, uint8_t *out);
 // A frame header OBU with show_existing_frame = 1: show the (inter) frame in slot `slot` (2-3 bytes)
 size_t av1_write_show_existing(int slot, uint8_t *out);

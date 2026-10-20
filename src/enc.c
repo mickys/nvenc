@@ -103,6 +103,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
         rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000, 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
     memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
+    if (!av1 && (e->cfg.has_mdcv || e->cfg.has_cll) && !(e->seiBuf = malloc(e->bs[0].size + 256))) return -1;
     if (av1) {
         // as NVIDIA's Linux driver sets them up (docs/traces/av1-linux, M12): the four default CDF tables (av1probs.c, the
         // same layout NVDEC uses) 0x3000 apart, the microcode picking one by quantizer (prob_tables_offset); two buffers for
@@ -145,7 +146,7 @@ void enc_close(Enc *e)
                    &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5] };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
     for (int d = 0; d < ENC_MAX_DEPTH; d++) { free(e->av1Tu[d]); e->av1Tu[d] = NULL; }
-    free(e->av1Hid); e->av1Hid = NULL;
+    free(e->av1Hid); e->av1Hid = NULL; free(e->seiBuf); e->seiBuf = NULL;
     for (int d = 0; d < ENC_MAX_DEPTH; d++) {
         RmMem *pm[] = { &e->in[d], &e->setup[d], &e->bs[d], &e->status[d] };
         for (int i = 0; i < 4; i++) if (pm[i]->hPhys) rm_mem_free(&e->rm, pm[i]);
@@ -155,7 +156,7 @@ void enc_close(Enc *e)
 
 static H264Params hdr_params(const Enc *e)
 {
-    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 || e->cfg.lossless ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = e->wmb * e->hmb > 36864 ? 60 : 51, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
+    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] }, .profile_idc = e->cfg.chroma444 || e->cfg.lossless ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = e->wmb * e->hmb > 36864 ? 60 : 51, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = e->cfg.bframes > 0 ? 0 : 2, .log2_max_poc_lsb_minus4 = 4,
         .num_reorder = e->cfg.bframes > 0 ? 1 : 0, .num_ref_frames = e->cfg.num_refs,
         .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100 || e->cfg.chroma444, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
@@ -169,7 +170,7 @@ static HevcParams hevc_params(const Enc *e)
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
         .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs, .num_reorder = e->cfg.bframes > 0 ? 1 : 0,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
-        .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
+        .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] }, .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
         .no_ts = hevc_off("ts") || e->cfg.bit_depth > 8,   /* nullmoth's 10-bit setup turns transform skip off */ .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
         .sis = hevc_off("sis") };
@@ -403,6 +404,9 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
         r->nal_bitrate = r->vcl_bitrate = e->cfg.max_bitrate;
         r->Np = e->cfg.idr_period > 0 ? (e->cfg.idr_period - 1) << 4 : 0x7fffffff;
         r->Ravg = r->R = (int)(perFrame / pixels * 256);
+        // VBR: R = the maximum rate per frame (as NVIDIA's driver sets AV1's, T12.03); with R = the average, a 15 / 30 Mbit/s
+        // VBR came out at 18 Mbit/s on crowd_run, with the maximum 15.4 (T7.05)
+        if (e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17) r->R = (int)((double)e->cfg.max_bitrate / e->cfg.fps / pixels * 256);
         r->Bmin = 0; r->i_size_ratio_x = 1; r->i_size_ratio_y = 1;   // single_frame_vbv stays 0 (T3.08)
     }
 
@@ -688,6 +692,7 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
         r->gop_length = e->cfg.idr_period > 0 ? (unsigned)e->cfg.idr_period : 0xffffffffu;
         r->Np = e->cfg.idr_period > 0 ? (e->cfg.idr_period - 1) << 4 : 0x7fffffff;
         r->Ravg = r->R = (int)(perFrame / pixels * 256);       // bits per pixel per frame, 23.8
+        if (e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17) r->R = (int)((double)e->cfg.max_bitrate / e->cfg.fps / pixels * 256);   // VBR: R = maximum (as HEVC)
         r->Bmin = 0; r->iSizeRatioX = 1; r->iSizeRatioY = 1;
         // single_frame_VBV stays 0: set to 1 (with a one-frame VBV) the rate went to 3x the target at QP 5 (T3.08). A
         // one-frame VBV by itself works: frames stay under bitrate/fps.
@@ -742,8 +747,14 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
 
     // ---- methods ----
 methods:
+    // the 64 KB push buffer starts over once the channel fetched everything: tried from 32 KB on, waited for past 48 KB (a
+    // frame takes well under 1 KB; AV1 once skipped this and ran off the end after ~200 frames)
+    if (chan_push_used(c) > 0x8000 && !chan_rewind(c) && chan_push_used(c) > 0xc000) {
+        const double t0 = now_ms();
+        while (!chan_rewind(c) && now_ms() - t0 < 3000) { struct timespec ts = { 0, 50000 }; nanosleep(&ts, NULL); }
+        if (chan_push_used(c) > 0xc000) { fprintf(stderr, "enc: push buffer not fetched\n"); return -1; }
+    }
     if (av1) { submit_av1(e, ds, idr, b, slot, nRefs, poc); goto execute; }
-    if (chan_push_used(c) > 0x8000) chan_rewind(c);
     NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot;
     NvU64 inVa = e->extInput ? e->extInput : in->gpu;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
@@ -831,6 +842,7 @@ execute:
 static Av1SeqParams av1_seq(const Enc *e)
 {
     return (Av1SeqParams){ .width = e->cfg.width, .height = e->cfg.height, .bit_depth = e->cfg.bit_depth, .full_range = e->cfg.full_range,
+                           .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] },
                            .enable_cdef = true, .enable_restoration = true };
 }
 size_t enc_av1_config(Enc *e, uint8_t *out) { Av1SeqParams sp = av1_seq(e); return av1_write_sequence_header(&sp, out); }
@@ -875,6 +887,7 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
     }
     uint8_t *o = e->av1Tu[ds]; size_t n = av1_write_temporal_delimiter(o);
     if (key) n += av1_write_sequence_header(&sp, o + n);
+    if (key && (e->cfg.has_mdcv || e->cfg.has_cll)) n += av1_write_hdr_metadata(e->cfg.has_mdcv ? e->cfg.mdcv : NULL, e->cfg.has_cll ? e->cfg.cll : NULL, o + n);
     if (e->av1HidN) { memcpy(o + n, e->av1Hid, e->av1HidN); n += e->av1HidN; e->av1HidN = 0; }
     n += av1_write_frame(&sp, &fp, tile, tsz, nt, o + n);
     out->data = o; out->size = n;
@@ -929,6 +942,10 @@ int enc_wait(Enc *e, NvU32 ticket, EncFrame *out)
     // error_status is 2 on good frames too: judge by the microcode error and the bit count
     if (st->ucode_error_status || !st->total_bit_count || st->total_bit_count / 8 >= e->bs[ds].size) { e->forceIdr = true; return -1; }
     out->data = (const uint8_t *)e->bs[ds].cpu + st->bitstream_start_pos; out->size = st->total_bit_count / 8;
+    if (out->idr && (e->cfg.has_mdcv || e->cfg.has_cll) && e->seiBuf) {   // HDR metadata in front of the key frame's slices
+        const size_t sn = hdr_write_sei(e->cfg.codec == ENC_HEVC, e->cfg.has_mdcv ? e->cfg.mdcv : NULL, e->cfg.has_cll ? e->cfg.cll : NULL, e->seiBuf);
+        memcpy(e->seiBuf + sn, out->data, out->size); out->data = e->seiBuf; out->size += sn;
+    }
     if (e->cfg.codec == ENC_AV1) return av1_assemble(e, ds, out);
     return 0;
 }

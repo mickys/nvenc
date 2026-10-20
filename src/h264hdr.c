@@ -53,7 +53,7 @@ size_t h264_write_sps(const H264Params *p, uint8_t *out)
         put(&b, 0, 1);                                 // overscan_info_present
         put(&b, 1, 1);                                 // video_signal_type_present
         put(&b, 5, 3); put(&b, (unsigned)p->full_range, 1);   // video_format unspecified, video_full_range_flag
-        put(&b, 1, 1); put(&b, 1, 8); put(&b, 1, 8); put(&b, 1, 8);   // colour primaries / transfer / matrix: BT.709
+        put(&b, 1, 1); for (int i = 0; i < 3; i++) put(&b, (unsigned)(p->colour[i] ? p->colour[i] : 1), 8);   // colour description
         put(&b, 0, 1);                                 // chroma_loc_info_present
         put(&b, 0, 1);                                 // timing_info_present
         put(&b, 0, 1); put(&b, 0, 1);                  // nal / vcl hrd_parameters_present
@@ -87,4 +87,21 @@ size_t h264_write_pps(const H264Params *p, uint8_t *out)
     if (p->transform_8x8) { put(&b, 1, 1); put(&b, 0, 1); se(&b, 0); }   // transform_8x8_mode, no scaling, 2nd chroma qp
     trailing(&b);
     return emit(&b, 0x68, out);
+}
+
+size_t hdr_write_sei(bool hevc, const uint8_t *mdcv, const uint8_t *cll, uint8_t *out)   // H.264 D.1.29 / D.1.31, H.265 D.2.28 / D.2.35
+{
+    uint8_t rbsp[64]; size_t r = 0;
+    if (mdcv) { rbsp[r++] = 137; rbsp[r++] = 24; memcpy(rbsp + r, mdcv, 24); r += 24; }   // mastering_display_colour_volume
+    if (cll) { rbsp[r++] = 144; rbsp[r++] = 4; memcpy(rbsp + r, cll, 4); r += 4; }         // content_light_level_info
+    if (!r) return 0;
+    rbsp[r++] = 0x80;                                          // rbsp_trailing_bits
+    size_t n = 0; int zeros = 0;
+    out[n++] = 0; out[n++] = 0; out[n++] = 0; out[n++] = 1;
+    if (hevc) { out[n++] = 39 << 1; out[n++] = 1; } else out[n++] = 6;   // prefix SEI (layer 0, TemporalId 0) / SEI
+    for (size_t i = 0; i < r; i++) {
+        if (zeros >= 2 && rbsp[i] <= 3) { out[n++] = 3; zeros = 0; }   // emulation prevention
+        out[n++] = rbsp[i]; zeros = rbsp[i] ? 0 : zeros + 1;
+    }
+    return n;
 }

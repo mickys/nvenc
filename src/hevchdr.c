@@ -99,7 +99,7 @@ size_t hevc_write_sps(const HevcParams *p, uint8_t *out)
         put(&b, 1, 1); put(&b, 1, 8);                           // aspect_ratio_info_present, aspect_ratio_idc 1 (square)
         put(&b, 0, 1);                                          // overscan_info_present
         put(&b, 1, 1); put(&b, 5, 3); put(&b, (unsigned)p->full_range, 1);   // video_signal_type: format unspecified, full range flag
-        put(&b, 1, 1); put(&b, 1, 8); put(&b, 1, 8); put(&b, 1, 8);   // colour primaries / transfer / matrix: BT.709
+        put(&b, 1, 1); for (int i = 0; i < 3; i++) put(&b, (unsigned)(p->colour[i] ? p->colour[i] : 1), 8);   // colour description
         put(&b, 0, 1);                                          // chroma_loc_info_present
         put(&b, 0, 1); put(&b, 0, 1); put(&b, 0, 1);            // neutral_chroma, field_seq, frame_field_info
         put(&b, 0, 1);                                          // default_display_window_flag

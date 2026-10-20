@@ -83,6 +83,12 @@ typedef struct {
     // properties
     int bitrate, maxKeyInterval, fps, quality;
     int refs;                       // reference frames (ReferenceBufferCount; 0 = default)
+    int maxRate, maxVbv;            // DataRateLimits: the first limit as bit/s and its window in bits (0 = none): VBR up to it
+    bool cbr, speed;                // ConstantBitRate set (bitrate = it); PrioritizeEncodingSpeedOverQuality
+    // colour description (H.273 codes; 0 = not given): the ColorPrimaries / TransferFunction / YCbCrMatrix properties, else the
+    // first frame's attachments; HDR metadata as the SEI payloads (MasteringDisplayColorVolume 24 bytes, ContentLightLevelInfo 4)
+    int colour[3];
+    uint8_t mdcv[24], cll[4]; bool hasMdcv, hasCll;
     // diagnostic dump (flag file /tmp/nvencvt.dump): encoded stream from a forced IDR on, and the first 30 input frames
     FILE *dumpEs, *dumpYuv; int dumpYuvLeft; bool dumpIdr;
     bool realTime;
@@ -175,6 +181,15 @@ void build(void)
     CFDictionarySetValue(d, kVTCompressionPropertyKey_H264EntropyMode, enm);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_DataRateLimits, prop(kVTPropertyType_Enumeration, kVTPropertyReadWriteStatus_ReadWrite));
     CFDictionarySetValue(d, kVTCompressionPropertyKey_NumberOfPendingFrames, numRO);
+    // colour description and HDR metadata (T7.05), exact CBR and speed over quality (macOS 12-13 keys)
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_ColorPrimaries, enm);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_TransferFunction, enm);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_YCbCrMatrix, enm);
+    CFDictionaryRef dat = prop(kVTPropertyType_Enumeration, kVTPropertyReadWriteStatus_ReadWrite);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_MasteringDisplayColorVolume, dat);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_ContentLightLevelInfo, dat);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_ConstantBitRate, num);
+    CFDictionarySetValue(d, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, bol);
     CFDictionarySetValue(d, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, prop(kVTPropertyType_Boolean, kVTPropertyReadWriteStatus_ReadOnly));
     gSupported = d;
 }
@@ -213,6 +228,32 @@ static bool profile_ok(const State *s, CFTypeRef v)
 
 static OSStatus set_pixel_attrs(State *s);
 
+// CoreVideo colour strings <-> ITU-T H.273 codes (kind 0 primaries, 1 transfer, 2 matrix)
+static const struct { int kind, code; const CFStringRef *str; } gColour[] = {
+    { 0, 1, &kCVImageBufferColorPrimaries_ITU_R_709_2 }, { 0, 5, &kCVImageBufferColorPrimaries_EBU_3213 }, { 0, 6, &kCVImageBufferColorPrimaries_SMPTE_C },
+    { 0, 9, &kCVImageBufferColorPrimaries_ITU_R_2020 }, { 0, 11, &kCVImageBufferColorPrimaries_DCI_P3 }, { 0, 12, &kCVImageBufferColorPrimaries_P3_D65 },
+    { 1, 1, &kCVImageBufferTransferFunction_ITU_R_709_2 }, { 1, 7, &kCVImageBufferTransferFunction_SMPTE_240M_1995 }, { 1, 8, &kCVImageBufferTransferFunction_Linear },
+    { 1, 13, &kCVImageBufferTransferFunction_sRGB }, { 1, 14, &kCVImageBufferTransferFunction_ITU_R_2020 }, { 1, 16, &kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ },
+    { 1, 17, &kCVImageBufferTransferFunction_SMPTE_ST_428_1 }, { 1, 18, &kCVImageBufferTransferFunction_ITU_R_2100_HLG },
+    { 2, 1, &kCVImageBufferYCbCrMatrix_ITU_R_709_2 }, { 2, 6, &kCVImageBufferYCbCrMatrix_ITU_R_601_4 }, { 2, 7, &kCVImageBufferYCbCrMatrix_SMPTE_240M_1995 },
+    { 2, 9, &kCVImageBufferYCbCrMatrix_ITU_R_2020 } };
+static int colour_code(int kind, CFTypeRef v)
+{
+    if (!v || CFGetTypeID(v) != CFStringGetTypeID()) return 0;
+    for (size_t i = 0; i < sizeof gColour / sizeof gColour[0]; i++) if (gColour[i].kind == kind && CFEqual(v, *gColour[i].str)) return gColour[i].code;
+    return 0;
+}
+static CFStringRef colour_str(int kind, int code)
+{
+    for (size_t i = 0; i < sizeof gColour / sizeof gColour[0]; i++) if (gColour[i].kind == kind && gColour[i].code == code) return *gColour[i].str;
+    return NULL;
+}
+static bool copy_data(CFTypeRef v, uint8_t *dst, CFIndex n)
+{
+    if (!v || CFGetTypeID(v) != CFDataGetTypeID() || CFDataGetLength(v) != n) return false;
+    CFDataGetBytes(v, CFRangeMake(0, n), dst); return true;
+}
+
 static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
 {
     State *s = state(o);
@@ -237,8 +278,24 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
         bool ten = CFEqual(v, kVTProfileLevel_HEVC_Main10_AutoLevel);
         if (ten != s->ten && !s->opened) { s->ten = ten; set_pixel_attrs(s); }
     }
-    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) || CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) ||
-             CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)) { /* accepted: rate limits from AverageBitRate */ }
+    else if (CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)) {   // [bytes, seconds, ...]: the first pair caps the rate (VBR)
+        s->maxRate = 0;
+        if (v && CFGetTypeID(v) == CFArrayGetTypeID() && CFArrayGetCount(v) >= 2) {
+            double bytes = 0, sec = 0; CFTypeRef b0 = CFArrayGetValueAtIndex(v, 0), s0 = CFArrayGetValueAtIndex(v, 1);
+            if (CFGetTypeID(b0) == CFNumberGetTypeID() && CFGetTypeID(s0) == CFNumberGetTypeID()) {
+                CFNumberGetValue(b0, kCFNumberDoubleType, &bytes); CFNumberGetValue(s0, kCFNumberDoubleType, &sec);
+                if (bytes > 0 && sec > 0) { s->maxRate = (int)(bytes * 8 / sec > 2e9 ? 2e9 : bytes * 8 / sec); s->maxVbv = (int)(bytes * 8 > 2e9 ? 2e9 : bytes * 8); }
+            }
+        }
+    }
+    else if (CFEqual(key, kVTCompressionPropertyKey_ConstantBitRate)) { s->bitrate = num(v, 0); s->cbr = s->bitrate > 0; }
+    else if (CFEqual(key, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality)) s->speed = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ColorPrimaries)) s->colour[0] = colour_code(0, v);
+    else if (CFEqual(key, kVTCompressionPropertyKey_TransferFunction)) s->colour[1] = colour_code(1, v);
+    else if (CFEqual(key, kVTCompressionPropertyKey_YCbCrMatrix)) s->colour[2] = colour_code(2, v);
+    else if (CFEqual(key, kVTCompressionPropertyKey_MasteringDisplayColorVolume)) s->hasMdcv = copy_data(v, s->mdcv, 24);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ContentLightLevelInfo)) s->hasCll = copy_data(v, s->cll, 4);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) || CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode)) { /* accepted */ }
     else st = kVTPropertyNotSupportedErr;
     if (gLog) { CFStringRef d = v ? CFCopyDescription(v) : NULL; char k[128], vb[256] = "";
         CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); if (d) { CFStringGetCString(d, vb, sizeof vb, kCFStringEncodingUTF8); CFRelease(d); }
@@ -264,6 +321,14 @@ static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRe
     else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && !s->av1) v = CFRetain(s->hevc ? (s->ten ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
                                                                              : h264_high(s) ? kVTProfileLevel_H264_High_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel);
     else if (CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode) && !s->hevc && !s->av1) v = CFRetain(h264_cabac(s) ? kVTH264EntropyMode_CABAC : kVTH264EntropyMode_CAVLC);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ConstantBitRate)) { n = s->cbr ? s->bitrate : 0; v = CFNumberCreate(al, kCFNumberIntType, &n); }
+    else if (CFEqual(key, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality)) v = CFRetain(s->speed ? kCFBooleanTrue : kCFBooleanFalse);
+    else if ((CFEqual(key, kVTCompressionPropertyKey_ColorPrimaries) && colour_str(0, s->colour[0])) || (CFEqual(key, kVTCompressionPropertyKey_TransferFunction) && colour_str(1, s->colour[1])) ||
+             (CFEqual(key, kVTCompressionPropertyKey_YCbCrMatrix) && colour_str(2, s->colour[2])))
+        v = CFRetain(colour_str(CFEqual(key, kVTCompressionPropertyKey_ColorPrimaries) ? 0 : CFEqual(key, kVTCompressionPropertyKey_TransferFunction) ? 1 : 2,
+                                s->colour[CFEqual(key, kVTCompressionPropertyKey_ColorPrimaries) ? 0 : CFEqual(key, kVTCompressionPropertyKey_TransferFunction) ? 1 : 2]));
+    else if (CFEqual(key, kVTCompressionPropertyKey_MasteringDisplayColorVolume) && s->hasMdcv) v = CFDataCreate(al, s->mdcv, 24);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ContentLightLevelInfo) && s->hasCll) v = CFDataCreate(al, s->cll, 4);
     else if (CFEqual(key, kVTCompressionPropertyKey_NumberOfPendingFrames)) { n = s->npend; v = CFNumberCreate(al, kCFNumberIntType, &n); }
     else if (CFEqual(key, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder)) v = CFRetain(kCFBooleanTrue);
     else { if (gLog) { char k[128]; CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); LOG("copy %s: not available", k); } return kCMBaseObjectError_ValueNotAvailable; }
@@ -319,6 +384,23 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 }
 
 static void *completion(void *arg);
+
+// The format description gets the colour description and HDR metadata too, so AVAssetWriter writes colr / mdcv / clli
+// (and players read them without parsing the stream)
+static void add_fmt_extensions(State *s)
+{
+    CFDictionaryRef ext = CMFormatDescriptionGetExtensions(s->fmt);
+    CFMutableDictionaryRef m = ext ? CFDictionaryCreateMutableCopy(NULL, 0, ext) : CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const CFStringRef keys[3] = { kCMFormatDescriptionExtension_ColorPrimaries, kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix };
+    for (int k = 0; k < 3; k++) { CFStringRef v = colour_str(k, s->enc.cfg.colour[k] ? s->enc.cfg.colour[k] : 1); if (v) CFDictionarySetValue(m, keys[k], v); }
+    if (s->enc.cfg.has_mdcv) { CFDataRef d = CFDataCreate(NULL, s->enc.cfg.mdcv, 24); CFDictionarySetValue(m, kCMFormatDescriptionExtension_MasteringDisplayColorVolume, d); CFRelease(d); }
+    if (s->enc.cfg.has_cll) { CFDataRef d = CFDataCreate(NULL, s->enc.cfg.cll, 4); CFDictionarySetValue(m, kCMFormatDescriptionExtension_ContentLightLevelInfo, d); CFRelease(d); }
+    CMVideoDimensions dm = CMVideoFormatDescriptionGetDimensions(s->fmt);
+    CMVideoFormatDescriptionRef f2 = NULL;
+    if (!CMVideoFormatDescriptionCreate(NULL, CMFormatDescriptionGetMediaSubType(s->fmt), dm.width, dm.height, m, &f2)) { CFRelease(s->fmt); s->fmt = f2; }
+    CFRelease(m);
+}
+
 static OSStatus open_encoder(State *s)
 {
     // reference frames (every codec): ReferenceBufferCount if the client set it, else NVENCVT_REFS, else 3. Pictures that come back
@@ -346,7 +428,7 @@ static OSStatus open_encoder(State *s)
           ? (getenv("NVENCVT_BFRAMES") ? atoi(getenv("NVENCVT_BFRAMES")) : 2) : 0;
     s->bf = s->bf < 0 ? 0 : s->bf > VT_MAX_B ? VT_MAX_B : s->bf;
     if (s->bf && refs < 2) refs = 2;
-    c.num_refs = refs; c.bframes = s->bf; c.quality = !s->realTime && !getenv("NVENCVT_FAST");
+    c.num_refs = refs; c.bframes = s->bf; c.quality = !s->realTime && !s->speed && !getenv("NVENCVT_FAST");
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;
     c.qp_i = qp; c.qp_p = qp + 2;
@@ -354,7 +436,13 @@ static OSStatus open_encoder(State *s)
     if (s->bitrate > 0) {
         c.rc_mode = 18; c.bitrate = s->bitrate; c.max_bitrate = s->bitrate;
         c.vbv_bits = s->realTime ? s->bitrate / c.fps * 2 : s->bitrate;
+        if (!s->cbr && s->maxRate > s->bitrate) { c.rc_mode = 17; c.max_bitrate = s->maxRate; c.vbv_bits = s->maxVbv; }   // DataRateLimits: VBR
     }
+    // colour description (H.273) and HDR metadata; RGB input is converted with BT.709's matrix by us, so that is signalled
+    for (int k = 0; k < 3; k++) c.colour[k] = s->colour[k];
+    if (s->lastPf == kCVPixelFormatType_32BGRA || s->lastPf == kCVPixelFormatType_ARGB2101010LEPacked) c.colour[2] = 1;
+    if (s->hasMdcv) { memcpy(c.mdcv, s->mdcv, 24); c.has_mdcv = true; }
+    if (s->hasCll) { memcpy(c.cll, s->cll, 4); c.has_cll = true; }
     c.depth = getenv("NVENCVT_DEPTH") ? atoi(getenv("NVENCVT_DEPTH")) : 2;   // frames in flight
     // the engine with fewer sessions in this process (a second session runs on NVENC1, in parallel)
     pthread_mutex_lock(&gEngineLock);
@@ -396,6 +484,8 @@ static OSStatus open_encoder(State *s)
         c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, c.bframes, (int)c.quality, (int)st);
     if (st) { enc_close(&s->enc); return st; }
 opened:
+    add_fmt_extensions(s);
+    LOG("colour %d/%d/%d%s%s", s->enc.cfg.colour[0], s->enc.cfg.colour[1], s->enc.cfg.colour[2], s->enc.cfg.has_mdcv ? ", mastering display" : "", s->enc.cfg.has_cll ? ", content light level" : "");
     s->opened = true;
     s->stop = false;
     const char *sf = getenv("NVENCVT_STATS");
@@ -546,6 +636,11 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
                               (s->ten && (p0 == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange || p0 == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange))); }
     if (!s->opened && s->av1) { OSType p0 = CVPixelBufferGetPixelFormatType(img);   // AV1: 10-bit when the input is
         s->ten = p0 == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || p0 == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange || p0 == kCVPixelFormatType_ARGB2101010LEPacked; }
+    if (!s->opened) {   // colour not given as properties: the first frame's attachments (T7.05); its format for the RGB rule
+        static const CFStringRef *keys[3] = { &kCVImageBufferColorPrimariesKey, &kCVImageBufferTransferFunctionKey, &kCVImageBufferYCbCrMatrixKey };
+        for (int k = 0; k < 3; k++) if (!s->colour[k]) { CFTypeRef a = CVBufferCopyAttachment(img, *keys[k], NULL); s->colour[k] = colour_code(k, a); if (a) CFRelease(a); }
+        s->lastPf = CVPixelBufferGetPixelFormatType(img);
+    }
     if (!s->opened && !s->failed && (st = open_encoder(s))) s->failed = true;
     if (s->failed) { pthread_mutex_unlock(&s->lock); VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL); return kVTVideoEncoderMalfunctionErr; }
     OSType pf = CVPixelBufferGetPixelFormatType(img);

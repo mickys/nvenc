@@ -73,3 +73,14 @@ H.264 ME / MD controls (`EncConfig.quality`; `NVENCVT_FAST=1` keeps the fast one
   display order (the first: its PTS minus one duration). With non-reference B pictures `num_reorder_frames` is 1: a B
   picture decodes when it is shown, an anchor one picture before the first B picture that waits for it. B samples carry
   `IsDependedOnByOthers = false`.
+
+## Colour, HDR and rate properties (T7.05)
+
+- Colour: `ColorPrimaries` / `TransferFunction` / `YCbCrMatrix` (CoreVideo strings, mapped to H.273 codes: BT.709, BT.601 625 / 525,
+  BT.2020, DCI-P3, P3-D65; BT.709 / 240M / linear / sRGB / BT.2020 / PQ / ST 428 / HLG), else the first frame's attachments,
+  else BT.709. Written to the VUI / AV1 colour config and to the format description.
+- HDR: `MasteringDisplayColorVolume` (24 bytes) and `ContentLightLevelInfo` (4 bytes) in the SEI payload layout; sent with every
+  key frame (SEI NAL unit / AV1 metadata OBUs) and as format description extensions.
+- Rate: `AverageBitRate` alone = MB-row CBR (VBV one second, two frames in real time); `ConstantBitRate` the same at its rate;
+  `DataRateLimits` [bytes, seconds] above the average = MB-row VBR capped there. `PrioritizeEncodingSpeedOverQuality` = the fast
+  controls when not real time.
