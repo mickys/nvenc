@@ -6,6 +6,7 @@
 // CHROMA444=1 (HEVC 4:4:4; the source file is then planar yuv444p).
 // Writes the Annex B stream (SPS + PPS once, then every picture; AV1: an IVF file) and all source frames for h264check.
 #include "enc.h"
+#include "la.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,7 +54,7 @@ int main(int argc, char **argv)
                       .rc_mode = getenv("RC") ? atoi(getenv("RC")) : 0, .bitrate = getenv("BITRATE") ? atoi(getenv("BITRATE")) : 0,
                       .max_bitrate = getenv("MAXRATE") ? atoi(getenv("MAXRATE")) : 0, .vbv_bits = getenv("VBV") ? atoi(getenv("VBV")) : 0,
                       .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1, .bit_depth = getenv("BITDEPTH") ? atoi(getenv("BITDEPTH")) : 8,
-                      .chroma444 = getenv("CHROMA444") != NULL, .lossless = getenv("LOSSLESS") != NULL, .bframes = getenv("BFRAMES") ? atoi(getenv("BFRAMES")) : 0, .quality = getenv("QUALITY") != NULL, .aq = getenv("AQ") ? atoi(getenv("AQ")) : 0, .cabac = getenv("CABAC") != NULL, .h264_profile = getenv("HIGH") ? 100 : 77 };
+                      .chroma444 = getenv("CHROMA444") != NULL, .lossless = getenv("LOSSLESS") != NULL, .bframes = getenv("BFRAMES") ? atoi(getenv("BFRAMES")) : 0, .quality = getenv("QUALITY") != NULL, .aq = getenv("AQ") ? atoi(getenv("AQ")) : 0, .two_pass = getenv("TWOPASS") != NULL, .cabac = getenv("CABAC") != NULL, .h264_profile = getenv("HIGH") ? 100 : 77 };
     if (getenv("COLOUR")) sscanf(getenv("COLOUR"), "%d,%d,%d", &cfg.colour[0], &cfg.colour[1], &cfg.colour[2]);   // COLOUR=9,16,9 (H.273 codes)
     if (getenv("HDR")) {   // HDR=1: P3-D65 mastering display, 1000 / 0.005 cd/m2, MaxCLL 1000, MaxFALL 400 (SEI byte layout)
         static const uint8_t m[24] = { 0x33, 0xc2, 0x86, 0xc4, 0x1d, 0x4c, 0x0b, 0xb8, 0x84, 0xd0, 0x3e, 0x80, 0x3d, 0x13, 0x40, 0x42,
@@ -69,26 +70,56 @@ int main(int argc, char **argv)
         fwrite(ih, 1, 32, fh);
     }
     uint8_t *y = malloc((size_t)W * H), *uv = malloc((size_t)W * CH);
+    // LOOKAHEAD=1 (T7.09, research): every frame through the lookahead analysis first (la.c: NVIDIA's quarter-size QP 40
+    // H.264 pass), printed with -v; with SCENECUT=thr an IDR at each cut. (NVIDIA's per-picture lookahead hints, ab_beta /
+    // prev_act, change nothing on this engine: identical output for any value)
+    const int L = getenv("LOOKAHEAD") ? atoi(getenv("LOOKAHEAD")) : 0;
+    double *laRatio = NULL;
+    if (L > 0) {
+        La la; if (la_open(&la, W, H, cfg.engine)) return 1;
+        laRatio = calloc((size_t)N, sizeof *laRatio); double laMs = 0;
+        for (int f = 0; f < N; f++) {
+            frame(y, uv, W, H, f); LaStat st;
+            if (la_push(&la, y, W, uv, W, false, &st)) { fprintf(stderr, "lookahead failed at frame %d\n", f); return 1; }
+            laRatio[f] = st.inter && st.intra ? (double)st.inter / st.intra : -1; laMs += st.ms;
+            if (verbose) printf("lookahead %3d: intra %u inter %u (%.3f) bits %u\n", f, st.intra, st.inter, laRatio[f], st.bits);
+        }
+        printf("lookahead %dx%d: %.3f ms per frame\n", la.w, la.h, laMs / N);
+        la_close(&la);
+    }
+    // SCENECUT=thr (with LOOKAHEAD): an IDR where the lookahead's inter / intra complexity ratio passes thr (a cut: the
+    // previous frame predicts nothing; steady content 0.7-0.85 on crowd_run / park_joy, cuts 1.6-2.2)
+    const double cutThr = getenv("SCENECUT") ? atof(getenv("SCENECUT")) : 0;
+    #define IS_CUT(f) (cutThr > 0 && laRatio && (f) > 0 && (f) < N && laRatio[f] > cutThr)
     if (cfg.bframes > 0) {   // BFRAMES=n (H.264, HEVC, AV1): IDR, then each anchor followed by the n B pictures before it
         for (int f = 0; f < N; f++) { frame(y, uv, W, H, f); fwrite(y, 1, (size_t)W * H, fs); fwrite(uv, 1, (size_t)W * CH, fs); }
         int fails = 0; double bits = 0, ms = 0; int prev = 0, coded = 0, tu = 0;
         // AV1: IVF frames = temporal units in display order (a hidden anchor goes with the next one; after the B pictures,
         // the unit that shows the anchor)
         #define IVF_TU(d, n) do { if (av1) { uint8_t fhd_[12] = { (uint8_t)(n), (uint8_t)((n) >> 8), (uint8_t)((n) >> 16), (uint8_t)((n) >> 24), (uint8_t)tu, (uint8_t)(tu >> 8) }; fwrite(fhd_, 1, 12, fh); tu++; } fwrite(d, 1, n, fh); } while (0)
+        // IDR_PERIOD: an IDR every that many pictures in display order; the pictures before it are coded first (the last of
+        // them as an anchor), so no B picture references across the IDR (as libnvencvt does)
+        const int P = cfg.idr_period;
         for (int a = 0; a < N && !fails; ) {   // a: the next anchor in display order
+            const bool key = a == 0 || (P > 0 && a % P == 0) || IS_CUT(a);
             int order[16], no = 0; order[no++] = a; for (int k = prev + 1; k < a; k++) order[no++] = k;
             if (a == 0) no = 1;
             for (int i = 0; i < no; i++) {
                 const int disp = order[i]; const bool bp = i > 0;
                 frame(y, uv, W, H, disp); enc_load_nv12(&e, y, W, uv, W);
                 EncFrame fr;
-                if (enc_encode_ex(&e, false, bp, disp, &fr)) { printf("frame %d FAILED (ucode error %u)\n", disp, fr.ucode_error); fails++; break; }
+                if (enc_encode_ex(&e, key && i == 0 && a > 0, bp, disp, &fr)) { printf("frame %d FAILED (ucode error %u)\n", disp, fr.ucode_error); fails++; break; }
                 if (!fr.hidden) IVF_TU(fr.data, fr.size);
                 bits += fr.bits; ms += fr.ms; coded++;
                 if (av1 && bp && i == no - 1 && no > 1) { uint8_t se[16]; size_t sn = enc_av1_show_existing(&e, se); IVF_TU(se, sn); }
                 if (verbose || coded <= 4) printf("coded %3d: display %3d %s%s poc %3u: %8u bits, %.3f ms, avgQP %u, intra %u inter %u MBs\n", coded - 1, disp, fr.idr ? "IDR" : bp ? "B  " : "P  ", fr.hidden ? " (hidden)" : "", fr.poc, fr.bits, fr.ms, fr.avg_qp, fr.intra_mbs, fr.inter_mbs);
             }
             prev = a; a = a == 0 ? (cfg.bframes + 1 < N ? cfg.bframes + 1 : N - 1) : (a + cfg.bframes + 1 < N ? a + cfg.bframes + 1 : (a == N - 1 ? N : N - 1));
+            if (a < N) {   // the next IDR (period or cut): alone, right after the anchor before it
+                int k = P > 0 ? (prev / P + 1) * P : N;
+                for (int c = prev + 1; c < k && c <= a; c++) if (IS_CUT(c)) { k = c; break; }
+                if (a >= k) a = k - 1 > prev ? k - 1 : k;
+            }
         }
         printf("%d frames %dx%d with B pictures (%d between anchors): %.1f kbit/frame, %.2f Mbit/s at 60 fps, encode %.3f ms avg, %d failed\n",
                coded, W, H, cfg.bframes, bits / coded / 1000, bits / coded * 60 / 1e6, ms / coded, fails);
@@ -113,7 +144,7 @@ int main(int argc, char **argv)
         enc_load_nv12(&e, y, W, uv, W);
         }
         EncFrame fr;
-        if (enc_encode(&e, false, &fr)) { printf("frame %d FAILED (ucode error %u)\n", f, fr.ucode_error); fails++; break; }
+        if (enc_encode(&e, IS_CUT(f), &fr)) { printf("frame %d FAILED (ucode error %u)\n", f, fr.ucode_error); fails++; break; }
         if (av1) { uint8_t fhd[12] = { (uint8_t)fr.size, (uint8_t)(fr.size >> 8), (uint8_t)(fr.size >> 16), (uint8_t)(fr.size >> 24), (uint8_t)f, (uint8_t)(f >> 8) }; fwrite(fhd, 1, 12, fh); }
         fwrite(fr.data, 1, fr.size, fh);
         bits += fr.bits; ms += fr.ms; if (fr.ms > msMax) msMax = fr.ms;

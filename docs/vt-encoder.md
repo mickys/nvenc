@@ -56,6 +56,14 @@ Other exports a full encoder will want: `VTEncoderSessionSetPixelBufferAttribute
 `VTEncoderSessionCreateVideoFormatDescription`, `VTEncoderSessionCreateCMBlockBuffer`. The format description can
 also come from the public `CMVideoFormatDescriptionCreateFromH264ParameterSets`, as the probe does.
 
+## Rate control (T7.05, T7.08, T7.09)
+
+With a bitrate `libnvencvt` runs the engine's MB-row CBR (rc 18; `DataRateLimits` above the average: MB-row VBR, rc 17),
+NVIDIA's CBR fields, and the RC process buffer initialized as NVIDIA's driver does it (complexity weights, GOP counts, CPB
+half full: on target and no oversized first IDR). `NVENCVT_TWOPASS=1` turns on NVIDIA's two-pass mode (`EncConfig.two_pass`:
+a first pass per picture writes statistics the second reads; HEVC I / P only); off by default, because over long runs it
+gives -0.25..+0.65 VMAF at equal rate for 2x (H.264) / +7 % (HEVC) engine time.
+
 ## B pictures (T7.03)
 
 `libnvencvt` reorders when `AllowFrameReordering` is true (VideoToolbox's default; AVAssetWriter never sets it, OBS sets it

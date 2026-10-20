@@ -10,6 +10,11 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, rate control (T7.09):** NVIDIA's two-pass and lookahead traced and tried. Two-pass: -0.25..+0.65 VMAF at equal rate
+  over 900 frames for 2x (H.264) / +7 % (HEVC) engine time, off by default (`NVENCVT_TWOPASS=1`). The real gain came from
+  initializing the RC process buffer as the driver does (ours was zero, so the first IDR took ~37 frames' budget): +0.6-1.0 VMAF
+  at equal rate over 900 frames and the rate on target (7.21 for 7.2 Mbit/s instead of 7.44); VBR, broken by T7.08 (it ran at
+  its maximum), fixed. Lookahead: the engine ignores its hints; scene-cut IDRs lowered VMAF. Raw: `docs/bench/2026-10-20-rc-matrix.txt`.
 - **2026-10-20, full rerun** (`docs/bench/2026-10-20-rerun.txt`, nvenc `e29f761`; tables above): after the frame-rate fix
   (T7.05), the HEVC p7 controls and NVIDIA's CBR fields (T7.08), 300 frames at 4K. **HEVC caught up with x265:** 1080p crowd_run /
   park_joy 62.1 / 65.1 VMAF (baseline 56.8 / 59.2 at 8-10 % under the target; x265 fast 61.6 / 65.7), 4K 72.2 / 72.7 (baseline

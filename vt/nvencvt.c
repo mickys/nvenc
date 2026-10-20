@@ -445,6 +445,7 @@ static OSStatus open_encoder(State *s)
         c.rc_mode = 18; c.bitrate = s->bitrate; c.max_bitrate = s->bitrate;
         c.vbv_bits = s->realTime ? s->bitrate / c.fps * 2 : s->bitrate;
         if (!s->cbr && s->maxRate > s->bitrate) { c.rc_mode = 17; c.max_bitrate = s->maxRate; c.vbv_bits = s->maxVbv; }   // DataRateLimits: VBR
+        c.two_pass = getenv("NVENCVT_TWOPASS") != NULL;   // two passes per frame (T7.09; enc.c), H.264 / HEVC
     }
     // colour description (H.273) and HDR metadata; RGB input is converted with BT.709's matrix by us, so that is signalled
     for (int k = 0; k < 3; k++) c.colour[k] = s->colour[k];

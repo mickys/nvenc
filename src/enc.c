@@ -28,6 +28,14 @@ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &
 // AV1: the RC data buffer's activity and pass-2 areas (the driver's offsets: 0x100 + n, 0x100 + 2n; n = 64 bytes per MB, in pages)
 static size_t av1_rc_area(const Enc *e) { return (((size_t)e->wmb * e->hmb * 64) + 0xfff) & ~(size_t)0xfff; }
 
+// rate control: the anchors (I / P) per GOP, as nvenc_drv.h defines Np, (gop_length + num_b_frames - 1) / (num_b_frames + 1);
+// NVIDIA's CBR trace (P only) has GOP - 1. With 2 B pictures GOP - 1 made the RC start far too high with two passes (T7.09)
+static int rc_np(const Enc *e)
+{
+    const int gop = e->cfg.idr_period, bf = e->cfg.bframes > 0 ? e->cfg.bframes : 0;
+    return gop > 0 ? (gop + bf - 1) / (bf + 1) : 0x7fffffff;
+}
+
 int enc_open(Enc *e, const EncConfig *cfg)
 {
     memset(e, 0, sizeof *e);
@@ -106,6 +114,17 @@ int enc_open(Enc *e, const EncConfig *cfg)
         rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000 + (size_t)ENC_MAX_DEPTH * ((((size_t)H + 31) / 32 * 256 + 0xfff) & ~(size_t)0xfff), 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
     memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
+    if (av1 || !e->cfg.rc_mode) e->cfg.two_pass = false;
+    if (e->cfg.two_pass) {   // the first pass's own outputs (NVIDIA's status buffer for it: 2.3 MB at 1080p, per-MB statistics)
+        for (int d = 0; d < e->cfg.depth; d++)
+            if (rm_mem_alloc(rm, &e->setup1[d], SETUP_SIZE, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
+        if (rm_mem_alloc(rm, &e->bs1, e->bs[0].size, 0x1000, false, false, true) ||
+            rm_mem_alloc(rm, &e->status1, ((mbs + 3) * 256 + 0x1ffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
+            rm_mem_alloc(rm, &e->hist1, histSz, 0x1000, false, false, true) ||
+            rm_mem_alloc(rm, &e->rec1, e->rSlot, 0x10000, false, false, true) ||
+            rm_mem_alloc(rm, &e->coloc1, (mbs * 64 + 0xffff) & ~(size_t)0xffff, 0x1000, false, false, true) ||
+            rm_mem_alloc(rm, &e->mepred1, meSz, 0x1000, false, false, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
+    }
     if (!av1 && (e->cfg.has_mdcv || e->cfg.has_cll) && !(e->seiBuf = malloc(e->bs[0].size + 256))) return -1;
     if (av1) {
         // as NVIDIA's Linux driver sets them up (docs/traces/av1-linux, M12): the four default CDF tables (av1probs.c, the
@@ -129,6 +148,21 @@ int enc_open(Enc *e, const EncConfig *cfg)
     if (!e->cfg.fps) e->cfg.fps = 60;
     if (!e->cfg.vbv_bits) e->cfg.vbv_bits = e->cfg.bitrate;
     if (!e->cfg.max_bitrate) e->cfg.max_bitrate = e->cfg.bitrate;
+    if (!av1 && e->cfg.rc_mode) {
+        // the RC process buffer's initial state (nvenc_persistent_state_s), which the driver fills (nvenc_drv.h 2.9:
+        // NVENC_RC_INIT_COMPLEXITY): P / B / I complexity in bits per pixel at Qs 1 (27.4; NVIDIA's values at 1080p: 15-19 /
+        // 5-6 / 35-41), the GOP's P / B counts, the CPB half full. Left at zero the model thinks bits are free: the first IDR
+        // took ~37 frames' budget (4.6 Mbit at QP 21 for 120 kbit frames) and the rest of a short clip starved. T7.09: +0.6-1.0
+        // VMAF at equal rate over 900 frames, the rate on target (7.21 for 7.2 Mbit/s instead of 7.44). ENC_RCINIT=wp,wb,wi,full
+        int wp = 16, wb = 6, wi = 38; double full = 0.5;
+        if (getenv("ENC_RCINIT")) sscanf(getenv("ENC_RCINIT"), "%d,%d,%d,%lf", &wp, &wb, &wi, &full);
+        nvenc_persistent_state_s *ps = e->rcproc.cpu;
+        const int w[3] = { wp, wb, wi };
+        for (int k = 0; k < 3; k++) { ps->Wpbi[k] = w[k]; for (int t = 0; t < 3; t++) ps->Whist[k][t] = w[k]; }
+        const int gop = e->cfg.idr_period, np = rc_np(e);
+        if (gop > 0) { ps->np = np << 4; ps->nb = (gop - 1 - np) << 4; }
+        ps->nal_cpb_fullness = ps->vcl_cpb_fullness = (int)(full * e->cfg.vbv_bits * 16);
+    }
 
     NV_NVENC_ALLOCATION_PARAMETERS ep = { .size = sizeof ep, .engineInstance = (NvU32)cfg->engine };
     if (chan_create(rm, &e->chan, cfg->engine ? NV2080_ENGINE_TYPE_NVENC1 : NV2080_ENGINE_TYPE_NVENC0, NVC9B7_VIDEO_ENCODER, &ep)) return -1;
@@ -146,13 +180,14 @@ void enc_close(Enc *e)
     if (e->ev.h) rm_event_close(&e->rm, &e->ev);
     chan_destroy(&e->chan);
     RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->colocB, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata, &e->av1ProbIn, &e->av1Prob,
-                   &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5] };
+                   &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5],
+                   &e->bs1, &e->status1, &e->hist1, &e->rec1, &e->coloc1, &e->mepred1 };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
     for (int d = 0; d < ENC_MAX_DEPTH; d++) { free(e->av1Tu[d]); e->av1Tu[d] = NULL; }
     free(e->av1Hid); e->av1Hid = NULL; free(e->seiBuf); e->seiBuf = NULL;
     for (int d = 0; d < ENC_MAX_DEPTH; d++) {
-        RmMem *pm[] = { &e->in[d], &e->setup[d], &e->bs[d], &e->status[d] };
-        for (int i = 0; i < 4; i++) if (pm[i]->hPhys) rm_mem_free(&e->rm, pm[i]);
+        RmMem *pm[] = { &e->in[d], &e->setup[d], &e->bs[d], &e->status[d], &e->setup1[d] };
+        for (int i = 0; i < 5; i++) if (pm[i]->hPhys) rm_mem_free(&e->rm, pm[i]);
     }
     rm_close(&e->rm);
 }
@@ -456,10 +491,12 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
         // VBR came out at 18 Mbit/s on crowd_run, with the maximum 15.4 (T7.05)
         if (e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17) r->R = (int)((double)e->cfg.max_bitrate / e->cfg.fps / pixels * 256);
         r->Bmin = 0; r->i_size_ratio_x = 1; r->i_size_ratio_y = 1;   // single_frame_vbv stays 0 (T3.08)
-        // NVIDIA's CBR fields (docs/traces/quality-linux vcbr, T7.08): HRD type 34, P / B / I weights, Np = the GOP's P count,
+        // NVIDIA's CBR fields (docs/traces/quality-linux vcbr, T7.08): HRD type 34, P / B / I weights, Np = the GOP's anchors,
         // a minimum buffer level; with 2 B pictures +0.5-1.1 VMAF on crowd_run / park_joy at 6 Mbit/s, P only the same
-        r->hrd_type = 34; r->rhopbi[0] = 286; r->rhopbi[1] = 317; r->rhopbi[2] = 256;
-        r->Np = e->cfg.idr_period > 0 ? e->cfg.idr_period - 1 : 0x7fffffff; r->Bmin = (int)(r->buffersize / 81920); r->Ravg = 0;
+        if ((e->cfg.rc_mode & 3) == 2) {   // CBR only (with Ravg 0 VBR ran at its maximum rate: T7.09)
+            r->hrd_type = 34; r->rhopbi[0] = 286; r->rhopbi[1] = 317; r->rhopbi[2] = 256;
+            r->Np = rc_np(e); r->Bmin = (int)(r->buffersize / 81920); r->Ravg = 0;
+        }
     }
 
     int ctbW = (W + 31) / 32, ctbH = (H + 31) / 32, ctbs = ctbW * ctbH, lg = 0;
@@ -695,6 +732,30 @@ static void submit_av1(Enc *e, int ds, bool idr, bool isB, int slot, int nRefs, 
     e->pend[ds].lf = lf;
 }
 
+// two passes (T7.09), as NVIDIA's driver runs -multipass fullres (docs/traces/quality-linux vmp, HEVC at p4): the first pass
+// is the frame's setup with two_pass_rc 1 and cheaper mode decision (its MD block, no transform skip, quantizer cost vectors,
+// SAO; FPP partition decision, one ME winner); the second has two_pass_rc 2 and takes MV hints from the first pass's motion
+// vectors (its ME predictor sources and search shapes). H.264 (not traced): only two_pass_rc, unless ENC_MP_HINT is set.
+static void two_pass_setups(Enc *e, RmMem *setup, RmMem *setup1, bool hevc)
+{
+    NvU8 *s2 = setup->cpu, *s1 = setup1->cpu;
+    memcpy(s1, s2, SETUP_SIZE);
+    nvenc_h264_me_control_s *me1 = (void *)(s1 + OFF_ME);
+    const bool hint = hevc ? !getenv("ENC_MP_NOHINT") : getenv("ENC_MP_HINT") != NULL;
+    if (hint) { memcpy(s2 + OFF_ME + 12, hevc_mp2_me + 12, 16); memcpy(s2 + OFF_ME + 44, hevc_mp2_me + 44, 48); }   // predsrc, shape0-3
+    if (hevc) {
+        nvenc_h265_drv_pic_setup_s *p2 = (void *)s2, *p1 = (void *)s1;
+        p2->rate_control.two_pass_rc = 2; p1->rate_control.two_pass_rc = 1;
+        p1->pps_data.transform_skip_enabled_flag = 0;
+        me1->Cu16partDecisionMadeByFPP = 1; me1->fbm_op_winner_num_p_frame = 1;
+        memcpy(s1 + OFF_MD, hevc_mp1_md, sizeof hevc_mp1_md); memset(s1 + OFF_Q, 0, 16);
+        nvenc_h265_slice_control_s *sc = (void *)(s1 + OFF_SLICE);
+        sc->qp_slice_max = 51; sc->slice_sao_luma_flag = 0; sc->slice_sao_chroma_flag = 0;
+    } else {
+        ((nvenc_h264_drv_pic_setup_s *)s2)->rate_control.two_pass_rc = 2; ((nvenc_h264_drv_pic_setup_s *)s1)->rate_control.two_pass_rc = 1;
+    }
+}
+
 int enc_submit(Enc *e, bool force_idr, NvU32 *ticket) { return enc_submit_ex(e, force_idr, false, -1, ticket); }
 
 int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
@@ -704,7 +765,9 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
     RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
     if (enc_inflight(e) >= e->cfg.depth) return -1;
     const bool b = isB && e->cfg.bframes > 0 && e->nRefs >= 2;
-    bool idr = !b && (force_idr || e->forceIdr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period));
+    // the IDR period applies to pictures in coding order (enc_submit); with display indices (enc_submit_ex) the caller places
+    // the IDRs (force_idr) after coding the pictures before them, else B pictures would reference across the IDR
+    bool idr = !b && (force_idr || e->forceIdr || e->seq == 0 || (disp < 0 && e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period));
     e->forceIdr = false;
     if (idr) { e->frame_num = 0; e->sinceIdr = 0; e->nRefs = 0; if (disp >= 0) e->idrDisp = disp; }
     int slot = b ? e->bSlot : e->nextSlot;                    // where this picture's reconstruction goes
@@ -757,8 +820,10 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
         if (e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17) r->R = (int)((double)e->cfg.max_bitrate / e->cfg.fps / pixels * 256);   // VBR: R = maximum (as HEVC)
         r->Bmin = 0; r->iSizeRatioX = 1; r->iSizeRatioY = 1;
         // NVIDIA's CBR fields, as for HEVC (docs/traces/quality-linux hcbr, T7.08): with 2 B pictures +0.7-0.8 VMAF
-        r->hrd_type = 34; r->rhopbi[0] = 286; r->rhopbi[1] = 317; r->rhopbi[2] = 256;
-        r->Np = e->cfg.idr_period > 0 ? e->cfg.idr_period - 1 : 0x7fffffff; r->Bmin = (int)(r->buffersize / 81920); r->Ravg = 0;
+        if ((e->cfg.rc_mode & 3) == 2) {   // CBR only (with Ravg 0 VBR ran at its maximum rate: T7.09)
+            r->hrd_type = 34; r->rhopbi[0] = 286; r->rhopbi[1] = 317; r->rhopbi[2] = 256;
+            r->Np = rc_np(e); r->Bmin = (int)(r->buffersize / 81920); r->Ravg = 0;
+        }
         // single_frame_VBV stays 0: set to 1 (with a one-frame VBV) the rate went to 3x the target at QP 5 (T3.08). A
         // one-frame VBV by itself works: frames stay under bitrate/fps.
     }
@@ -808,10 +873,19 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
             nvenc_h264_md_control_s *md = (void *)(base + OFF_MD); md->intra_luma8x8_mode_enable = 0x1ff;
         }
     }
+    if (e->cfg.la_pass) {   // lookahead pictures (la.c): NVIDIA's controls for them (docs/traces/quality-linux vla, T7.09)
+        NvU8 *base = setup->cpu;
+        memcpy(base + OFF_ME, idr ? h264_la_me_idr : h264_la_me_p, 0x100); memcpy(base + OFF_MD, idr ? h264_la_md_idr : h264_la_md_p, 0x100);
+        memcpy(base + OFF_Q, h264_la_q, 0x100);
+    }
     }
 
     // ---- methods ----
-methods:
+methods:;
+    // two passes for this picture: HEVC only for I / P (B pictures in one pass gave the same quality at 6.0 instead of 7.6 ms
+    // per 1080p frame); H.264 for every picture (one-pass B pictures among two-pass anchors undershot the rate by a quarter)
+    const bool mp = e->cfg.two_pass && !(b && hevc);
+    if (mp) two_pass_setups(e, setup, &e->setup1[ds], hevc);
     // the 64 KB push buffer starts over once the channel fetched everything: tried from 32 KB on, waited for past 48 KB (a
     // frame takes well under 1 KB; AV1 once skipped this and ran off the end after ~200 frames)
     if (chan_push_used(c) > 0x8000 && !chan_rewind(c) && chan_push_used(c) > 0xc000) {
@@ -826,23 +900,29 @@ methods:
     // HEVC: application ID 3 and codec type 4 (not in clc9b7.h; seen in nullmoth's library, T6.03)
     NvU32 appId = hevc ? (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H265 : (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_H264;
     if (getenv("ENC_PROBE_APPID")) appId = (NvU32)atoi(getenv("ENC_PROBE_APPID"));   // T13.03 probe: documented IDs only (2 VP8, 4 VP9)
+    // two passes (T7.09): pass 1 writes the RC statistics and its own outputs into scratch buffers, then pass 2 (the real
+    // encode) reads them; NVIDIA's driver pushes the pair back to back (vmp)
+    for (int pass = mp ? 1 : 0; pass <= (mp ? 2 : 0); pass++) {
+    const bool p1 = pass == 1;
+    const NvU64 rec = p1 ? e->rec1.gpu : recOut;
     chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, appId);
     chan_mthd(c, 0, NVC9B7_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _CODEC_TYPE, hevc ? 4u : NVC9B7_SET_CONTROL_PARAMS_CODEC_TYPE_H264) |
-              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode));
+              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _FORCE_OUT_PIC, 1) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCMODE, (NvU32)e->cfg.rc_mode) |
+              DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCSTAT_WRITE, p1 ? 1u : 0u) | DRF_NUM(C9B7, _SET_CONTROL_PARAMS, _RCSTAT_READ, pass == 2 ? 1u : 0u));
     chan_mthd(c, 0, NVC9B7_SET_PICTURE_INDEX, 1, e->seq);
     struct { NvU32 m; NvU64 a; } bm[] = {
-        { NVC9B7_SET_IN_DRV_PIC_SETUP, setup->gpu }, { NVC9B7_SET_IOHISTORY, e->hist.gpu },
-        { hevc ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc ? recOut : b ? e->colocB.gpu : e->coloc.gpu },   // HEVC: no colocated data
-        { NVC9B7_SET_OUT_REF_PIC_LUMA, recOut }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, recOut + e->rLuma },
-        { NVC9B7_SET_OUT_ENC_STATUS, status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, bs->gpu },
+        { NVC9B7_SET_IN_DRV_PIC_SETUP, p1 ? e->setup1[ds].gpu : setup->gpu }, { NVC9B7_SET_IOHISTORY, p1 ? e->hist1.gpu : e->hist.gpu },
+        { hevc ? NVC9B7_SET_OUT_REF_PIC_LUMA : NVC9B7_SET_OUT_COLOC_DATA, hevc ? rec : p1 ? e->coloc1.gpu : b ? e->colocB.gpu : e->coloc.gpu },   // HEVC: no colocated data
+        { NVC9B7_SET_OUT_REF_PIC_LUMA, rec }, { NVC9B7_SET_OUT_REF_PIC_CHROMA, rec + e->rLuma },
+        { NVC9B7_SET_OUT_ENC_STATUS, p1 ? e->status1.gpu : status->gpu }, { NVC9B7_SET_OUT_BITSTREAM, p1 ? e->bs1.gpu : bs->gpu },
         { NVC9B7_SET_IN_CUR_PIC, inVa }, { NVC9B7_SET_IN_CUR_PIC_CHROMA_U, inVa + e->lumaSz },
         { NVC9B7_SET_IN_CUR_PIC_CHROMA_V, inVa + e->lumaSz }, { NVC9B7_SET_IO_RC_PROCESS, e->rcproc.gpu },
         { NVC9B7_SET_IN_RCDATA, e->rcdata.gpu } };
     for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) chan_mthd(c, 0, bm[i].m, 1, (NvU32)(bm[i].a >> 8));
     if (!idr) {
         if (!hevc) chan_mthd(c, 0, NVC9B7_SET_IN_COLOC_DATA, 1, (NvU32)(e->coloc.gpu >> 8));
-        chan_mthd(c, 0, NVC9B7_SET_IN_MEPRED_DATA, 1, (NvU32)(meIn->gpu >> 8));
-        chan_mthd(c, 0, NVC9B7_SET_OUT_MEPRED_DATA, 1, (NvU32)(meOut->gpu >> 8));
+        chan_mthd(c, 0, NVC9B7_SET_IN_MEPRED_DATA, 1, (NvU32)((pass == 2 ? e->mepred1.gpu : meIn->gpu) >> 8));
+        chan_mthd(c, 0, NVC9B7_SET_OUT_MEPRED_DATA, 1, (NvU32)((p1 ? e->mepred1.gpu : meOut->gpu) >> 8));
         for (int i = 0; i < nRefs; i++) {
             // H.264: REF_PIC<n> by DPB slot (l0 = 2 x slot). HEVC: by position in list 0 (poc_entry_l0[i] = i), while l0
             // still carries 2 x slot (nullmoth's third picture: l0[0] 2, the reference in REF_PIC0; T6.07)
@@ -853,6 +933,8 @@ methods:
             chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * n, 1, (NvU32)(ra >> 8));
             chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * n, 1, (NvU32)((ra + e->rLuma) >> 8));
         }
+    }
+    if (p1) chan_mthd(c, 0, NVC9B7_EXECUTE, 1, 0u);
     }
 execute:
     chan_mthd(c, 0, NVC9B7_EXECUTE, 1, 0u);
@@ -996,6 +1078,7 @@ int enc_wait(Enc *e, NvU32 ticket, EncFrame *out)
     out->idr = e->pend[ds].idr; out->frame_num = e->pend[ds].frame_num; out->poc = e->pend[ds].poc;
     out->bits = st->total_bit_count; out->ucode_error = st->ucode_error_status; out->avg_qp = st->avgQP;
     out->intra_mbs = st->intra_mb_count; out->inter_mbs = st->inter_mb_count;
+    out->intra_cost = st->total_intra_cost; out->inter_cost = st->total_inter_cost;
     if ((int32_t)(*sv - ticket) < 0) {
         fprintf(stderr, "enc: frame %u %s (notifier 0x%x info32 0x%x)\n", ticket, chan_error(c) ? "engine error" : "timeout",
                 chan_error(c), ((volatile NvNotification *)c->notifier.cpu)[0].info32);

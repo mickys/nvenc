@@ -19,7 +19,8 @@ typedef struct {
     int dpb_extra;                  // extra pictures announced in the HEVC VPS/SPS decoded picture buffer size, 0..2
                                     // (refs + 1 + 2 <= 6 = the smallest MaxDpbSize of any level)
     int engine;                     // 0 = NVENC0, 1 = NVENC1
-    int idr_period;                 // 0 = only the first picture (and enc_encode(force_idr))
+    int idr_period;                 // 0 = only the first picture (and enc_encode(force_idr)); with enc_submit_ex (display
+                                    // indices) the caller forces the IDRs; the period still goes to the rate control
     int rc_mode;                    // SET_CONTROL_PARAMS RCMODE: 0 const QP, 1 VBR, 2 CBR, 17/18 MB-row VBR/CBR
     int bitrate, max_bitrate;       // bits/s (rate control modes)
     int vbv_bits;                   // CPB size in bits (0 = one second)
@@ -39,6 +40,13 @@ typedef struct {
                                     // the caller orders the pictures and marks the B ones (enc_submit_ex). num_refs >= 2
     int aq;                         // spatial adaptive quantization strength 1..15 as NVIDIA's -aq-strength (8 its default); 0 = off.
                                     // HEVC; from the luma of NV12 / P010 input (enc_load_nv12 / _p010), a QP offset per 32x32 CTB
+    bool two_pass;                  // H.264 / HEVC with rate control: two passes per picture at full resolution, as NVIDIA's
+                                    // -multipass fullres: a quick first pass writes picture and row statistics into the RC data
+                                    // (RCSTAT_WRITE), the second reads them for its QP choices and takes the first pass's motion
+                                    // vectors as hints (T7.09; HEVC: I / P pictures only). Over 900 frames -0.25..+0.65 VMAF at
+                                    // equal rate for 2x (H.264) / +7 % (HEVC) engine time: off by default
+    bool la_pass;                   // H.264: a lookahead analysis session (la.c): the driver's ME / MD / quant controls for its
+                                    // QP 40 quarter-size pictures
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     int colour[3];                  // colour_primaries, transfer_characteristics, matrix_coefficients (ITU-T H.273) for the VUI /
                                     // AV1 color_config; 0 = BT.709 (1). E.g. BT.2020 PQ: 9, 16, 9; HLG: 9, 18, 9; BT.601 NTSC: 6, 6, 6
@@ -54,6 +62,7 @@ typedef struct {
     bool idr;
     unsigned frame_num, poc;
     unsigned bits, ucode_error, avg_qp, intra_mbs, inter_mbs;
+    unsigned intra_cost, inter_cost;    // sums of each block's best intra / inter SATD (status total_intra_cost / _inter_cost)
     double ms;                      // doorbell to completion seen
     bool hidden;                    // AV1: a hidden anchor (size 0: it travels with the next frame; show it later with
                                     // enc_av1_show_existing)
@@ -83,6 +92,9 @@ typedef struct {
     unsigned slotPoc[ENC_MAX_REFS + 2];   // POC of the picture in each reconstruction slot
     int idrDisp;                    // display index of the last IDR (enc_submit_ex)
     RmMem colocB;                   // co-located data a B picture writes (the anchor's must survive for the next B)
+    // two passes (EncConfig.two_pass): the first pass's picture setups and its scratch outputs (bitstream, status, history,
+    // reconstruction, co-located data, motion vectors for the second pass)
+    RmMem setup1[ENC_MAX_DEPTH], bs1, status1, hist1, rec1, coloc1, mepred1;
     RmEvent ev;                     // NVENC non-stall event (ev.h == 0: none, spin)
     // AV1: default probability tables, the tables the engine wrote, entropy / filter line buffers, assembled temporal units
     RmMem av1ProbIn, av1Prob, av1Line[6];   // av1Prob: the CDFs each reconstruction slot's frame saved (0x10000 each), then scratch
