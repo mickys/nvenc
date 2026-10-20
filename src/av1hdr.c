@@ -22,7 +22,7 @@ static size_t obu(int type, const uint8_t *payload, size_t n, uint8_t *out)
     memmove(out + o, payload, n);
     return o + n;
 }
-enum { OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME = 6 };
+enum { OBU_SEQUENCE_HEADER = 1, OBU_TEMPORAL_DELIMITER = 2, OBU_FRAME_HEADER = 3, OBU_FRAME = 6 };
 
 int av1_level_for(int width, int height)   // Annex A.3: MaxPicSize per level; the .1 levels for 60 fps
 {
@@ -76,8 +76,9 @@ size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uin
     Bw b = { p, 0 };
     const bool key = f->frame_type == 0, intra = key;
     const int ohb = s->order_hint_bits ? s->order_hint_bits : 7;
-    // uncompressed_header (5.9.2); show_existing_frame 0, shown frames only
-    put(&b, 0, 1); put(&b, (unsigned)f->frame_type, 2); put(&b, 1, 1);   // show_existing_frame, frame_type, show_frame
+    // uncompressed_header (5.9.2); show_existing_frame 0
+    put(&b, 0, 1); put(&b, (unsigned)f->frame_type, 2); put(&b, !f->hidden, 1);   // show_existing_frame, frame_type, show_frame
+    if (f->hidden) put(&b, 1, 1);                              // showable_frame
     const bool er = key ? true : f->error_resilient;           // a shown key frame is error resilient (not signalled)
     if (!key) put(&b, f->error_resilient, 1);
     put(&b, f->disable_cdf_update, 1);
@@ -172,4 +173,12 @@ size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uin
     }
     (void)total;
     return obu(OBU_FRAME, p, n, out);
+}
+
+size_t av1_write_show_existing(int slot, uint8_t *out)   // 5.9.2 with show_existing_frame (no decoder model, no film grain)
+{
+    uint8_t p[4] = { 0 }; Bw b = { p, 0 };
+    put(&b, 1, 1); put(&b, (unsigned)slot, 3);                 // show_existing_frame, frame_to_show_map_idx
+    trailing(&b);
+    return obu(OBU_FRAME_HEADER, p, b.bits / 8, out);
 }

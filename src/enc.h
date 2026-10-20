@@ -34,8 +34,8 @@ typedef struct {
     bool lossless;                  // H.264 (High 4:4:4 Predictive, CAVLC) / HEVC: every macroblock / CU at QP 0, bypassed
     bool quality;                   // H.264: NVIDIA's -preset p4 ME / MD / quant controls for I and P pictures (about +0.6 dB at
                                     // equal rate on camera content, ~2.7 ms instead of ~1.5 ms per 1080p frame); default: fast
-    int bframes;                    // H.264: B pictures between anchors announced (POC type 0, VUI reordering); the caller orders
-                                    // the pictures and marks the B ones (enc_submit_ex). num_refs must be >= 2
+    int bframes;                    // B pictures between anchors (H.264: POC type 0, VUI reordering; AV1: hidden ALTREF anchors);
+                                    // the caller orders the pictures and marks the B ones (enc_submit_ex). num_refs >= 2
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     bool verbose;
 } EncConfig;
@@ -48,6 +48,8 @@ typedef struct {
     unsigned frame_num, poc;
     unsigned bits, ucode_error, avg_qp, intra_mbs, inter_mbs;
     double ms;                      // doorbell to completion seen
+    bool hidden;                    // AV1: a hidden anchor (size 0: it travels with the next frame; show it later with
+                                    // enc_av1_show_existing)
 } EncFrame;
 
 typedef struct {
@@ -60,7 +62,7 @@ typedef struct {
     size_t bps;                     // bytes per sample: 1, or 2 for 10-bit (the surface pitch fields stay in samples)
     // per frame in flight (slot = ticket % depth): input picture, picture setup, bitstream, status
     RmMem in[ENC_MAX_DEPTH], setup[ENC_MAX_DEPTH], bs[ENC_MAX_DEPTH], status[ENC_MAX_DEPTH];
-    struct { bool idr; unsigned frame_num, poc; double t0; int slot, nRefs, refs[ENC_MAX_REFS], refOh[ENC_MAX_REFS], lf; } pend[ENC_MAX_DEPTH];
+    struct { bool idr; unsigned frame_num, poc; double t0; int slot, nRefs, refs[ENC_MAX_REFS], refOh[ENC_MAX_REFS], lf; bool b, hidden; } pend[ENC_MAX_DEPTH];
     RmMem recon, hist, coloc, mepred[2], sem, rcproc, rcdata;
     NvU32 seq;                      // frames submitted (semaphore payload of the last one)
     NvU32 waited;                   // frames waited for
@@ -76,8 +78,11 @@ typedef struct {
     RmMem colocB;                   // co-located data a B picture writes (the anchor's must survive for the next B)
     RmEvent ev;                     // NVENC non-stall event (ev.h == 0: none, spin)
     // AV1: default probability tables, the tables the engine wrote, entropy / filter line buffers, assembled temporal units
-    RmMem av1ProbIn, av1ProbOut, av1ProbOut2, av1Line[6];
-    int av1OutIdx;                  // which of av1ProbOut / av1ProbOut2 the next frame writes
+    RmMem av1ProbIn, av1Prob, av1Line[6];   // av1Prob: the CDFs each reconstruction slot's frame saved (0x10000 each), then scratch
+    int nSlots;                     // reconstruction slots
+    // AV1 B pictures (T12.08): an anchor with B pictures before it is coded hidden; its frame OBU goes into the next shown
+    // frame's temporal unit, and enc_av1_show_existing() makes the temporal unit that shows it
+    uint8_t *av1Hid; size_t av1HidN; int av1HidSlot, av1HidDisp, av1LastShown;
     uint8_t *av1Tu[ENC_MAX_DEPTH]; size_t av1TuCap;
     int av1SbCols, av1SbRows;
     int av1TileColsLog2, av1TileRowsLog2, av1TileW, av1TileH, av1TileCols, av1TileRows;   // uniform tile grid (superblocks)
@@ -103,10 +108,15 @@ void enc_load_l10r(Enc *e, const uint8_t *src, size_t stride);
 void enc_load_bgra(Enc *e, const uint8_t *bgra, size_t stride);
 int  enc_encode(Enc *e, bool force_idr, EncFrame *out);         // encode the loaded frame and wait; 0 = ok
 int  enc_submit(Enc *e, bool force_idr, NvU32 *ticket);         // start encoding the loaded frame; 0 = ok
-// B pictures (H.264): like enc_submit, with the picture's display index and whether it is a B picture. The caller
-// submits each anchor (I / P) before the B pictures that precede it in display order: list 0 of a B picture is the
-// anchors before it, list 1 the newest anchor. Display indices give the POCs (POC type 0, EncConfig.bframes > 0).
+// B pictures (H.264, HEVC, AV1): like enc_submit, with the picture's display index and whether it is a B picture. The
+// caller submits each anchor (I / P) before the B pictures that precede it in display order: list 0 of a B picture is
+// the anchors before it, list 1 the newest anchor. Display indices give the POCs / order hints (EncConfig.bframes > 0).
+// AV1: an anchor with B pictures before it comes back hidden (EncFrame.hidden); after its last B picture, write
+// enc_av1_show_existing().
 int  enc_submit_ex(Enc *e, bool force_idr, bool b, int disp, NvU32 *ticket);
 int  enc_encode_ex(Enc *e, bool force_idr, bool b, int disp, EncFrame *out);
 int  enc_wait(Enc *e, NvU32 ticket, EncFrame *out);             // wait for a submitted frame (in submission order); 0 = ok
+// AV1 with B pictures: the temporal unit that shows the last hidden anchor (temporal delimiter + frame header with
+// show_existing_frame), to be written after the B pictures before it; returns its size (< 8 bytes)
+size_t enc_av1_show_existing(Enc *e, uint8_t *out);
 static inline int enc_inflight(const Enc *e) { return (int)(e->seq - e->waited); }

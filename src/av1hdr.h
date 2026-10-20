@@ -20,6 +20,7 @@ typedef struct {
 
 typedef struct {
     int frame_type;                 // 0 key, 1 inter
+    bool hidden;                    // inter: show_frame 0 (showable later with show_existing_frame), e.g. a B group's ALTREF
     int order_hint;
     int refresh_frame_flags;        // inter frames (a shown key frame refreshes all)
     int ref_frame_idx[7];           // inter: slot of LAST..ALTREF
@@ -45,3 +46,5 @@ size_t av1_write_sequence_header(const Av1SeqParams *s, uint8_t *out);    // < 3
 // A frame OBU: the frame header, then a tile group with ntiles tiles (raster order); returns the bytes written
 size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uint8_t *const *tile, const size_t *tile_size,
                        int ntiles, uint8_t *out);
+// A frame header OBU with show_existing_frame = 1: show the (inter) frame in slot `slot` (2-3 bytes)
+size_t av1_write_show_existing(int slot, uint8_t *out);

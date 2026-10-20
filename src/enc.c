@@ -65,7 +65,8 @@ int enc_open(Enc *e, const EncConfig *cfg)
     if (cfg->chroma444 && !av1) e->rSlot = (3 * e->rLuma + 0xffff) & ~(size_t)0xffff;   // 4:4:4: chroma twice the luma plane
     if (hevc || av1) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
     int slots = e->cfg.num_refs + 1;
-    if (e->cfg.bframes > 0 && e->cfg.codec != ENC_AV1) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
+    if (e->cfg.bframes > 0) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
+    e->nSlots = slots; e->av1LastShown = -1; e->av1HidDisp = -1;
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
     if (hevc) histSz = ((size_t)(W + 31) / 32 * 768 + 0xffff) & ~(size_t)0xffff;   // HEVC: 768 bytes per CTB column (nullmoth's size, T6.06)
@@ -106,17 +107,18 @@ int enc_open(Enc *e, const EncConfig *cfg)
         // same layout NVDEC uses) 0x3000 apart, the microcode picking one by quantizer (prob_tables_offset); two buffers for
         // the tables the engine writes (a P frame reads the previous frame's); the entropy / filter line buffers; the RC
         // process buffer with the words the driver puts there before the first frame
-        if (rm_mem_alloc(rm, &e->av1ProbIn, 4 * 0x3000, 0x1000, true, true, true) || rm_mem_alloc(rm, &e->av1ProbOut, 0x10000, 0x1000, true, true, true) ||
-            rm_mem_alloc(rm, &e->av1ProbOut2, 0x10000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
-        memset(e->av1ProbIn.cpu, 0, e->av1ProbIn.size); memset(e->av1ProbOut.cpu, 0, e->av1ProbOut.size); memset(e->av1ProbOut2.cpu, 0, e->av1ProbOut2.size);
+        if (rm_mem_alloc(rm, &e->av1ProbIn, 4 * 0x3000, 0x1000, true, true, true) ||
+            rm_mem_alloc(rm, &e->av1Prob, (size_t)(slots + 1) * 0x10000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
+        memset(e->av1ProbIn.cpu, 0, e->av1ProbIn.size); memset(e->av1Prob.cpu, 0, e->av1Prob.size);
         for (int q = 0; q < 4; q++) av1_default_probs(q, (uint8_t *)e->av1ProbIn.cpu + q * 0x3000);
         for (int i = 0; i < 6; i++) {
             if (rm_mem_alloc(rm, &e->av1Line[i], 1 << 20, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
             memset(e->av1Line[i].cpu, 0, e->av1Line[i].size);
         }
         memcpy(e->rcproc.cpu, av1_tmpl_rcprocess, sizeof av1_tmpl_rcprocess);
-        e->av1TuCap = e->bs[0].size + 4096;
+        e->av1TuCap = 2 * e->bs[0].size + 4096;                     // room for a hidden anchor in front of the frame
         for (int d = 0; d < e->cfg.depth; d++) if (!(e->av1Tu[d] = malloc(e->av1TuCap))) return -1;
+        if (!(e->av1Hid = malloc(e->bs[0].size + 4096))) return -1;
     }
     ((volatile NvU32 *)e->sem.cpu)[0] = 0;
     if (!e->cfg.fps) e->cfg.fps = 60;
@@ -138,10 +140,11 @@ void enc_close(Enc *e)
 {
     if (e->ev.h) rm_event_close(&e->rm, &e->ev);
     chan_destroy(&e->chan);
-    RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->colocB, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata, &e->av1ProbIn, &e->av1ProbOut,
-                   &e->av1ProbOut2, &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5] };
+    RmMem *m[] = { &e->recon, &e->hist, &e->coloc, &e->colocB, &e->mepred[0], &e->mepred[1], &e->sem, &e->rcproc, &e->rcdata, &e->av1ProbIn, &e->av1Prob,
+                   &e->av1Line[0], &e->av1Line[1], &e->av1Line[2], &e->av1Line[3], &e->av1Line[4], &e->av1Line[5] };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i]->hPhys) rm_mem_free(&e->rm, m[i]);
     for (int d = 0; d < ENC_MAX_DEPTH; d++) { free(e->av1Tu[d]); e->av1Tu[d] = NULL; }
+    free(e->av1Hid); e->av1Hid = NULL;
     for (int d = 0; d < ENC_MAX_DEPTH; d++) {
         RmMem *pm[] = { &e->in[d], &e->setup[d], &e->bs[d], &e->status[d] };
         for (int i = 0; i < 4; i++) if (pm[i]->hPhys) rm_mem_free(&e->rm, pm[i]);
@@ -481,7 +484,10 @@ static int av1_lf_level(int q, bool key)
     return l < 0 ? 0 : l > 63 ? 63 : l;
 }
 
-static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf, int nRefs, unsigned poc)
+// B pictures' quantizer index: the driver's 126 for P 100 (ab2s), not references
+static int av1_qp_b(const Enc *e) { return e->cfg.qp_p + 26 > 255 ? 255 : e->cfg.qp_p + 26; }
+
+static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, bool isB, int q, int lf, int nRefs, unsigned poc)
 {
     NvU8 *b = setup->cpu;
     const int W = e->cfg.width, H = e->cfg.height;
@@ -501,18 +507,28 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf, 
     }
     if (e->cfg.bit_depth > 8) put32(b, 0x84, *(NvU32 *)(b + 0x84) | 2u << 7 | 2u << 11);   // seqhdr: bit depth, input bit depth - 8
     for (int i = 0; i < 4; i++) b[0x98 + i] = (NvU8)lf;            // frame header: loop filter levels
+    if (e->cfg.bframes > 0) memcpy(b + 0x1b8, isB ? av1_tmpl_bf_b_mdme : av1_tmpl_bf_p_mdme, sizeof av1_tmpl_bf_b_mdme);   // B mode controls
     if (!idr) {   // references (docs/traces/bframes-linux ahq, NVIDIA's -preset p7 -tune hq: up to 4, newest first): list 0
-        // entry i = REF_PIC<i> = LAST + i, temporal distance in half frames, position i; unused entries -1; compound
-        // prediction from one direction (unicompound) once there are two
+        // entry i = reference type LAST + i = REF_PIC<i>, temporal distance in half frames, position = the type; unused
+        // entries -1; compound prediction from one direction (unicompound) once there are two. B pictures (ab2s): list 0 =
+        // the anchors before (slotOf[1..]), list 1 = ALTREF (type 6) = the newest anchor, after it (negative distance),
+        // compound from both directions, ALTREF's sign bias 1, picture type B, not a reference
+        const int nL0 = isB ? nRefs - 1 : nRefs, *L0 = isB ? e->slotOf + 1 : e->slotOf;
         for (int i = 0; i < 4; i++) {
-            b[0x128 + i] = (NvU8)(i < nRefs ? i : 0xff); b[0x136 + i] = (NvU8)(i < nRefs ? i : 0xff);
-            b[0x12f + i] = (NvU8)(i < nRefs ? poc - e->slotPoc[e->slotOf[i]] : 0xff);
+            b[0x128 + i] = (NvU8)(i < nL0 ? i : 0xff); b[0x136 + i] = (NvU8)(i < nL0 ? i : 0xff);
+            b[0x12f + i] = (NvU8)(i < nL0 ? poc - e->slotPoc[L0[i]] : 0xff);
         }
-        b[0x144] = (NvU8)((b[0x144] & ~0xe0) | nRefs << 5);         // num_ref_idx_l0_active
-        if (nRefs >= 2) b[0x8d] |= 4;                               // unicompound_enable
+        b[0x144] = (NvU8)((b[0x144] & ~0xe0) | nL0 << 5);           // num_ref_idx_l0_active
+        if (nL0 >= 2) b[0x8d] |= 4;                                 // unicompound_enable
+        if (isB) {
+            b[0x12c] = 6; b[0x13a] = 6; b[0x133] = (NvU8)(poc - e->slotPoc[e->slotOf[0]]);   // l1, poc_entry_l1, temp_dist_l1
+            b[0x145] = (NvU8)((b[0x145] & ~7) | 1);                 // num_ref_idx_l1_active
+            b[0x8d] |= 2; b[0x97] = 1;                              // bicompound_enable, ref_frame_sign_bias[ALTREF]
+            b[0x160] = (NvU8)((b[0x160] & ~7) | 1);                 // pic_type B, ref_pic_flag 0
+        }
     }
     b[0xc0] = (NvU8)q;                                              // frame header: base_q_idx
-    b[0xc9] = (NvU8)e->cfg.qp_p; b[0xca] = (NvU8)e->cfg.qp_p; b[0xcb] = (NvU8)e->cfg.qp_i;   // RC: QP[P, B, I]
+    b[0xc9] = (NvU8)e->cfg.qp_p; b[0xca] = (NvU8)av1_qp_b(e); b[0xcb] = (NvU8)e->cfg.qp_i;   // RC: QP[P, B, I]
     put32(b, 0x154, (NvU32)e->hist.size); put32(b, 0x158, (NvU32)bs->size); put32(b, 0x15c, 0);   // pic_control buffer sizes
     put32(b, 0x16c, 0x1000); put32(b, 0x18c, 0x1000);              // mpec / stats fifo offsets in the status (not enabled)
     put32(b, 0x178, 0x100 + (NvU32)av1_rc_area(e)); put32(b, 0x174, 0x100 + 2 * (NvU32)av1_rc_area(e));   // act / pass-2 in RC data
@@ -540,6 +556,7 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf, 
         for (int k = 0; k < 4; k++) { put16(t, 2 * (size_t)k, (NvU16)c[0][k]); put16(t, 0x10 + 2 * (size_t)k, (NvU16)c[1][k]); }
         t[0xa] = (NvU8)q;                                           // qp_avr
         if (i) t[0xb] &= (NvU8)~0x08;                               // tile_end_update_cdf: tile 0 only
+        if (isB) t[0xb] = (NvU8)((t[0xb] & ~3) | 1);                // tile_type B
         t[0xc] = (NvU8)i;                                           // tile_idx
     }
     if (e->cfg.rc_mode) {   // rate control as the driver sets it up (docs/traces/av1-linux cbr / vbr; M12, T12.03)
@@ -567,14 +584,17 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf, 
 // statistics, the app timer and sub-frame mode 2; no colocated data; luma and chroma by one address each (the surface
 // configs give the chroma planes); on P frames the ME predictors and reference picture 0. Probability tables: key frames
 // read the default tables (by quantizer), P frames the tables the previous frame wrote.
-static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs, unsigned poc)
+static void submit_av1(Enc *e, int ds, bool idr, bool isB, int slot, int nRefs, unsigned poc)
 {
     Chan *c = &e->chan;
     RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
-    const int q = idr ? e->cfg.qp_i : e->cfg.qp_p, lf = av1_lf_level(q, idr);
-    setup_av1(e, setup, bs, idr, q, lf, nRefs, poc);
+    const int q = idr ? e->cfg.qp_i : isB ? av1_qp_b(e) : e->cfg.qp_p, lf = av1_lf_level(q, idr);
+    setup_av1(e, setup, bs, idr, isB, q, lf, nRefs, poc);
     const NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot, inVa = e->extInput ? e->extInput : in->gpu;
-    RmMem *probOut = e->av1OutIdx ? &e->av1ProbOut2 : &e->av1ProbOut, *probPrev = e->av1OutIdx ? &e->av1ProbOut : &e->av1ProbOut2;
+    // CDFs: a key frame reads the default tables, an inter frame those its primary reference saved (LAST for anchors,
+    // ALTREF for B pictures: slotOf[0] either way); each frame saves its own in its slot's table (B pictures: scratch)
+    const NvU64 probIn = idr ? e->av1ProbIn.gpu : e->av1Prob.gpu + (NvU64)e->slotOf[0] * 0x10000;
+    const NvU64 probOut = e->av1Prob.gpu + (NvU64)(isB ? e->nSlots : slot) * 0x10000;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
     chan_mthd(c, 0, NVC9B7_SET_APPLICATION_ID, 1, (NvU32)NVC9B7_SET_APPLICATION_ID_ID_NVENC_AV1);
     // rate control: the driver uses the MB-row modes (17 VBR, 18 CBR)
@@ -591,16 +611,16 @@ static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs, unsigned p
     chan_mthd(c, 0, NVC9B7_SET_IN_CUR_PIC, 1, (NvU32)(inVa >> 8));
     chan_mthd(c, 0, NVC9B7_SET_IN_CUR_PIC_CHROMA_U, 1, (NvU32)(inVa >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_CUR_PIC_CHROMA_V, 1, (NvU32)(inVa >> 8));
     chan_mthd(c, 0, NVC9B7_SET_IN_RCDATA, 1, (NvU32)(e->rcdata.gpu >> 8));
-    chan_mthd(c, 0, NVC9B7_SET_IN_AV1_PROBABILITY_DATA, 1, (NvU32)((idr ? e->av1ProbIn.gpu : probPrev->gpu) >> 8));
-    chan_mthd(c, 0, NVC9B7_SET_OUT_AV1_PROBABILITY_DATA, 1, (NvU32)(probOut->gpu >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_IN_AV1_PROBABILITY_DATA, 1, (NvU32)(probIn >> 8));
+    chan_mthd(c, 0, NVC9B7_SET_OUT_AV1_PROBABILITY_DATA, 1, (NvU32)(probOut >> 8));
     static const NvU32 lm[6] = { NVC9B7_SET_IOENTROPY_ABOVE_MV_DATA, NVC9B7_SET_IOENTROPY_ABOVE_CTX_DATA, NVC9B7_SET_IODEBLOCK_TOPROW,
                                  NVC9B7_SET_IODEBLOCK_LEFTCOLUMN, NVC9B7_SET_IOCDEF_LEFTCOLUMN, NVC9B7_SET_IOLR_LEFTCOLUMN };
     for (int i = 0; i < 6; i++) chan_mthd(c, 0, lm[i], 1, (NvU32)(e->av1Line[i].gpu >> 8));
-    for (int i = 0; !idr && i < nRefs; i++) {   // REF_PIC<i>: the i-th newest reference
+    for (int i = 0; !idr && i < nRefs; i++) {   // REF_PIC<reference type>: anchors LAST.. = newest first; B: LAST.. = slotOf[1..], ALTREF = slotOf[0]
+        const NvU32 type = isB ? (i ? (NvU32)i - 1 : 6u) : (NvU32)i;
         const NvU64 ra = e->recon.gpu + (NvU64)e->slotOf[i] * e->rSlot;
-        chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * (NvU32)i, 1, (NvU32)(ra >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * (NvU32)i, 1, (NvU32)(ra >> 8));
+        chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * type, 1, (NvU32)(ra >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * type, 1, (NvU32)(ra >> 8));
     }
-    e->av1OutIdx ^= 1;
     e->pend[ds].lf = lf;
 }
 
@@ -612,7 +632,7 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
     int W = e->cfg.width, H = e->cfg.height, ds = (int)(e->seq % (NvU32)e->cfg.depth);
     RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
     if (enc_inflight(e) >= e->cfg.depth) return -1;
-    const bool b = isB && e->cfg.codec != ENC_AV1 && e->cfg.bframes > 0 && e->nRefs >= 2;
+    const bool b = isB && e->cfg.bframes > 0 && e->nRefs >= 2;
     bool idr = !b && (force_idr || e->forceIdr || e->seq == 0 || (e->cfg.idr_period > 0 && e->sinceIdr >= (unsigned)e->cfg.idr_period));
     e->forceIdr = false;
     if (idr) { e->frame_num = 0; e->sinceIdr = 0; e->nRefs = 0; if (disp >= 0) e->idrDisp = disp; }
@@ -717,7 +737,7 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
 
     // ---- methods ----
 methods:
-    if (av1) { submit_av1(e, ds, idr, slot, nRefs, poc); goto execute; }
+    if (av1) { submit_av1(e, ds, idr, b, slot, nRefs, poc); goto execute; }
     if (chan_push_used(c) > 0x8000) chan_rewind(c);
     NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot;
     NvU64 inVa = e->extInput ? e->extInput : in->gpu;
@@ -771,8 +791,12 @@ execute:
         char path[256]; snprintf(path, sizeof path, "%s/enc%u.bin", getenv("ENC_DUMP_SETUP"), payload);
         FILE *df = fopen(path, "wb"); if (df) { fwrite(setup->cpu, 1, SETUP_SIZE, df); fclose(df); }
     }
-    e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = av1 ? e->sinceIdr : poc;
-    e->pend[ds].t0 = now_ms(); e->pend[ds].slot = slot; e->pend[ds].nRefs = nRefs;
+    e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = av1 ? poc / 2 : poc;
+    e->pend[ds].t0 = now_ms(); e->pend[ds].slot = slot; e->pend[ds].nRefs = nRefs; e->pend[ds].b = b;
+    // AV1: an anchor with B pictures before it in display order is hidden until the last of them is shown
+    e->pend[ds].hidden = av1 && !idr && !b && disp >= 0 && e->cfg.bframes > 0 && disp > e->av1LastShown + 1;
+    if (e->pend[ds].hidden) e->av1HidDisp = disp;
+    else if (disp >= 0) e->av1LastShown = b && disp == e->av1HidDisp - 1 ? e->av1HidDisp : disp;
     for (int i = 0; i < nRefs; i++) { e->pend[ds].refs[i] = e->slotOf[i]; e->pend[ds].refOh[i] = (int)(e->slotPoc[e->slotOf[i]] / 2); }
     chan_submit(c);
     *ticket = payload;
@@ -814,13 +838,16 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
     const bool key = e->pend[ds].idr;
     Av1SeqParams sp = av1_seq(e);
     const int lf = st->loop_filter_level;
-    Av1FrameParams fp = { .frame_type = key ? 0 : 1, .order_hint = (int)e->pend[ds].poc, .refresh_frame_flags = 1 << e->pend[ds].slot,
-        .primary_ref_frame = key ? 7 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
+    const bool isB = e->pend[ds].b;
+    Av1FrameParams fp = { .frame_type = key ? 0 : 1, .hidden = e->pend[ds].hidden, .order_hint = (int)e->pend[ds].poc,
+        .refresh_frame_flags = isB ? 0 : 1 << e->pend[ds].slot, .primary_ref_frame = key ? 7 : isB ? 6 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
         .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = 1, .cdef_y = { 0, 16 }, .cdef_uv = { 0, 0 },
         .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4,
         .tile_cols_log2 = e->av1TileColsLog2, .tile_rows_log2 = e->av1TileRowsLog2, .context_update_tile_id = 0, .delta_q_present = e->cfg.rc_mode != 0 };
     for (int i = 0; i < 7; i++) {   // LAST, LAST2, LAST3, GOLDEN = the references newest first; the rest repeat the oldest
-        const int r = e->pend[ds].nRefs ? (i < e->pend[ds].nRefs ? i : e->pend[ds].nRefs - 1) : 0;
+        // B pictures: LAST.. = the anchors before (refs[1..]), BWDREF / ALTREF2 / ALTREF = the anchor after (refs[0])
+        const int nr = e->pend[ds].nRefs;
+        const int r = !nr ? 0 : isB ? (i >= 4 ? 0 : 1 + (i < nr - 1 ? i : nr - 2)) : (i < nr ? i : nr - 1);
         fp.ref_frame_idx[i] = e->pend[ds].nRefs ? e->pend[ds].refs[r] : 0; fp.ref_order_hint[i] = e->pend[ds].nRefs ? e->pend[ds].refOh[r] : (int)e->pend[ds].poc - 1;
     }
     const int nt = e->av1TileCols * e->av1TileRows;
@@ -834,11 +861,24 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
         if (!tsz[i] || ts[4 * i] + tsz[i] > e->bs[ds].size) return -1;
     }
     if (total + 1024 > e->av1TuCap) return -1;
+    if (fp.hidden) {   // kept for the next shown frame's temporal unit
+        e->av1HidN = av1_write_frame(&sp, &fp, tile, tsz, nt, e->av1Hid);
+        e->av1HidSlot = e->pend[ds].slot;                          // set here (in completion order): later submissions run ahead
+        out->data = e->av1Hid; out->size = 0; out->hidden = true;
+        return 0;
+    }
     uint8_t *o = e->av1Tu[ds]; size_t n = av1_write_temporal_delimiter(o);
     if (key) n += av1_write_sequence_header(&sp, o + n);
+    if (e->av1HidN) { memcpy(o + n, e->av1Hid, e->av1HidN); n += e->av1HidN; e->av1HidN = 0; }
     n += av1_write_frame(&sp, &fp, tile, tsz, nt, o + n);
     out->data = o; out->size = n;
     return 0;
+}
+
+size_t enc_av1_show_existing(Enc *e, uint8_t *out)
+{
+    const size_t n = av1_write_temporal_delimiter(out);
+    return n + av1_write_show_existing(e->av1HidSlot, out + n);
 }
 
 int enc_wait(Enc *e, NvU32 ticket, EncFrame *out)

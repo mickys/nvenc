@@ -62,9 +62,12 @@ int main(int argc, char **argv)
         fwrite(ih, 1, 32, fh);
     }
     uint8_t *y = malloc((size_t)W * H), *uv = malloc((size_t)W * CH);
-    if (cfg.bframes > 0 && !av1) {   // BFRAMES=n (H.264, HEVC): IDR, then each anchor followed by the n B pictures before it
+    if (cfg.bframes > 0) {   // BFRAMES=n (H.264, HEVC, AV1): IDR, then each anchor followed by the n B pictures before it
         for (int f = 0; f < N; f++) { frame(y, uv, W, H, f); fwrite(y, 1, (size_t)W * H, fs); fwrite(uv, 1, (size_t)W * CH, fs); }
-        int fails = 0; double bits = 0, ms = 0; int prev = 0, coded = 0;
+        int fails = 0; double bits = 0, ms = 0; int prev = 0, coded = 0, tu = 0;
+        // AV1: IVF frames = temporal units in display order (a hidden anchor goes with the next one; after the B pictures,
+        // the unit that shows the anchor)
+        #define IVF_TU(d, n) do { if (av1) { uint8_t fhd_[12] = { (uint8_t)(n), (uint8_t)((n) >> 8), (uint8_t)((n) >> 16), (uint8_t)((n) >> 24), (uint8_t)tu, (uint8_t)(tu >> 8) }; fwrite(fhd_, 1, 12, fh); tu++; } fwrite(d, 1, n, fh); } while (0)
         for (int a = 0; a < N && !fails; ) {   // a: the next anchor in display order
             int order[16], no = 0; order[no++] = a; for (int k = prev + 1; k < a; k++) order[no++] = k;
             if (a == 0) no = 1;
@@ -73,8 +76,10 @@ int main(int argc, char **argv)
                 frame(y, uv, W, H, disp); enc_load_nv12(&e, y, W, uv, W);
                 EncFrame fr;
                 if (enc_encode_ex(&e, false, bp, disp, &fr)) { printf("frame %d FAILED (ucode error %u)\n", disp, fr.ucode_error); fails++; break; }
-                fwrite(fr.data, 1, fr.size, fh); bits += fr.bits; ms += fr.ms; coded++;
-                if (verbose || coded <= 4) printf("coded %3d: display %3d %s poc %3u: %8u bits, %.3f ms, avgQP %u, intra %u inter %u MBs\n", coded - 1, disp, fr.idr ? "IDR" : bp ? "B  " : "P  ", fr.poc, fr.bits, fr.ms, fr.avg_qp, fr.intra_mbs, fr.inter_mbs);
+                if (!fr.hidden) IVF_TU(fr.data, fr.size);
+                bits += fr.bits; ms += fr.ms; coded++;
+                if (av1 && bp && i == no - 1 && no > 1) { uint8_t se[16]; size_t sn = enc_av1_show_existing(&e, se); IVF_TU(se, sn); }
+                if (verbose || coded <= 4) printf("coded %3d: display %3d %s%s poc %3u: %8u bits, %.3f ms, avgQP %u, intra %u inter %u MBs\n", coded - 1, disp, fr.idr ? "IDR" : bp ? "B  " : "P  ", fr.hidden ? " (hidden)" : "", fr.poc, fr.bits, fr.ms, fr.avg_qp, fr.intra_mbs, fr.inter_mbs);
             }
             prev = a; a = a == 0 ? (cfg.bframes + 1 < N ? cfg.bframes + 1 : N - 1) : (a + cfg.bframes + 1 < N ? a + cfg.bframes + 1 : (a == N - 1 ? N : N - 1));
         }

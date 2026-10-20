@@ -96,7 +96,10 @@ typedef struct {
     CMTime ptsRing[64];             // input presentation times by display index: decode time stamps come from them
     unsigned coded;                 // pictures submitted (= the decode position of the next one)
     // frames in flight: encodeFrame submits, the completion thread waits (in order) and emits
-    struct { VTEncoderFrameRef frame; CMTime pts, dur, dts; NvU32 ticket; bool ok, b; double tEntry, tCall, tTile; } q[ENC_MAX_DEPTH];
+    struct { VTEncoderFrameRef frame; CMTime pts, dur, dts; NvU32 ticket; bool ok, b, showAfter; double tEntry, tCall, tTile; } q[ENC_MAX_DEPTH];
+    // AV1 with B pictures: the hidden anchor's frame, emitted (as the temporal unit that shows it) after the last B picture
+    // before it (q[].showAfter); AV1 temporal units stay in display order, so no decode time stamps
+    struct { VTEncoderFrameRef frame; CMTime pts, dur; bool valid; } hid;
     // statistics (NVENCVT_STATS=<file> or the flag file /tmp/nvencvt.stats: a line every 2 s to that file /
     // /tmp/nvencvt-stats.log)
     FILE *statsFile; double statsT0; unsigned sN, sIdr, sFail; double sCall, sCallMax, sTile, sEng, sEngMax, sTotal, sTotalMax, sBytes;
@@ -337,9 +340,9 @@ static OSStatus open_encoder(State *s)
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange,
                     .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s), .chroma444 = s->c444 };
     // B pictures when the client allows reordering and is not real time (OBS / AVAssetWriter recordings, not Parsec): 2 by
-    // default (NVENCVT_BFRAMES=0..3). H.264 needs Main or High in 4:2:0 (Baseline and 4:4:4 stay P-only), AV1 has none yet.
+    // default (NVENCVT_BFRAMES=0..3). H.264 needs Main or High in 4:2:0 (Baseline and 4:4:4 stay P-only); AV1: hidden ALTREFs.
     // Not real time also gets NVIDIA's slower ME / MD controls (H.264 quality preset, ~+0.6 dB)
-    s->bf = s->reorder && !s->realTime && !s->av1 && !s->c444 && (s->hevc || s->h264Profile != 66)
+    s->bf = s->reorder && !s->realTime && !s->c444 && (s->hevc || s->av1 || s->h264Profile != 66)
           ? (getenv("NVENCVT_BFRAMES") ? atoi(getenv("NVENCVT_BFRAMES")) : 2) : 0;
     s->bf = s->bf < 0 ? 0 : s->bf > VT_MAX_B ? VT_MAX_B : s->bf;
     if (s->bf && refs < 2) refs = 2;
@@ -376,8 +379,8 @@ static OSStatus open_encoder(State *s)
         CFDictionaryRef ext = CFDictionaryCreate(NULL, ek, ev, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus st = CMVideoFormatDescriptionCreate(NULL, CODEC_AV1, s->width, s->height, ext, &s->fmt);
         CFRelease(ext); CFRelease(atoms); CFRelease(d);
-        LOG("AV1%s encoder open on NVENC%d: %dx%d refs %d range %s rc_mode %d bitrate %d vbv %d q %d/%d idr_period %d fps %d -> fmt %d", s->ten ? " 10-bit" : "", c.engine,
-            c.width, c.height, s->enc.cfg.num_refs, c.full_range ? "full" : "video", c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
+        LOG("AV1%s encoder open on NVENC%d: %dx%d refs %d range %s rc_mode %d bitrate %d vbv %d q %d/%d idr_period %d fps %d bframes %d -> fmt %d", s->ten ? " 10-bit" : "", c.engine,
+            c.width, c.height, s->enc.cfg.num_refs, c.full_range ? "full" : "video", c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, c.bframes, (int)st);
         if (st) { enc_close(&s->enc); return st; }
         goto opened;
     }
@@ -429,7 +432,7 @@ static void emit(State *s, VTEncoderFrameRef frame, CMTime pts, CMTime dur, CMTi
         CFMutableDictionaryRef a = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
         CFDictionarySetValue(a, kCMSampleAttachmentKey_NotSync, fr->idr ? kCFBooleanFalse : kCFBooleanTrue);
         CFDictionarySetValue(a, kCMSampleAttachmentKey_DependsOnOthers, fr->idr ? kCFBooleanFalse : kCFBooleanTrue);
-        if (s->bf) CFDictionarySetValue(a, kCMSampleAttachmentKey_IsDependedOnByOthers, b ? kCFBooleanFalse : kCFBooleanTrue);
+        if (s->bf && !s->av1) CFDictionarySetValue(a, kCMSampleAttachmentKey_IsDependedOnByOthers, b ? kCFBooleanFalse : kCFBooleanTrue);
     }
     VTEncoderSessionEmitEncodedFrame(s->session, frame, st, 0, st ? NULL : sb);
     if (sb) CFRelease(sb);
@@ -444,14 +447,20 @@ static void *completion(void *arg)
         while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->lock);
         if (s->qh == s->qt) break;
         unsigned i = s->qh % s->depth;
-        VTEncoderFrameRef frame = s->q[i].frame; CMTime pts = s->q[i].pts, dur = s->q[i].dur, dts = s->q[i].dts; NvU32 t = s->q[i].ticket; bool ok = s->q[i].ok, b = s->q[i].b;
+        VTEncoderFrameRef frame = s->q[i].frame; CMTime pts = s->q[i].pts, dur = s->q[i].dur, dts = s->q[i].dts; NvU32 t = s->q[i].ticket;
+        bool ok = s->q[i].ok, b = s->q[i].b, showAfter = s->q[i].showAfter;
         double tEntry = s->q[i].tEntry, tCall = s->q[i].tCall, tTile = s->q[i].tTile;
         pthread_mutex_unlock(&s->lock);
         EncFrame fr; memset(&fr, 0, sizeof fr);
         int rc = ok ? enc_wait(&s->enc, t, &fr) : -1;
         if (rc) LOG("frame %u: encode failed (ucode error %u)", t, fr.ucode_error);
         else if (gLog && (t <= 3 || fr.idr)) LOG("frame %u %s: %zu bytes, %.3f ms, avgQP %u", t, fr.idr ? "IDR" : b ? "B" : "P", fr.size, fr.ms, fr.avg_qp);
-        emit(s, frame, pts, dur, dts, b, &fr, rc ? kVTVideoEncoderMalfunctionErr : noErr);   // fr.data stays valid until qh moves on
+        if (!rc && fr.hidden) { s->hid.frame = frame; s->hid.pts = pts; s->hid.dur = dur; s->hid.valid = true; }   // AV1: shown later
+        else emit(s, frame, pts, dur, dts, b, &fr, rc ? kVTVideoEncoderMalfunctionErr : noErr);   // fr.data stays valid until qh moves on
+        if (showAfter && s->hid.valid) {
+            uint8_t se[16]; EncFrame sf; memset(&sf, 0, sizeof sf); sf.data = se; sf.size = enc_av1_show_existing(&s->enc, se);
+            emit(s, s->hid.frame, s->hid.pts, s->hid.dur, kCMTimeInvalid, false, &sf, noErr); s->hid.valid = false;
+        }
         pthread_mutex_lock(&s->lock);
         stats_frame(s, tCall, tTile, fr.ms, now_ms() - tEntry, rc ? 0 : fr.size, fr.idr, rc != 0);
         s->qh++;
@@ -493,11 +502,11 @@ static void submit(State *s, VTEncoderFrameRef frame, CVPixelBufferRef img, CMTi
     double tTile0 = now_ms();
     load_image(s, img);
     unsigned i = s->qt % s->depth;
-    s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur; s->q[i].b = b;
+    s->q[i].frame = frame; s->q[i].pts = pts; s->q[i].dur = dur; s->q[i].b = b; s->q[i].showAfter = false;
     // decode time stamps with reordering: the presentation time one picture earlier in display order (num_reorder_frames
     // 1: a B picture decodes when it is shown, an anchor one picture before the first B picture that waits for it)
     CMTime d = CMTIME_IS_NUMERIC(dur) ? dur : CMTimeMake(1, s->fps > 0 ? s->fps : 60);
-    s->q[i].dts = disp < 0 ? kCMTimeInvalid : s->coded == 0 ? CMTimeSubtract(pts, d) : s->ptsRing[(s->coded - 1) % 64];
+    s->q[i].dts = disp < 0 || s->av1 ? kCMTimeInvalid : s->coded == 0 ? CMTimeSubtract(pts, d) : s->ptsRing[(s->coded - 1) % 64];
     s->q[i].tEntry = tEntry; s->q[i].tTile = now_ms() - tTile0;
     s->q[i].ok = (disp < 0 ? enc_submit(&s->enc, idr, &s->q[i].ticket) : enc_submit_ex(&s->enc, idr, b, disp, &s->q[i].ticket)) == 0;
     s->q[i].tCall = now_ms() - tEntry;
@@ -516,6 +525,7 @@ static void flush_group(State *s)
     for (int k = 0; k < n; k++) {
         int j = restart ? k : k == 0 ? n - 1 : k - 1;
         submit(s, g[j].frame, g[j].img, g[j].pts, g[j].dur, g[j].tEntry, false, !restart && k > 0, g[j].disp);
+        if (s->av1 && !restart && n > 1 && k == n - 1) s->q[(s->qt - 1) % s->depth].showAfter = true;   // then show the anchor
         CVPixelBufferRelease(g[j].img);
     }
 }
