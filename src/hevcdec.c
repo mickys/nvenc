@@ -28,6 +28,7 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     d->first_pic = true; d->after_eos = true;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
+    d->turing = rm_class(rm, RM_CLS_NVDEC) == 0xc4b0;
     if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "hevcdec: channel failed\n"); return -1; }
     const size_t b16 = (size_t)(d->maxW / 16) * (d->maxH / 16);
     // co-located MVs: 128 bytes per 16x16 block per picture (generous; the headers give no size)
@@ -332,7 +333,9 @@ static int decode_pending(HevcDec *d)
     chan_mthd(c, 0, NVC9B0_SET_PICTURE_INDEX, 1, (NvU32)surf);
     chan_mthd(c, 0, NVC9B0_SET_COLOC_DATA_OFFSET, 1, hi(d->coloc.gpu));
     chan_mthd(c, 0, NVC9B0_SET_NVDEC_STATUS_OFFSET, 1, hi(d->status.gpu));
-    chan_mthd(c, 0, NVC9B0_SET_INTRA_TOP_BUF_OFFSET, 1, hi(d->intra.gpu));
+    // not on Turing (0xc4b0): its class has no such method and NVIDIA's driver sends none there (VP9: given one, that engine
+    // misused the buffer; docs/traces/vp9dec-gtx1650-linux); HEVC never touched it on Turing anyway
+    if (!d->turing) chan_mthd(c, 0, NVC9B0_SET_INTRA_TOP_BUF_OFFSET, 1, hi(d->intra.gpu));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_SCALING_LIST_OFFSET, 1, hi(d->scaling.gpu));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_TILE_SIZES_OFFSET, 1, hi(d->tiles.gpu));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_FILTER_BUFFER_OFFSET, 1, hi(d->filter.gpu));

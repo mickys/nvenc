@@ -26,6 +26,7 @@ typedef struct {
     bool first_pic, after_eos, skip_rasl;
     NvU32 semval;
     bool verbose;
+    bool turing;                    // NVDEC 0xc4b0 (GTX 1650): no SET_INTRA_TOP_BUF_OFFSET
     // the picture just decoded
     int cur_surf, cur_poc, cur_w, cur_h, cur_crop[4];   // crop: left, right, top, bottom (luma samples)
     bool cur_output;                // pic_output_flag (and not a skipped RASL picture)
