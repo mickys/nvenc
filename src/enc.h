@@ -5,7 +5,7 @@
 #include "channel.h"
 #include <stdint.h>
 
-#define ENC_MAX_REFS 3
+#define ENC_MAX_REFS 4             // AV1; H.264 and HEVC take up to 3
 #define ENC_MAX_SLICES 16
 #define ENC_MAX_DEPTH 3
 
@@ -15,7 +15,7 @@ typedef struct {
     int codec;                      // ENC_H264, ENC_HEVC or ENC_AV1 (qp_i / qp_p are then AV1 quantizer indices, 0..255)
     int width, height;              // display size; coded size is whole macroblocks (H.264) / 16-pixel CBs (HEVC)
     int qp_i, qp_p;                 // constant QP for I/IDR and P pictures
-    int num_refs;                   // L0 reference frames, 1..ENC_MAX_REFS
+    int num_refs;                   // L0 reference frames, 1..3 (AV1: 1..4, LAST / LAST2 / LAST3 / GOLDEN)
     int dpb_extra;                  // extra pictures announced in the HEVC VPS/SPS decoded picture buffer size, 0..2
                                     // (refs + 1 + 2 <= 6 = the smallest MaxDpbSize of any level)
     int engine;                     // 0 = NVENC0, 1 = NVENC1
@@ -60,7 +60,7 @@ typedef struct {
     size_t bps;                     // bytes per sample: 1, or 2 for 10-bit (the surface pitch fields stay in samples)
     // per frame in flight (slot = ticket % depth): input picture, picture setup, bitstream, status
     RmMem in[ENC_MAX_DEPTH], setup[ENC_MAX_DEPTH], bs[ENC_MAX_DEPTH], status[ENC_MAX_DEPTH];
-    struct { bool idr; unsigned frame_num, poc; double t0; int slot, nRefs, refs[ENC_MAX_REFS], lf; } pend[ENC_MAX_DEPTH];
+    struct { bool idr; unsigned frame_num, poc; double t0; int slot, nRefs, refs[ENC_MAX_REFS], refOh[ENC_MAX_REFS], lf; } pend[ENC_MAX_DEPTH];
     RmMem recon, hist, coloc, mepred[2], sem, rcproc, rcdata;
     NvU32 seq;                      // frames submitted (semaphore payload of the last one)
     NvU32 waited;                   // frames waited for

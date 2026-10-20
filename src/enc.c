@@ -32,6 +32,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->cfg = *cfg;
     if (e->cfg.num_refs < 1) e->cfg.num_refs = 1;
     if (e->cfg.num_refs > ENC_MAX_REFS) e->cfg.num_refs = ENC_MAX_REFS;
+    if (e->cfg.codec != ENC_AV1 && e->cfg.num_refs > 3) e->cfg.num_refs = 3;
     // H.264 4:4:4: the engine's CABAC coder only knows 4:2:0 (broken IDRs, then an engine exception, RM error 0x2f on P
     // frames); CAVLC 4:4:4 is correct (M13 T13.02)
     if (cfg->codec == ENC_H264 && (cfg->chroma444 || cfg->lossless)) e->cfg.cabac = false;
@@ -464,8 +465,8 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
 // ---- AV1 (M12): NVIDIA's Linux driver's picture setups (src/av1enctmpl.h, traced at 256x128), patched in the fields that
 // change with the picture size and the frame (found by comparing traces at 256x128, 640x360 and 1920x1080 and across
 // frames). Ada reads nvenc_av1_drv_pic_setup_s with a fourth 32-byte surface config at 0x64 (a copy of the reference
-// picture's), so the offsets below are the header's plus 0x20 from there on. One reference (LAST, the previous frame),
-// as the driver's low-latency P frames; CDEF and loop restoration on (the engine picks CDEF per block from two strengths
+// picture's), so the offsets below are the header's plus 0x20 from there on. References: the previous frames, newest
+// first (one in the driver's low-latency mode, up to four in p7 / hq; T12.07); CDEF and loop restoration on (the engine picks CDEF per block from two strengths
 // and leaves restoration off); constant quantizer per frame type (rate control: later, T12.03).
 static void put32(void *b, size_t off, NvU32 v) { memcpy((NvU8 *)b + off, &v, 4); }
 static void put16(void *b, size_t off, NvU16 v) { memcpy((NvU8 *)b + off, &v, 2); }
@@ -480,7 +481,7 @@ static int av1_lf_level(int q, bool key)
     return l < 0 ? 0 : l > 63 ? 63 : l;
 }
 
-static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
+static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf, int nRefs, unsigned poc)
 {
     NvU8 *b = setup->cpu;
     const int W = e->cfg.width, H = e->cfg.height;
@@ -500,6 +501,16 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
     }
     if (e->cfg.bit_depth > 8) put32(b, 0x84, *(NvU32 *)(b + 0x84) | 2u << 7 | 2u << 11);   // seqhdr: bit depth, input bit depth - 8
     for (int i = 0; i < 4; i++) b[0x98 + i] = (NvU8)lf;            // frame header: loop filter levels
+    if (!idr) {   // references (docs/traces/bframes-linux ahq, NVIDIA's -preset p7 -tune hq: up to 4, newest first): list 0
+        // entry i = REF_PIC<i> = LAST + i, temporal distance in half frames, position i; unused entries -1; compound
+        // prediction from one direction (unicompound) once there are two
+        for (int i = 0; i < 4; i++) {
+            b[0x128 + i] = (NvU8)(i < nRefs ? i : 0xff); b[0x136 + i] = (NvU8)(i < nRefs ? i : 0xff);
+            b[0x12f + i] = (NvU8)(i < nRefs ? poc - e->slotPoc[e->slotOf[i]] : 0xff);
+        }
+        b[0x144] = (NvU8)((b[0x144] & ~0xe0) | nRefs << 5);         // num_ref_idx_l0_active
+        if (nRefs >= 2) b[0x8d] |= 4;                               // unicompound_enable
+    }
     b[0xc0] = (NvU8)q;                                              // frame header: base_q_idx
     b[0xc9] = (NvU8)e->cfg.qp_p; b[0xca] = (NvU8)e->cfg.qp_p; b[0xcb] = (NvU8)e->cfg.qp_i;   // RC: QP[P, B, I]
     put32(b, 0x154, (NvU32)e->hist.size); put32(b, 0x158, (NvU32)bs->size); put32(b, 0x15c, 0);   // pic_control buffer sizes
@@ -556,12 +567,12 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
 // statistics, the app timer and sub-frame mode 2; no colocated data; luma and chroma by one address each (the surface
 // configs give the chroma planes); on P frames the ME predictors and reference picture 0. Probability tables: key frames
 // read the default tables (by quantizer), P frames the tables the previous frame wrote.
-static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs)
+static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs, unsigned poc)
 {
     Chan *c = &e->chan;
     RmMem *setup = &e->setup[ds], *in = &e->in[ds], *bs = &e->bs[ds], *status = &e->status[ds];
     const int q = idr ? e->cfg.qp_i : e->cfg.qp_p, lf = av1_lf_level(q, idr);
-    setup_av1(e, setup, bs, idr, q, lf);
+    setup_av1(e, setup, bs, idr, q, lf, nRefs, poc);
     const NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot, inVa = e->extInput ? e->extInput : in->gpu;
     RmMem *probOut = e->av1OutIdx ? &e->av1ProbOut2 : &e->av1ProbOut, *probPrev = e->av1OutIdx ? &e->av1ProbOut : &e->av1ProbOut2;
     RmMem *meIn = &e->mepred[e->seq & 1], *meOut = &e->mepred[(e->seq + 1) & 1];
@@ -585,9 +596,9 @@ static void submit_av1(Enc *e, int ds, bool idr, int slot, int nRefs)
     static const NvU32 lm[6] = { NVC9B7_SET_IOENTROPY_ABOVE_MV_DATA, NVC9B7_SET_IOENTROPY_ABOVE_CTX_DATA, NVC9B7_SET_IODEBLOCK_TOPROW,
                                  NVC9B7_SET_IODEBLOCK_LEFTCOLUMN, NVC9B7_SET_IOCDEF_LEFTCOLUMN, NVC9B7_SET_IOLR_LEFTCOLUMN };
     for (int i = 0; i < 6; i++) chan_mthd(c, 0, lm[i], 1, (NvU32)(e->av1Line[i].gpu >> 8));
-    if (!idr && nRefs > 0) {
-        const NvU64 ra = e->recon.gpu + (NvU64)e->slotOf[0] * e->rSlot;
-        chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA, 1, (NvU32)(ra >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA, 1, (NvU32)(ra >> 8));
+    for (int i = 0; !idr && i < nRefs; i++) {   // REF_PIC<i>: the i-th newest reference
+        const NvU64 ra = e->recon.gpu + (NvU64)e->slotOf[i] * e->rSlot;
+        chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * (NvU32)i, 1, (NvU32)(ra >> 8)); chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * (NvU32)i, 1, (NvU32)(ra >> 8));
     }
     e->av1OutIdx ^= 1;
     e->pend[ds].lf = lf;
@@ -706,7 +717,7 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
 
     // ---- methods ----
 methods:
-    if (av1) { submit_av1(e, ds, idr, slot, nRefs); goto execute; }
+    if (av1) { submit_av1(e, ds, idr, slot, nRefs, poc); goto execute; }
     if (chan_push_used(c) > 0x8000) chan_rewind(c);
     NvU64 recOut = e->recon.gpu + (NvU64)slot * e->rSlot;
     NvU64 inVa = e->extInput ? e->extInput : in->gpu;
@@ -762,7 +773,7 @@ execute:
     }
     e->pend[ds].idr = idr; e->pend[ds].frame_num = e->frame_num; e->pend[ds].poc = av1 ? e->sinceIdr : poc;
     e->pend[ds].t0 = now_ms(); e->pend[ds].slot = slot; e->pend[ds].nRefs = nRefs;
-    for (int i = 0; i < nRefs; i++) e->pend[ds].refs[i] = e->slotOf[i];
+    for (int i = 0; i < nRefs; i++) { e->pend[ds].refs[i] = e->slotOf[i]; e->pend[ds].refOh[i] = (int)(e->slotPoc[e->slotOf[i]] / 2); }
     chan_submit(c);
     *ticket = payload;
 
@@ -786,8 +797,8 @@ execute:
 // av1-linux): sequence header with CDEF and restoration on; frame header with the engine's base quantizer, loop filter
 // level and CDEF damping (status), the setup's two CDEF strengths (0, and luma primary 4), restoration off on every
 // plane, TX_MODE_SELECT; inter frames: switchable interpolation filters, reference_select, CDFs from LAST (primary
-// reference 0) and saved at the end of the frame. Reference slots = reconstruction slots; every reference index names the
-// previous frame (LAST).
+// reference 0) and saved at the end of the frame. Reference slots = reconstruction slots; LAST, LAST2, LAST3, GOLDEN name
+// the references newest first (EncConfig.num_refs, up to 4), the other reference types repeat the oldest.
 static Av1SeqParams av1_seq(const Enc *e)
 {
     return (Av1SeqParams){ .width = e->cfg.width, .height = e->cfg.height, .bit_depth = e->cfg.bit_depth, .full_range = e->cfg.full_range,
@@ -808,7 +819,10 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
         .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = 1, .cdef_y = { 0, 16 }, .cdef_uv = { 0, 0 },
         .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4,
         .tile_cols_log2 = e->av1TileColsLog2, .tile_rows_log2 = e->av1TileRowsLog2, .context_update_tile_id = 0, .delta_q_present = e->cfg.rc_mode != 0 };
-    for (int i = 0; i < 7; i++) { fp.ref_frame_idx[i] = e->pend[ds].nRefs ? e->pend[ds].refs[0] : 0; fp.ref_order_hint[i] = (int)e->pend[ds].poc - 1; }
+    for (int i = 0; i < 7; i++) {   // LAST, LAST2, LAST3, GOLDEN = the references newest first; the rest repeat the oldest
+        const int r = e->pend[ds].nRefs ? (i < e->pend[ds].nRefs ? i : e->pend[ds].nRefs - 1) : 0;
+        fp.ref_frame_idx[i] = e->pend[ds].nRefs ? e->pend[ds].refs[r] : 0; fp.ref_order_hint[i] = e->pend[ds].nRefs ? e->pend[ds].refOh[r] : (int)e->pend[ds].poc - 1;
+    }
     const int nt = e->av1TileCols * e->av1TileRows;
     const uint8_t *tile[128]; size_t tsz[128], total = 0;
     if (getenv("ENC_AV1_LOG")) fprintf(stderr, "av1: frame %u %s: %u bits, q %u, lf %u (asked %d), cdef damping %u, %u tiles, tile 0 at %u size %u\n",

@@ -318,7 +318,7 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 static void *completion(void *arg);
 static OSStatus open_encoder(State *s)
 {
-    // reference frames: ReferenceBufferCount if the client set it, else NVENCVT_REFS, else 3. Pictures that come back
+    // reference frames (every codec): ReferenceBufferCount if the client set it, else NVENCVT_REFS, else 3. Pictures that come back
     // (window switching, blinking content) cost far less with more references: 1080p, three pictures cycling, HEVC:
     // 27.8 Mbit/s with one, 1.7 with three (T6.11); steady motion about -2 %, +0.1 ms per frame. No reordering, no added latency.
     int refs = s->refs > 0 ? s->refs : getenv("NVENCVT_REFS") ? atoi(getenv("NVENCVT_REFS")) : 3;
@@ -332,7 +332,7 @@ static OSStatus open_encoder(State *s)
     { FILE *df = fopen("/tmp/nvencvt.dpb", "r"); int v = 0;
       if (df) { if (fscanf(df, "%d", &v) == 1 && v >= 0) dpb_extra = v; fclose(df); } }
     dpb_extra = dpb_extra < 0 ? 0 : dpb_extra > 2 ? 2 : dpb_extra;
-    if (s->av1) refs = 1;   // AV1: one reference (LAST), as NVIDIA's driver in low-latency mode (enc.c)
+    if (!s->av1 && refs > 3) refs = 3;   // AV1 takes 4 (LAST .. GOLDEN), H.264 / HEVC 3
     EncConfig c = { .codec = s->av1 ? ENC_AV1 : s->hevc ? ENC_HEVC : ENC_H264, .width = s->width, .height = s->height, .num_refs = refs, .dpb_extra = dpb_extra, .fps = s->fps > 0 ? s->fps : 60,
                     .idr_period = s->maxKeyInterval > 0 ? s->maxKeyInterval : 0, .bit_depth = s->ten ? 10 : 8, .full_range = s->fullRange,
                     .h264_profile = h264_high(s) ? 100 : 77, .cabac = h264_cabac(s), .chroma444 = s->c444 };
@@ -376,8 +376,8 @@ static OSStatus open_encoder(State *s)
         CFDictionaryRef ext = CFDictionaryCreate(NULL, ek, ev, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus st = CMVideoFormatDescriptionCreate(NULL, CODEC_AV1, s->width, s->height, ext, &s->fmt);
         CFRelease(ext); CFRelease(atoms); CFRelease(d);
-        LOG("AV1%s encoder open on NVENC%d: %dx%d range %s rc_mode %d bitrate %d vbv %d q %d/%d idr_period %d fps %d -> fmt %d", s->ten ? " 10-bit" : "", c.engine,
-            c.width, c.height, c.full_range ? "full" : "video", c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
+        LOG("AV1%s encoder open on NVENC%d: %dx%d refs %d range %s rc_mode %d bitrate %d vbv %d q %d/%d idr_period %d fps %d -> fmt %d", s->ten ? " 10-bit" : "", c.engine,
+            c.width, c.height, s->enc.cfg.num_refs, c.full_range ? "full" : "video", c.rc_mode, c.bitrate, c.vbv_bits, c.qp_i, c.qp_p, c.idr_period, c.fps, (int)st);
         if (st) { enc_close(&s->enc); return st; }
         goto opened;
     }
