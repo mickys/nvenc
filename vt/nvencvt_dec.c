@@ -62,6 +62,7 @@ typedef struct { CMBaseVTable base; const DecoderClass *decoderClass; } DecoderV
 #define DECODER_ID_MPEG4 "org.nvenc.videodecoder.mpeg4"
 static bool is_mpeg12(FourCharCode c) { return c == kCMVideoCodecType_MPEG2Video || c == kCMVideoCodecType_MPEG1Video; }
 enum { CODEC_VP9 = 0x76703039, CODEC_AV1 = 0x61763031 };   // 'vp09', 'av01' (kCMVideoCodecType_VP9 / _AV1)
+enum { CODEC_HEV1 = 0x68657631, CODEC_AVC3 = 0x61766333 };  // 'hev1', 'avc3': sample entries macOS has no decoder for
 static bool gDLog; static FILE *gDLogF;
 #define DLOG(...) do { if (gDLog) { FILE *lf_ = gDLogF ? gDLogF : stderr; fprintf(lf_, "nvdecvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
 
@@ -797,6 +798,8 @@ static const DecoderVTable gDVT = { .base = { NULL, &gDBase }, .decoderClass = &
 
 __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharCode codec, CFAllocatorRef al, VTVideoDecoderRef *out)
 {
+    const FourCharCode entry = codec;   // 'hev1' / 'avc3' (parameter sets may also come in band) decode as HEVC / H.264
+    if (codec == CODEC_HEV1) codec = kCMVideoCodecType_HEVC; else if (codec == CODEC_AVC3) codec = kCMVideoCodecType_H264;
     if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC && codec != CODEC_VP9 && codec != CODEC_AV1 && !is_mpeg12(codec) && codec != kCMVideoCodecType_MPEG4Video) return kVTCouldNotFindVideoDecoderErr;
     CMBaseObjectRef obj = NULL;
     OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
@@ -806,7 +809,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     s->codec = codec;
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
-    DLOG("instance %p (%s)", obj, codec == CODEC_VP9 ? "vp09" : codec == CODEC_AV1 ? "av01" : codec == kCMVideoCodecType_HEVC ? "hvc1" :
+    DLOG("instance %p (%s)", obj, entry == CODEC_HEV1 ? "hev1" : entry == CODEC_AVC3 ? "avc3" : codec == CODEC_VP9 ? "vp09" : codec == CODEC_AV1 ? "av01" : codec == kCMVideoCodecType_HEVC ? "hvc1" :
          codec == kCMVideoCodecType_MPEG2Video ? "mp2v" : codec == kCMVideoCodecType_MPEG1Video ? "mp1v" :
          codec == kCMVideoCodecType_MPEG4Video ? "mp4v" : "avc1");
     return noErr;
@@ -827,12 +830,16 @@ OSStatus NVDecVT_Register(int rating)
     const void *v[] = { CFSTR(DECODER_ID), CFSTR("NVDEC - H.264 - mickys/nvenc"), nr, kCFBooleanTrue };
     CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     OSStatus st = reg(kCMVideoCodecType_H264, info, (void *)NVDecVT_CreateInstance);
+    // 'avc3' / 'hev1' sample entries (ffmpeg writes hev1 for HEVC in MP4 by default): VideoToolbox has no decoder for them
+    // at all (-12906, Apple's included); ours decodes them like avc1 / hvc1 (NVENCVT_NO_HEV1=1 leaves both out)
+    if (!getenv("NVENCVT_NO_HEV1")) { OSStatus s3 = reg(CODEC_AVC3, info, (void *)NVDecVT_CreateInstance); DLOG("registered %s for avc3 -> %d", DECODER_ID, (int)s3); }
     CFRelease(info);
     DLOG("registered %s -> %d (rating %d)", DECODER_ID, (int)st, rating);
     if (!getenv("NVENCVT_NO_HEVCDEC")) {   // HEVC (NVENCVT_NO_HEVCDEC=1 leaves it out): above NullMoth's own HEVC decoder too
         const void *vh[] = { CFSTR(DECODER_ID_HEVC), CFSTR("NVDEC - HEVC - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ih = CFDictionaryCreate(NULL, k, vh, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus sh = reg(kCMVideoCodecType_HEVC, ih, (void *)NVDecVT_CreateInstance);
+        if (!getenv("NVENCVT_NO_HEV1")) { OSStatus s1 = reg(CODEC_HEV1, ih, (void *)NVDecVT_CreateInstance); DLOG("registered %s for hev1 -> %d", DECODER_ID_HEVC, (int)s1); }
         CFRelease(ih);
         DLOG("registered %s -> %d (rating %d)", DECODER_ID_HEVC, (int)sh, rating);
     }
