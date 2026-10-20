@@ -2,7 +2,7 @@
 # bench-enc.sh: encoder benchmark in the guest (run from ~/nvenc-dev after ./build.sh nvencvt vtencfile).
 #   bench-enc.sh SRC.nv12 W H FPS FRAMES BITRATE [encoder ...]
 # SRC is raw NV12 (looped to FRAMES); every encoder gets the same frames and the same target bitrate. Prints one line per
-# encoder: "RESULT name WxH fps=<encode fps> kbps=<rate> psnr=<luma dB> vmaf=<score>" (VMAF only with BENCH_VMAF=1).
+# encoder (each encode runs twice, the faster time counts: single runs in the VM sometimes stall for seconds): "RESULT name WxH fps=<encode fps> kbps=<rate> psnr=<luma dB> vmaf=<score>" (VMAF only with BENCH_VMAF=1).
 # Encoders (default: all):
 #   ours-h264-rt ours-h264 ours-hevc-rt ours-hevc ours-hevc10 ours-av1-rt ours-av1 ours-av1-10   (libnvencvt through
 #     VideoToolbox: ffmpeg h264/hevc_videotoolbox with the library injected = what `nvenc-run ffmpeg` does; AV1 through
@@ -19,7 +19,7 @@ T=${BENCH_TMP:-/tmp/bench}; mkdir -p "$T"
 FS=$((W * H * 3 / 2)); SRCN=$(( $(stat -f %z "$SRC") / FS )); LOOPS=$(( (N + SRCN - 1) / SRCN - 1 ))
 IN=(-f rawvideo -pix_fmt nv12 -s ${W}x${H} -r $FPS -stream_loop $LOOPS -i "$SRC" -frames:v $N)
 # the reference: SRC looped to N frames (raw)
-REF=$T/ref-${W}x${H}-$N.nv12
+REF=$T/ref-$(basename "$SRC" .nv12)-${W}x${H}-$N.nv12
 [ -s "$REF" ] || $F -nostdin -v error -y "${IN[@]}" -f rawvideo "$REF"
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 metrics() {   # $1 = encoded file: decode to NV12 (8-bit), luma PSNR (and VMAF) against REF
@@ -30,7 +30,7 @@ metrics() {   # $1 = encoded file: decode to NV12 (8-bit), luma PSNR (and VMAF) 
   [ -n "${BENCH_VMAF:-}" ] && VMAF=$($F -nostdin -hide_banner "${R[@]}" -i "$T/dec.nv12" "${R[@]}" -i "$REF" -lavfi "[0][1]libvmaf=n_threads=16" -f null - 2>&1 | grep -o "VMAF score: [0-9.]*" | cut -d" " -f3)
 }
 for e in $ENCS; do
-  out=$T/$e.mp4; inj=(); args=(); t0=$(now)
+  out=$T/$e.mp4; inj=(); args=()
   case $e in
     ours-h264-rt) inj=(env DYLD_INSERT_LIBRARIES=$LIB); args=(-c:v h264_videotoolbox -realtime 1 -bf 0) ;;
     ours-h264)    inj=(env DYLD_INSERT_LIBRARIES=$LIB); args=(-c:v h264_videotoolbox -bf 2) ;;
@@ -51,13 +51,15 @@ for e in $ENCS; do
     ve=(env DYLD_INSERT_LIBRARIES=$LIB VT_SRC="$SRC" VT_BITRATE=$RATE VT_FPS=$FPS)
     [ $e = ours-av1-rt ] && ve+=(VT_REALTIME=1) || ve+=(VT_REORDER=1)
     [ $e = ours-av1-10 ] && ve+=(VT_10BIT=1)
-    t0=$(now); "${ve[@]}" ./vtencfile av01 $W $H $N "$out" /dev/null > "$T/log" 2>&1; t1=$(now)
+    best=999999
+    for rep in 1 2; do t0=$(now); "${ve[@]}" ./vtencfile av01 $W $H $N "$out" /dev/null > "$T/log" 2>&1; t1=$(now); d=$(echo "$t1 - $t0" | bc -l); [ $(echo "$d < $best" | bc) = 1 ] && best=$d; done
     grep -q "RESULT $N of $N" "$T/log" || { echo "RESULT $e ${W}x${H} FAILED: $(tail -1 "$T/log")"; continue; }
   else
-    t0=$(now); ${inj[@]+"${inj[@]}"} $F -nostdin -v error -y "${IN[@]}" "${args[@]}" -b:v $RATE -g 250 "$out" 2> "$T/log"; t1=$(now)
+    best=999999
+    for rep in 1 2; do t0=$(now); ${inj[@]+"${inj[@]}"} $F -nostdin -v error -y "${IN[@]}" "${args[@]}" -b:v $RATE -g 250 "$out" 2> "$T/log"; t1=$(now); d=$(echo "$t1 - $t0" | bc -l); [ $(echo "$d < $best" | bc) = 1 ] && best=$d; done
     [ -s "$out" ] || { echo "RESULT $e ${W}x${H} FAILED: $(tail -1 "$T/log")"; continue; }
   fi
   sz=$(stat -f %z "$out")
   metrics "$out"
-  echo "RESULT $e ${W}x${H} fps=$(echo "$N / ($t1 - $t0)" | bc -l | cut -c1-6) kbps=$(( sz * 8 * FPS / N / 1000 )) psnr=$PSNR vmaf=$VMAF"
+  echo "RESULT $e ${W}x${H} fps=$(echo "$N / $best" | bc -l | cut -c1-6) kbps=$(( sz * 8 * FPS / N / 1000 )) psnr=$PSNR vmaf=$VMAF"
 done

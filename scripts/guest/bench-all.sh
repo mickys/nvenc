@@ -33,12 +33,12 @@ for p in $PARTS; do case $p in
   8k)    # 8K: the 4K source scaled to 7680x4320 (speed only); encode with ours (encodeN, the session API) and decode the result
     K=/tmp/bench8k.nv12
     [ -s $K ] || $F -nostdin -v error -y -f rawvideo -pix_fmt nv12 -s 3840x2160 -i "$S/crowd2160_60.nv12" -frames:v 30 -vf scale=7680:4320:flags=bicubic -pix_fmt nv12 -f rawvideo $K
-    for c in "-av1 100 120" "-hevc 30 32" "30 32"; do
-      set -- $c; cod=h264; [ "$1" = -av1 ] && cod=av1; [ "$1" = -hevc ] && cod=hevc
-      o=$(SRC=$K ./encodeN $c 7680 4320 120 3 /tmp/8k.bin /dev/null 2>&1 | grep -o "encode [0-9.]* ms avg")
-      echo "RESULT 8k-encode $cod 7680x4320 $o"
-      if [ $cod = av1 ]; then $F -nostdin -v error -y -i /tmp/8k.bin -c copy /tmp/8k.mp4; else $F -nostdin -v error -y -i /tmp/8k.bin -c copy $( [ $cod = hevc ] && echo -tag:v hvc1 ) /tmp/8k.mp4; fi
+    for c in av1 hevc h264; do
+      case $c in av1) a=(-av1 7680 4320 30 100 120 3); fmt=ivf ;; hevc) a=(-hevc 7680 4320 30 30 32 3); fmt=hevc ;; h264) a=(7680 4320 30 30 32 3); fmt=h264 ;; esac
+      o=$(SRC=$K ./encodeN "${a[@]}" /tmp/8k.bin /dev/null 2>&1 | grep -o "encode [0-9.]* ms avg")
+      echo "RESULT 8k-encode $c 7680x4320 $o"
+      $F -nostdin -v error -y -f $fmt -i /tmp/8k.bin -c copy $( [ $c = hevc ] && echo -tag:v hvc1 ) /tmp/8k.mp4
       r=$(env DYLD_INSERT_LIBRARIES=$LIB VTDECODE_SPEED=hw ./vtdecode /tmp/8k.mp4 2>&1 | grep "RESULT speed")
-      echo "RESULT 8k-decode $cod 7680x4320 $(echo "$r" | grep -o "([0-9.]* fps)") $(echo "$r" | grep -o "hardware [01]")"
+      echo "RESULT 8k-decode $c 7680x4320 $(echo "$r" | grep -o "([0-9.]* fps)") $(echo "$r" | grep -o "hardware [01]")"
     done ;;
 esac; done
