@@ -36,10 +36,15 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     // above and SAO above areas, sized generously (per row, for up to 24 tile columns), then the slice edge area
     const size_t top = HEVC_DBLK_TOP_BUF_SIZE(d->maxW), left = HEVC_DBLK_LEFT_BUF_SIZE(d->maxH);
     d->flt_sao = NVDEC_ALIGN(top + left);
-    d->flt_bsd = d->flt_sao + NVDEC_ALIGN(HEVC_SAO_LEFT_BUF_SIZE(d->maxH));
+    // the SAO left area 8x nvdec_drv.h's size: Turing's NVDEC (GTX 1650, 0xc4b0) needs more with 3+ tile columns and rows
+    // (5x5 tiles at 1080p: 2x; the 1x size ran into the BSD control area: decoding stopped part way, wrong tile edges)
+    d->flt_bsd = d->flt_sao + NVDEC_ALIGN(HEVC_SAO_LEFT_BUF_SIZE(d->maxH) * 8);
     d->flt_above = d->flt_bsd + NVDEC_ALIGN((size_t)d->maxH * GIP_ASIC_BSD_CTRL_RAM_SIZE * 24);
-    d->flt_sao_above = d->flt_above + NVDEC_ALIGN((size_t)d->maxH * GIP_ASIC_VERT_FILTER_RAM_SIZE * 24);
-    d->flt_edge = d->flt_sao_above + NVDEC_ALIGN((size_t)d->maxH * GIP_ASIC_VERT_SAO_RAM_SIZE * 24);
+    // the filter-above and SAO-above areas by the larger picture dimension: Turing's NVDEC splits pictures wider than ~3072
+    // into columns and fills them by width; sized by the height they overlapped (wrong rows at CTB edges)
+    const size_t dimA = (size_t)(d->maxW > d->maxH ? d->maxW : d->maxH);
+    d->flt_sao_above = d->flt_above + NVDEC_ALIGN(dimA * GIP_ASIC_VERT_FILTER_RAM_SIZE * 24);
+    d->flt_edge = d->flt_sao_above + NVDEC_ALIGN(dimA * GIP_ASIC_VERT_SAO_RAM_SIZE * 24);
     const size_t flt = d->flt_edge + NVDEC_ALIGN((size_t)d->maxW * 64);
     d->auCap = (size_t)d->maxW * d->maxH * 2 > (4u << 20) ? (size_t)d->maxW * d->maxH * 2 : (4u << 20);
     if (!(d->au = malloc(d->auCap))) return -1;
