@@ -192,6 +192,19 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
         return 1;
     }
     if (f->width > 8192 || f->height > 8192) { fprintf(stderr, "vp9dec: %dx%d is beyond NVDEC's VP9 limit (8192)\n", f->width, f->height); return -1; }
+    // Turing's NVDEC (GTX 1650, 0xc4b0) answers status 0x10 for frames of one superblock row or column (NVIDIA lists 128x128
+    // as VP9's minimum; 66x66 and larger decode bit-exact); Ada decodes down to 8x8
+    const bool turing = rm_class(d->rm, RM_CLS_NVDEC) == 0xc4b0;
+    if (turing && (f->width <= 64 || f->height <= 64)) {
+        fprintf(stderr, "vp9dec: %dx%d is below this engine's VP9 minimum (65x65)\n", f->width, f->height); return -1; }
+    // Turing also decodes a frame that keeps the previous segmentation map (segmentation_update_map 0) as if segmentation were
+    // off: the same pictures whatever the segment buffers hold (wrong quantizers with alternate Q, broken parsing with the skip
+    // feature; libvpx vectors 15-segkey_adpq, 19-skip). Nothing in the setup changed it; said once per session.
+    if (turing && f->seg_enabled && !f->seg_update_map && !d->seg_warned) {
+        bool feat = false;
+        for (int i = 0; i < 8; i++) for (int j = 0; j < 4; j++) feat |= d->st.seg_feature_enabled[i][j] != 0;
+        if (feat) { fprintf(stderr, "vp9dec: frames keeping the segmentation map decode with segment 0 on this engine\n"); d->seg_warned = true; }
+    }
     if ((unsigned)f->width > d->maxW || (unsigned)f->height > d->maxH) { fprintf(stderr, "vp9dec: %dx%d is larger than the session\n", f->width, f->height); return -1; }
     if (!f->subsampling_x || !f->subsampling_y) { fprintf(stderr, "vp9dec: only 4:2:0 (NVDEC has no VP9 4:2:2 / 4:4:4)\n"); return -1; }
     if (f->bit_depth != d->bit_depth) { fprintf(stderr, "vp9dec: %d-bit frame in a %d-bit session\n", f->bit_depth, d->bit_depth); return -1; }
