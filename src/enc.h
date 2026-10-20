@@ -36,6 +36,8 @@ typedef struct {
     bool quality;                   // H.264: NVIDIA's -preset p4 ME / MD / quant controls for I and P pictures (about +0.6 dB at
                                     // equal rate on camera content, ~2.7 ms instead of ~1.5 ms per 1080p frame); AV1: the default
                                     // preset's MD / ME controls, 4 CDEF strengths and luma loop restoration (T12.09); default: fast
+    bool no_cu8;                    // HEVC quality mode without 8x8 coding units (NVIDIA's p7 controls, 16x16 minimum): at 4K
+                                    // 10 ms per frame instead of 22, +0.6 VMAF over the fast controls instead of +0.7 (T7.10)
     int bframes;                    // B pictures between anchors (H.264: POC type 0, VUI reordering; AV1: hidden ALTREF anchors);
                                     // the caller orders the pictures and marks the B ones (enc_submit_ex). num_refs >= 2
     int aq;                         // spatial adaptive quantization strength 1..15 as NVIDIA's -aq-strength (8 its default); 0 = off.

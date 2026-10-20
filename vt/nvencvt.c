@@ -435,7 +435,10 @@ static OSStatus open_encoder(State *s)
     {   // the quality controls only where they keep up: their cost per 1080p frame (HEVC NVIDIA's p7 with 8x8 CUs 5.6 ms, H.264
         // 2.7, AV1 2.2) scaled by the picture size must stay under 80 % of the frame period (HEVC 4K: 22 ms, so not at 60 fps)
         const double ms = (s->hevc ? 5.6 : s->av1 ? 2.2 : 2.7) * s->width * s->height / (1920.0 * 1080.0), fps = s->fps > 0 ? s->fps : 60;
-        if (c.quality && ms * fps > 800 && !getenv("NVENCVT_QUALITY")) { c.quality = false; LOG("quality controls off: %.1f ms per frame at %.0f fps", ms, fps); }
+        // HEVC: without 8x8 coding units the p7 controls cost 2.5 ms per 1080p frame (10 at 4K) for most of the gain (T7.10)
+        const double msMid = 2.5 * s->width * s->height / (1920.0 * 1080.0);
+        if (c.quality && ms * fps > 800 && s->hevc && msMid * fps <= 800 && !getenv("NVENCVT_QUALITY")) { c.no_cu8 = true; LOG("quality controls without 8x8 CUs: %.1f ms per frame at %.0f fps", msMid, fps); }
+        else if (c.quality && ms * fps > 800 && !getenv("NVENCVT_QUALITY")) { c.quality = false; LOG("quality controls off: %.1f ms per frame at %.0f fps", ms, fps); }
     }
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;

@@ -11,6 +11,9 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, HEVC 4K quality tier (T7.10):** NVIDIA's p7 controls without 8x8 coding units cost 10 ms per 4K frame (with
+  them 22) for most of their gain; libnvencvt uses them where the full set does not keep up (4K up to ~80 fps). 4K 50 fps through
+  VideoToolbox: crowd_run 72.0 -> 72.6 VMAF, park_joy 72.0 -> 72.7 (Main 10 73.3 / 73.1), at 74-80 fps instead of 120-126.
 - **2026-10-20, asynchronous decode (T8.09):** clients that allow asynchronous decompression (AVFoundation players and readers)
   now get the copy-out overlapped with the next decode: 4K H.264 189 -> 213 fps, HEVC 302 -> 356, HEVC Main 10 164 -> 207, VP9
   302 -> 337, AV1 309 -> 382, MPEG-2 211 -> 238 (`vtdecode VTDECODE_ASYNC=1`). The decode tables are synchronous (as ffmpeg).
@@ -122,8 +125,8 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 | ours H.264, real time (P only) | 113 | 20.00 | 30.86 | 63.6 |
 | ours H.264 (2 B, quality) | 87 | 20.39 | 31.40 | 69.1 |
 | ours HEVC, real time | 96 | 20.01 | 31.56 | 71.6 |
-| ours HEVC (2 B) | 120 | 20.15 | 31.87 | 72.0 |
-| ours HEVC Main 10 (2 B) | 92 | 20.19 | 31.85 | 72.6 |
+| ours HEVC (2 B) | 78 | 20.22 | 31.92 | 72.6 |
+| ours HEVC Main 10 (2 B) | 74 | 20.21 | 31.92 | 73.3 |
 | ours AV1, real time | 96 | 19.91 | 31.94 | 73.1 |
 | ours AV1 (2 B, quality) | 110 | 21.41 | 32.45 | 76.1 |
 | ours AV1 10-bit (2 B, quality) | 96 | 21.43 | 32.47 | 76.2 |
@@ -142,8 +145,8 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 | ours H.264, real time (P only) | 109 | 19.83 | 30.84 | 63.0 |
 | ours H.264 (2 B, quality) | 88 | 20.55 | 31.24 | 68.7 |
 | ours HEVC, real time | 98 | 19.79 | 31.59 | 71.4 |
-| ours HEVC (2 B) | 126 | 20.28 | 31.88 | 72.0 |
-| ours HEVC Main 10 (2 B) | 92 | 20.31 | 31.88 | 72.4 |
+| ours HEVC (2 B) | 78 | 20.16 | 31.90 | 72.7 |
+| ours HEVC Main 10 (2 B) | 74 | 20.17 | 31.90 | 73.1 |
 | ours AV1, real time | 95 | 19.84 | 32.23 | 75.4 |
 | ours AV1 (2 B, quality) | 109 | 21.17 | 32.63 | 77.8 |
 | ours AV1 10-bit (2 B, quality) | 90 | 21.15 | 32.63 | 77.8 |
@@ -155,15 +158,16 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 | x265 medium | 12 | 20.44 | 32.12 | 74.8 |
 | libaom AV1 realtime, cpu-used 8 | 10 | 20.00 | 31.67 | 72.7 |
 
-What this shows (our rows re-measured after T7.09's rate control changes: `docs/bench/2026-10-20-ours-t709.txt`):
-- **Speed:** our encoders run at 115-305 fps at 1080p and 87-126 fps at 4K end to end (the engine alone: 1.1-1.2 ms per 1080p
-  frame, 3.7-4.5 ms per 4K frame in real time mode, see the latency table): 1.8-2.6x x264 veryfast at 4K and 3-12x x265,
+What this shows (our rows re-measured after T7.09's rate control changes, `docs/bench/2026-10-20-ours-t709.txt`, and the 4K
+HEVC rows after T7.10, `docs/bench/2026-10-20-hevc4k-t710.txt`):
+- **Speed:** our encoders run at 115-305 fps at 1080p and 74-113 fps at 4K end to end (the engine alone: 1.1-1.2 ms per 1080p
+  frame, 3.7-4.5 ms per 4K frame in real time mode, see the latency table): 1.5-2.5x x264 veryfast at 4K and 3-12x x265,
   libaom and Apple's software encoders. HEVC with B pictures at 1080p (~130 fps) runs NVIDIA's p7 controls with 8x8 coding
-  units (5.6 ms per frame); at 4K 50 fps libnvencvt leaves them off because they would not keep up (22 ms per frame).
+  units (5.6 ms per frame); at 4K 50 fps it uses them without 8x8 units (10 ms per frame; with them 22 ms would not keep up).
 - **AV1 (not real time) is the best quality in every row:** VMAF 65-78, 3-4 points above x265 medium and 3-5 above libaom
   realtime, at 10x their speed.
-- **HEVC** with B pictures is level with x265 at about the same rate: crowd_run 62.3 vs x265 fast 61.6 (1080p) and 72.0 vs 72.1
-  (4K); park_joy 65.1 vs 65.7 (1080p) and 72.0 vs 74.1 (4K), the one clear gap. Real time (P only) is 1-4 VMAF lower. Main 10
+- **HEVC** with B pictures is level with x265 at about the same rate: crowd_run 62.3 vs x265 fast 61.6 (1080p) and 72.6 vs 72.1
+  (4K); park_joy 65.1 vs 65.7 (1080p) and 72.7 vs 74.1 (4K), the one clear gap. Real time (P only) is 1-4 VMAF lower. Main 10
   adds 0.4-1 VMAF over 8-bit at the same rate.
 - **H.264** with B pictures and the quality controls is at or above x264 medium at 1080p (59.5 / 63.2 vs 57.6 / 63.4) and far
   above it at 4K (69.1 / 68.7 vs 59.7 / 64.7), at 3.5x its speed (1080p) and 5x (4K).

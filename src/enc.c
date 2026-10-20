@@ -208,7 +208,7 @@ static HevcParams hevc_params(const Enc *e)
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
         .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs, .num_reorder = e->cfg.bframes > 0 ? 1 : 0,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
-        .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] }, .min_cb8 = e->cfg.quality, .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
+        .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] }, .min_cb8 = e->cfg.quality && !e->cfg.no_cu8 && !hevc_off("cu8"), .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
         .no_ts = hevc_off("ts") || e->cfg.bit_depth > 8,   /* nullmoth's 10-bit setup turns transform skip off */ .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
         .sis = hevc_off("sis") };
@@ -455,7 +455,7 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
     if (e->cfg.chroma444) { ic.sfc_pitch_chroma = (unsigned short)(2 * e->pitch); rc.sfc_pitch_chroma = (unsigned short)(2 * e->rPitch); }
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
     nvenc_h265_sps_data_s *sp = &ps->sps_data;
-    sp->chroma_format_idc = e->cfg.chroma444 ? 3 : 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = e->cfg.quality ? 0 : 1; sp->max_cu_size = 2;
+    sp->chroma_format_idc = e->cfg.chroma444 ? 3 : 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = e->cfg.quality && !e->cfg.no_cu8 && !hevc_off("cu8") ? 0 : 1; sp->max_cu_size = 2;
     sp->min_tu_size = 0; sp->max_tu_size = 3; sp->max_transform_depth_inter = 3; sp->max_transform_depth_intra = 3;
     sp->amp_enabled_flag = !hp.no_amp; sp->num_short_term_ref_pic_sets = 1; sp->sample_adaptive_offset_enabled_flag = !hp.no_sao;
     sp->strong_intra_smoothing_enabled_flag = hp.sis ? 1 : 0;
