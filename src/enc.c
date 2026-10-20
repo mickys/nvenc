@@ -78,6 +78,8 @@ int enc_open(Enc *e, const EncConfig *cfg)
     e->rSlot = (e->rLuma + e->rPitch * e->bps * (av1 ? rRows / 2 : (((size_t)e->hmb * 8 + 31) & ~(size_t)31)) + 0xffff) & ~(size_t)0xffff;
     if (cfg->chroma444 && !av1) e->rSlot = (3 * e->rLuma + 0xffff) & ~(size_t)0xffff;   // 4:4:4: chroma twice the luma plane
     if (hevc || av1) e->rSlot += 0x10000;   // nullmoth's HEVC slots are 64 KB larger than the planes (T6.03); what goes there is unknown
+    // NVENC 6.6 (GTX 1650) has no HEVC B pictures (NVIDIA's driver refuses hevc_nvenc -bf on it): P only there
+    if (hevc && e->cfg.bframes > 0 && rm_class(rm, RM_CLS_NVENC) == 0xb4b7) e->cfg.bframes = 0;
     int slots = e->cfg.num_refs + 1;
     if (e->cfg.bframes > 0) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
     e->nSlots = slots; e->av1LastShown = -1; e->av1HidDisp = -1;
@@ -86,6 +88,13 @@ int enc_open(Enc *e, const EncConfig *cfg)
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
     if (hevc) histSz = ((size_t)(W + 31) / 32 * 768 + 0xffff) & ~(size_t)0xffff;   // HEVC: 768 bytes per CTB column (nullmoth's size, T6.06)
+    // NVENC 6.6 (GTX 1650, class 0xb4b7) keeps HEVC history for the whole frame: 768 bytes per CTB plus half a row
+    // (NVIDIA's Linux driver: 27648 / 1589760 / 6312960 at 256x128 / 1080p / 4K; docs/traces/gtx1650-linux). With Ada's
+    // size the second P picture faulted (MMU fault)
+    if (hevc && rm_class(rm, RM_CLS_NVENC) == 0xb4b7) {
+        const size_t cw = ((size_t)W + 31) / 32, ch = ((size_t)H + 31) / 32;
+        histSz = (768 * cw * ch + 384 * cw + 0xffff) & ~(size_t)0xffff;
+    }
     e->av1SbCols = (W + 63) / 64; e->av1SbRows = (H + 63) / 64;
     if (av1) {   // tiles (uniform spacing): the fewest the spec allows, at most 64 superblocks (4096) wide and 2304 superblocks
         // (4096x2304) in area (A.3, 5.9.15); ENC_AV1_TILE_ROWS_LOG2 asks for more rows
@@ -932,7 +941,11 @@ methods:;
             // still carries 2 x slot (nullmoth's third picture: l0[0] 2, the reference in REF_PIC0; T6.07)
             // HEVC entries: list 0 first, then list 1 (a B picture: list 0 = slotOf[1..], list 1 = slotOf[0])
             const int es = hevc && b ? (i < nRefs - 1 ? e->slotOf[i + 1] : e->slotOf[0]) : e->slotOf[i];
-            NvU32 n = hevc ? (NvU32)i : (NvU32)e->slotOf[i];
+            // NVENC 6.6 (GTX 1650, 0xb4b7) indexes HEVC references by DPB slot as H.264 does (NVIDIA's Linux driver: the
+            // reference of l0[0] = 2 in REF_PIC1; docs/traces/gtx1650-linux): by list position the second P picture read an
+            // unset REF_PIC and faulted
+            const bool bySlot = !hevc || rm_class(&e->rm, RM_CLS_NVENC) == 0xb4b7;
+            NvU32 n = bySlot ? (NvU32)es : (NvU32)i;
             NvU64 ra = e->recon.gpu + (NvU64)es * e->rSlot;
             chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_LUMA + 4 * n, 1, (NvU32)(ra >> 8));
             chan_mthd(c, 0, NVC9B7_SET_IN_REF_PIC0_CHROMA + 4 * n, 1, (NvU32)((ra + e->rLuma) >> 8));

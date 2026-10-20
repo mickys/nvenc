@@ -62,6 +62,7 @@ int main(int argc, char **argv)
         memcpy(cfg.mdcv, m, 24); memcpy(cfg.cll, c, 4); cfg.has_mdcv = cfg.has_cll = true;
     }
     Enc e; if (enc_open(&e, &cfg)) return 1;
+    cfg.bframes = e.cfg.bframes;   // the encoder may have turned B pictures off (HEVC on NVENC 6.6)
     FILE *fh = fopen(argv[ai + 6], "wb"), *fs = fopen(argv[ai + 7], "wb");
     uint8_t hdr[256]; fwrite(hdr, 1, enc_headers(&e, hdr), fh);
     if (av1) {   // IVF file header
