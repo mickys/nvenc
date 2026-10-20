@@ -67,6 +67,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     int slots = e->cfg.num_refs + 1;
     if (e->cfg.bframes > 0) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
     e->nSlots = slots; e->av1LastShown = -1; e->av1HidDisp = -1;
+    e->av1Hq = cfg->codec == ENC_AV1 && (cfg->quality || cfg->bframes > 0);
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
     if (hevc) histSz = ((size_t)(W + 31) / 32 * 768 + 0xffff) & ~(size_t)0xffff;   // HEVC: 768 bytes per CTB column (nullmoth's size, T6.06)
@@ -470,7 +471,7 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
 // frames). Ada reads nvenc_av1_drv_pic_setup_s with a fourth 32-byte surface config at 0x64 (a copy of the reference
 // picture's), so the offsets below are the header's plus 0x20 from there on. References: the previous frames, newest
 // first (one in the driver's low-latency mode, up to four in p7 / hq; T12.07); CDEF and loop restoration on (the engine picks CDEF per block from two strengths
-// and leaves restoration off); constant quantizer per frame type (rate control: later, T12.03).
+// and leaves restoration off; with av1Hq from four, and self-guided restoration on luma); constant quantizer per frame type or the driver's RC.
 static void put32(void *b, size_t off, NvU32 v) { memcpy((NvU8 *)b + off, &v, 4); }
 static void put16(void *b, size_t off, NvU16 v) { memcpy((NvU8 *)b + off, &v, 2); }
 // loop filter level from the base quantizer index: the driver's choices were 7 at 80 (key) and 13 at 100 (P); libaom's
@@ -507,7 +508,11 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, bool isB, int q
     }
     if (e->cfg.bit_depth > 8) put32(b, 0x84, *(NvU32 *)(b + 0x84) | 2u << 7 | 2u << 11);   // seqhdr: bit depth, input bit depth - 8
     for (int i = 0; i < 4; i++) b[0x98 + i] = (NvU8)lf;            // frame header: loop filter levels
-    if (e->cfg.bframes > 0) memcpy(b + 0x1b8, isB ? av1_tmpl_bf_b_mdme : av1_tmpl_bf_p_mdme, sizeof av1_tmpl_bf_b_mdme);   // B mode controls
+    if (e->av1Hq) {   // the default preset (B mode / quality; docs/traces/bframes-linux ab2s): its MD / ME controls (the same for key
+        // frames and anchors), CDEF with four luma strengths and luma self-guided loop restoration (frame header in av1_assemble)
+        memcpy(b + 0x1b8, isB ? av1_tmpl_bf_b_mdme : av1_tmpl_bf_p_mdme, sizeof av1_tmpl_bf_b_mdme);
+        memcpy(b + 0xa8, av1_tmpl_hq_fh, 0x18); memcpy(b + 0xc4, av1_tmpl_hq_fh + 0x1c, 4);   // not 0xc0..0xc3 (base_q_idx, set above)
+    }
     if (!idr) {   // references (docs/traces/bframes-linux ahq, NVIDIA's -preset p7 -tune hq: up to 4, newest first): list 0
         // entry i = reference type LAST + i = REF_PIC<i>, temporal distance in half frames, position = the type; unused
         // entries -1; compound prediction from one direction (unicompound) once there are two. B pictures (ab2s): list 0 =
@@ -819,8 +824,8 @@ execute:
 
 // AV1: the temporal unit around the engine's tiles, with the headers NVIDIA's driver writes for this setup (docs/traces/
 // av1-linux): sequence header with CDEF and restoration on; frame header with the engine's base quantizer, loop filter
-// level and CDEF damping (status), the setup's two CDEF strengths (0, and luma primary 4), restoration off on every
-// plane, TX_MODE_SELECT; inter frames: switchable interpolation filters, reference_select, CDFs from LAST (primary
+// level and CDEF damping (status), the setup's CDEF strengths (0 and luma primary 4; av1Hq: luma primary 0, 2, 4, 9),
+// restoration off on every plane (av1Hq: self-guided on luma, 64x64 units), TX_MODE_SELECT; inter frames: switchable interpolation filters, reference_select, CDFs from LAST (primary
 // reference 0) and saved at the end of the frame. Reference slots = reconstruction slots; LAST, LAST2, LAST3, GOLDEN name
 // the references newest first (EncConfig.num_refs, up to 4), the other reference types repeat the oldest.
 static Av1SeqParams av1_seq(const Enc *e)
@@ -841,7 +846,8 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
     const bool isB = e->pend[ds].b;
     Av1FrameParams fp = { .frame_type = key ? 0 : 1, .hidden = e->pend[ds].hidden, .order_hint = (int)e->pend[ds].poc,
         .refresh_frame_flags = isB ? 0 : 1 << e->pend[ds].slot, .primary_ref_frame = key ? 7 : isB ? 6 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
-        .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = 1, .cdef_y = { 0, 16 }, .cdef_uv = { 0, 0 },
+        .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = e->av1Hq ? 2 : 1, .cdef_uv = { 0, 0, 0, 0 },
+        .cdef_y = { 0, e->av1Hq ? 8 : 16, 16, 36 }, .lr_type = { e->av1Hq ? 3 : 0, 0, 0 },
         .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4,
         .tile_cols_log2 = e->av1TileColsLog2, .tile_rows_log2 = e->av1TileRowsLog2, .context_update_tile_id = 0, .delta_q_present = e->cfg.rc_mode != 0 };
     for (int i = 0; i < 7; i++) {   // LAST, LAST2, LAST3, GOLDEN = the references newest first; the rest repeat the oldest

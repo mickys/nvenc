@@ -22,4 +22,7 @@ out += arr("av1_tmpl_p", p[:0x320]) + arr("av1_tmpl_p_tile", p[0x800:0x820]) + a
 bf = sys.argv[2] if len(sys.argv) > 2 else "docs/traces/bframes-linux/ab2s/dump"
 bp = open(bf + "/exec4-710.bin", "rb").read(); bb = open(bf + "/exec5-710.bin", "rb").read()
 out += arr("av1_tmpl_bf_p_mdme", bp[0x1b8:0x318]) + arr("av1_tmpl_bf_b_mdme", bb[0x1b8:0x318])
+# the default preset's frame header controls (setup 0xa8..0xc8: CDEF with four luma strengths, luma self-guided loop
+# restoration in 64x64 units; the same in p7); 0xc0 (base_q_idx) is patched per frame
+out += arr("av1_tmpl_hq_fh", bp[0xa8:0xc8])
 open("src/av1enctmpl.h", "w").write(out)

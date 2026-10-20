@@ -34,6 +34,7 @@ typedef struct {
     bool lf_delta_enabled;          // the reference / mode deltas (spec defaults, not updated)
     int cdef_damping;               // 3..6
     int cdef_bits, cdef_y[8], cdef_uv[8];   // strengths as (primary << 2) | secondary (secondary 0..3, 3 meaning 4)
+    int lr_type[3], lr_unit_shift;  // loop restoration per plane as coded (0 none, 1 switchable, 2 Wiener, 3 self-guided); unit 64 << shift
     bool tx_mode_select, reference_select, reduced_tx_set;
     int interp_filter;              // 0..3, 4 = switchable
     bool allow_high_precision_mv, is_motion_mode_switchable;

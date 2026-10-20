@@ -135,7 +135,13 @@ size_t av1_write_frame(const Av1SeqParams *s, const Av1FrameParams *f, const uin
                 put(&b, (unsigned)f->cdef_uv[i] >> 2, 4); put(&b, (unsigned)f->cdef_uv[i] & 3, 2);
             }
         }
-        if (s->enable_restoration) { put(&b, 0, 2); put(&b, 0, 2); put(&b, 0, 2); }   // lr_type RESTORE_NONE for each plane
+        if (s->enable_restoration) {                           // lr_params (5.9.20), 64x64 superblocks
+            for (int i = 0; i < 3; i++) put(&b, (unsigned)f->lr_type[i], 2);
+            if (f->lr_type[0] || f->lr_type[1] || f->lr_type[2]) {
+                put(&b, f->lr_unit_shift > 0, 1); if (f->lr_unit_shift > 0) put(&b, f->lr_unit_shift > 1, 1);
+                if (f->lr_type[1] || f->lr_type[2]) put(&b, 0, 1); // lr_uv_shift (4:2:0)
+            }
+        }
         put(&b, f->tx_mode_select, 1);                         // read_tx_mode
     }
     if (!intra) put(&b, f->reference_select, 1);               // frame_reference_mode

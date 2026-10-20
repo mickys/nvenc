@@ -33,7 +33,8 @@ typedef struct {
     bool chroma444;                 // HEVC Main 4:4:4 / H.264 High 4:4:4 Predictive (enc_load_yuv444 / enc_load_nv24)
     bool lossless;                  // H.264 (High 4:4:4 Predictive, CAVLC) / HEVC: every macroblock / CU at QP 0, bypassed
     bool quality;                   // H.264: NVIDIA's -preset p4 ME / MD / quant controls for I and P pictures (about +0.6 dB at
-                                    // equal rate on camera content, ~2.7 ms instead of ~1.5 ms per 1080p frame); default: fast
+                                    // equal rate on camera content, ~2.7 ms instead of ~1.5 ms per 1080p frame); AV1: the default
+                                    // preset's MD / ME controls, 4 CDEF strengths and luma loop restoration (T12.09); default: fast
     int bframes;                    // B pictures between anchors (H.264: POC type 0, VUI reordering; AV1: hidden ALTREF anchors);
                                     // the caller orders the pictures and marks the B ones (enc_submit_ex). num_refs >= 2
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
@@ -85,6 +86,7 @@ typedef struct {
     uint8_t *av1Hid; size_t av1HidN; int av1HidSlot, av1HidDisp, av1LastShown;
     uint8_t *av1Tu[ENC_MAX_DEPTH]; size_t av1TuCap;
     int av1SbCols, av1SbRows;
+    bool av1Hq;                     // AV1: the default preset's CDEF (4 strengths) and loop restoration (EncConfig.quality, B pictures)
     int av1TileColsLog2, av1TileRowsLog2, av1TileW, av1TileH, av1TileCols, av1TileRows;   // uniform tile grid (superblocks)
 } Enc;
 
