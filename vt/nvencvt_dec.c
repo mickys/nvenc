@@ -241,7 +241,10 @@ static OSStatus start_vp9(DState *s, VTVideoDecoderSession session, CMVideoForma
         depth = b[6] >> 4; chroma = (b[6] >> 1) & 7; full = b[6] & 1;
     }
     // 4:2:0 (chromaSubsampling 0 or 1), 8 or 10 bits (12-bit decodes, but CoreVideo has no 12-bit 4:2:0 biplanar format)
-    const bool ok = chroma <= 1 && (depth == 8 || depth == 10) && dim.width <= 8192 && dim.height <= 8192;
+    // TU117 (GTX 1650): no frames of 64 or less (vp9dec.c), so another decoder takes those
+    extern int gNvencvtGpu;
+    const bool ok = chroma <= 1 && (depth == 8 || depth == 10) && dim.width <= 8192 && dim.height <= 8192 &&
+                    (gNvencvtGpu != 2 || (dim.width > 64 && dim.height > 64));
     DLOG("startSession: VP9 %dx%d, %d-bit, chroma %d, %s range%s", dim.width, dim.height, depth, chroma, full ? "full" : "video",
          vpcc ? "" : " (no vpcC: assumed)");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
@@ -868,7 +871,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     return noErr;
 }
 
-// Called by NVEncVT_Register once the GPU checked out (Ada). Rated above NullMoth's own H.264 / HEVC decoders (1000). HEVC,
+// Called by NVEncVT_Register once the GPU checked out (Ada, or TU117 without AV1). Rated above NullMoth's own H.264 / HEVC decoders (1000). HEVC,
 // VP9 and AV1 too (NVENCVT_NO_HEVCDEC / _VP9DEC / _AV1DEC=1 leave one out).
 OSStatus NVDecVT_Register(int rating)
 {
@@ -909,7 +912,8 @@ OSStatus NVDecVT_Register(int rating)
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_VP9); DLOG("opted in to VP9 decoding for this process"); }
     }
-    if (!getenv("NVENCVT_NO_AV1DEC")) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
+    extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1)
+    if (!getenv("NVENCVT_NO_AV1DEC") && gNvencvtGpu == 1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
         const void *va[] = { CFSTR(DECODER_ID_AV1), CFSTR("NVDEC - AV1 - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ia = CFDictionaryCreate(NULL, k, va, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus sa = reg(CODEC_AV1, ia, (void *)NVDecVT_CreateInstance);
