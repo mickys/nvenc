@@ -7,6 +7,7 @@
 #include "av1hdr.h"
 #include "av1probs.h"
 #include "av1enctmpl.h"
+#include "hevcenctmpl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,7 +69,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     int slots = e->cfg.num_refs + 1;
     if (e->cfg.bframes > 0) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
     e->nSlots = slots; e->av1LastShown = -1; e->av1HidDisp = -1;
-    e->aqStride = ((size_t)e->wmb * e->hmb + 0xfff) & ~(size_t)0xfff;
+    e->aqStride = (((size_t)(H + 31) / 32 * 256) + 0xfff) & ~(size_t)0xfff;   // AQ: a 256-byte row per CTB row
     e->av1Hq = cfg->codec == ENC_AV1 && (cfg->quality || cfg->bframes > 0);
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
@@ -102,7 +103,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
         rm_mem_alloc(rm, &e->mepred[0], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[1], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->rcproc, 0x10000, 0x1000, true, true, true) ||
-        rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000 + (size_t)ENC_MAX_DEPTH * ((mbs + 0xfff) & ~(size_t)0xfff), 0x1000, true, true, true) ||
+        rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000 + (size_t)ENC_MAX_DEPTH * ((((size_t)H + 31) / 32 * 256 + 0xfff) & ~(size_t)0xfff), 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
     memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
     if (!av1 && (e->cfg.has_mdcv || e->cfg.has_cll) && !(e->seiBuf = malloc(e->bs[0].size + 256))) return -1;
@@ -172,7 +173,7 @@ static HevcParams hevc_params(const Enc *e)
     return (HevcParams){ .width = e->cfg.width, .height = e->cfg.height, .log2_max_poc_lsb_minus4 = 4,
         .max_dec_pic_buffering = e->cfg.num_refs + 1 + e->cfg.dpb_extra, .sps_rps_negative = e->cfg.num_refs, .num_reorder = e->cfg.bframes > 0 ? 1 : 0,
         .num_ref_idx_l0_default = e->cfg.num_refs, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range,
-        .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] }, .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
+        .colour = { e->cfg.colour[0], e->cfg.colour[1], e->cfg.colour[2] }, .min_cb8 = e->cfg.quality, .bit_depth = e->cfg.bit_depth, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .no_sdh = 1,   /* the engine does not apply sign data hiding: with it signalled, every residual decodes wrong (T6.05) */
         .no_ts = hevc_off("ts") || e->cfg.bit_depth > 8,   /* nullmoth's 10-bit setup turns transform skip off */ .no_cqd = hevc_off("cqd"), .no_sao = hevc_off("sao"), .no_amp = hevc_off("amp"),
         .sis = hevc_off("sis") };
@@ -203,32 +204,27 @@ static void load_widened(Enc *e, uint8_t *dst, const uint8_t *src, size_t stride
     free(buf);
 }
 
-// Spatial adaptive quantization (T7.07): a QP offset per 16x16 block from its luma variance, as x264's aq-mode 2: strength x
-// (log2 variance - the frame's mean of it), so flat areas get more bits and textured ones fewer at about the same rate. The
-// engine reads them (signed bytes, 16x16 blocks in raster order) from the RC data at the picture control's act_stat_offset
-// with aqMode 3 (external delta QP map); found by experiment, the header's comments name the fields.
+// Spatial adaptive quantization (T7.07, T7.08): a QP offset per 32x32 CTB from its luma variance, as NVIDIA's driver computes
+// them for -spatial_aq (docs/traces/quality-linux vsaq): about log2(variance + 1) - 8.6, clipped to +-strength (-8 on flat
+// CTBs, a few steps up on detailed ones; the rate control rebalances). The engine reads them with aqMode 3 (external delta
+// QP map) from the RC data at the picture control's act_stat_offset: one signed byte per CTB, rows 256 bytes apart.
 static void aq_compute(Enc *e, const void *y, size_t stride, int bytes)
 {
     const int slot = (int)(e->seq % (NvU32)e->cfg.depth);
     e->aqValid[slot] = false;
     if (!e->cfg.aq || e->cfg.codec != ENC_HEVC) return;
-    const int W = e->cfg.width, H = e->cfg.height, nb = e->wmb * e->hmb;
-    float *lv = malloc(sizeof *lv * (size_t)nb); if (!lv) return;
-    double sumL = 0;
-    for (int by = 0; by < e->hmb; by++) for (int bx = 0; bx < e->wmb; bx++) {
-        const int x0 = bx * 16, y0 = by * 16, w = W - x0 < 16 ? W - x0 : 16, h = H - y0 < 16 ? H - y0 : 16;
-        uint64_t s = 0, ss = 0;
-        for (int r = 0; r < h; r++) {
-            if (bytes == 1) { const uint8_t *p = (const uint8_t *)y + (size_t)(y0 + r) * stride + x0; for (int c = 0; c < w; c++) { s += p[c]; ss += (uint32_t)p[c] * p[c]; } }
-            else { const uint16_t *p = (const uint16_t *)((const uint8_t *)y + (size_t)(y0 + r) * stride) + x0; for (int c = 0; c < w; c++) { const uint32_t v = p[c] >> 8; s += v; ss += v * v; } }
-        }
-        const int n = w * h; const double var = ((double)ss - (double)s * s / n) * 256.0 / n;   // as for a full 16x16 block
-        lv[by * e->wmb + bx] = (float)log2(var + 1); sumL += lv[by * e->wmb + bx];
-    }
-    const double mean = sumL / nb, k = e->cfg.aq / 10.0;
+    const int W = e->cfg.width, H = e->cfg.height, cw = (W + 31) / 32, ch = (H + 31) / 32, k = e->cfg.aq;
     signed char *a = (signed char *)e->rcdata.cpu + 0x10000 + (size_t)slot * e->aqStride;
-    for (int i = 0; i < nb; i++) { const double o = k * (lv[i] - mean); a[i] = (signed char)(o > 10 ? 10 : o < -10 ? -10 : (o < 0 ? o - 0.5 : o + 0.5)); }
-    free(lv);
+    for (int by = 0; by < ch; by++) for (int bx = 0; bx < cw; bx++) {
+        const int x0 = bx * 32, y0 = by * 32, w = W - x0 < 32 ? W - x0 : 32, h = H - y0 < 32 ? H - y0 : 32;
+        uint64_t sum = 0, ss = 0;
+        for (int r = 0; r < h; r++) {
+            if (bytes == 1) { const uint8_t *p = (const uint8_t *)y + (size_t)(y0 + r) * stride + x0; for (int c = 0; c < w; c++) { sum += p[c]; ss += (uint32_t)p[c] * p[c]; } }
+            else { const uint16_t *p = (const uint16_t *)((const uint8_t *)y + (size_t)(y0 + r) * stride) + x0; for (int c = 0; c < w; c++) { const uint32_t v = p[c] >> 8; sum += v; ss += v * v; } }
+        }
+        const int n = w * h; const double var = ((double)ss - (double)sum * sum / n) / n, o = log2(var + 1) - 8.6;
+        a[by * 256 + bx] = (signed char)(o > k ? k : o < -k ? -k : (o < 0 ? o - 0.5 : o + 0.5));
+    }
     e->aqValid[slot] = true;
 }
 
@@ -424,7 +420,7 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
     if (e->cfg.chroma444) { ic.sfc_pitch_chroma = (unsigned short)(2 * e->pitch); rc.sfc_pitch_chroma = (unsigned short)(2 * e->rPitch); }
     ps->input_cfg = ic; ps->refpic_cfg = rc; ps->outputpic_cfg = rc;
     nvenc_h265_sps_data_s *sp = &ps->sps_data;
-    sp->chroma_format_idc = e->cfg.chroma444 ? 3 : 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = 1; sp->max_cu_size = 2;
+    sp->chroma_format_idc = e->cfg.chroma444 ? 3 : 1; sp->log2_max_pic_order_cnt_lsb_minus4 = 4; sp->min_cu_size = e->cfg.quality ? 0 : 1; sp->max_cu_size = 2;
     sp->min_tu_size = 0; sp->max_tu_size = 3; sp->max_transform_depth_inter = 3; sp->max_transform_depth_intra = 3;
     sp->amp_enabled_flag = !hp.no_amp; sp->num_short_term_ref_pic_sets = 1; sp->sample_adaptive_offset_enabled_flag = !hp.no_sao;
     sp->strong_intra_smoothing_enabled_flag = hp.sis ? 1 : 0;
@@ -460,6 +456,10 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
         // VBR came out at 18 Mbit/s on crowd_run, with the maximum 15.4 (T7.05)
         if (e->cfg.rc_mode == 1 || e->cfg.rc_mode == 17) r->R = (int)((double)e->cfg.max_bitrate / e->cfg.fps / pixels * 256);
         r->Bmin = 0; r->i_size_ratio_x = 1; r->i_size_ratio_y = 1;   // single_frame_vbv stays 0 (T3.08)
+        // NVIDIA's CBR fields (docs/traces/quality-linux vcbr, T7.08): HRD type 34, P / B / I weights, Np = the GOP's P count,
+        // a minimum buffer level; with 2 B pictures +0.5-1.1 VMAF on crowd_run / park_joy at 6 Mbit/s, P only the same
+        r->hrd_type = 34; r->rhopbi[0] = 286; r->rhopbi[1] = 317; r->rhopbi[2] = 256;
+        r->Np = e->cfg.idr_period > 0 ? e->cfg.idr_period - 1 : 0x7fffffff; r->Bmin = (int)(r->buffersize / 81920); r->Ravg = 0;
     }
 
     int ctbW = (W + 31) / 32, ctbH = (H + 31) / 32, ctbs = ctbW * ctbH, lg = 0;
@@ -520,6 +520,16 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
     if (b) ((nvenc_h264_me_control_s *)((NvU8 *)setup->cpu + OFF_ME))->Cu16partDecisionMadeByFPP = 1;   // NVIDIA's one B difference
     setup_md_hevc((void *)((NvU8 *)setup->cpu + OFF_MD));
     setup_q_hevc((void *)((NvU8 *)setup->cpu + OFF_Q));
+    if (e->cfg.quality) {   // NVIDIA's -preset p7 -tune hq controls (T7.08; with 8x8 coding blocks); the MV search range by size
+        NvU8 *base = setup->cpu;
+        memcpy(base + OFF_ME, idr ? hevc_p7_me_idr : b ? hevc_p7_me_b : hevc_p7_me_p, sizeof hevc_p7_me_p);
+        memcpy(base + OFF_MD, idr ? hevc_p7_md_idr : b ? hevc_p7_md_b : hevc_p7_md_p, sizeof hevc_p7_md_p);
+        memcpy(base + OFF_Q, hevc_p7_q, sizeof hevc_p7_q);
+        nvenc_h264_me_control_s *me = (void *)(base + OFF_ME);
+        const bool big = e->cfg.width > 1920 || e->cfg.height > 1088;   // the driver's ranges at 1080p and 4K
+        me->limit_mv.left_mvx_int = big ? -2048 : -1024; me->limit_mv.right_mvx_int = big ? 2047 : 1023;
+        me->limit_mv.top_mvy_int = big ? -512 : -256; me->limit_mv.bottom_mvy_int = big ? 511 : 255;
+    }
 }
 
 // ---- AV1 (M12): NVIDIA's Linux driver's picture setups (src/av1enctmpl.h, traced at 256x128), patched in the fields that

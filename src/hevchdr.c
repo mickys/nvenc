@@ -84,7 +84,7 @@ size_t hevc_write_sps(const HevcParams *p, uint8_t *out)
     ue(&b, (unsigned)p->log2_max_poc_lsb_minus4);
     put(&b, 1, 1);                                              // sps_sub_layer_ordering_info_present_flag
     ue(&b, (unsigned)p->max_dec_pic_buffering - 1); ue(&b, (unsigned)p->num_reorder); ue(&b, 0);
-    ue(&b, 1); ue(&b, 1);                                       // min CB 16 (log2 - 3 = 1), max CB 32 (diff 1)
+    ue(&b, p->min_cb8 ? 0 : 1); ue(&b, p->min_cb8 ? 2 : 1);     // min CB 16 (log2 - 3 = 1) or 8, max CB 32
     ue(&b, 0); ue(&b, 3);                                       // min TB 4 (log2 - 2 = 0), max TB 32 (diff 3)
     ue(&b, 3); ue(&b, 3);                                       // max_transform_hierarchy_depth inter / intra
     put(&b, 0, 1);                                              // scaling_list_enabled_flag

@@ -10,6 +10,10 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, HEVC quality from NVIDIA's presets (T7.08, third Linux-driver trace):** quality mode now uses NVIDIA's p7 controls
+  with 8x8 coding units, and CBR uses NVIDIA's rate control fields. crowd_run / park_joy 1080p, 6 Mbit/s CBR, 2 B pictures:
+  57.1 -> 58.4 / 59.5 -> 61.4 VMAF (encodeN). Quality mode costs 5.6 ms per 1080p frame (22 ms at 4K); libnvencvt enables it
+  only where it keeps up with the frame rate. Spatial AQ, now done exactly as the driver does it, still lowers VMAF here (off).
 - **2026-10-20, HEVC quality (T7.07):** with the frame-rate fix, ours vs x265 fast at 1080p / 6 Mbit/s: crowd_run 61.2 VMAF at
   6.50 Mbit/s vs 61.6 at 5.96, park_joy 63.7 at 6.52 vs 65.7 at 6.03 (ours 2 B pictures). Mode-decision knobs, block sizes and
   the rate control's I-frame budget give nothing; spatial AQ through the engine's delta-QP map works but lowers VMAF on these
