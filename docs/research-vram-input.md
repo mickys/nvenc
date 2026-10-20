@@ -383,3 +383,20 @@ The same as on 2.3.7 (20.9 -> 34.3 full screen, 40.5 -> 40.9 at 3200x1800). Meas
 relogin the guest session now comes back locked (`CGSSessionScreenIsLocked`; the lock screen's animated wallpaper then
 gives ~41 updates/s with Safari idle, and the display sleeps after a while, reading 0); `desk-run.sh` keeps the display
 awake and `desk-ab.sh` unlocks through QMP when needed.
+
+## GTX 1650: the same patch on a low-end card (2026-10-21)
+
+Same benchmark on a GTX 1650 (TU117, 4 GB, BAR1 256 MB) on NullMoth 2.4.3: the stock plugin against `v2.4.3-mickys.2`'s
+`--desktop` plugin (= 2.4.3 + 4868217), 2 x 3 x 20 s each. Logs: `notes/desk-ab-20261021-0123.log` (4K) and `-0133.log`
+(3200x1800).
+
+| Safari window | stock (updates/s) | patch (updates/s) | WindowServer, user + system (% of a core) | WebKit GPU process |
+|---|---:|---:|---|---|
+| 3200x1800 | 23.2 (21.6-23.9) | 31.7 (31.2-32.5), **+37 %** | 68 → 48 | 200-270 % → 192-200 % |
+| full-screen 4K | 16.5 (18.7 / 14.3 by login) | 18.6 (18.1-18.9), +13 % | 80 / 73 → 61 / 63 | 350-420 % → 240-420 % |
+
+- **3200x1800:** the gain the 4090 did not show there (+6 %), because on this card the CPU copy still limited that size.
+- **Full-screen 4K:** the card itself caps both builds at about 19 updates per second, so the gain is smaller. Stock varied
+  between logins (18.7 then 14.3), the patch did not. WindowServer's own CPU time drops by about two thirds (user 47 % /
+  32 % → 16-18 %).
+- **On both cards** the patch lowers WindowServer's CPU and raises the update rate where the CPU copy is the limit.
