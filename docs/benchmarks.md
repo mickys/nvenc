@@ -2,8 +2,9 @@
 
 Every encoder and decoder of this project against what else a Mac has: Apple's VideoToolbox codecs (software on this
 Mac), NullMoth's own NVIDIA decoders, and ffmpeg's software codecs (x264, x265, libaom, dav1d, libvpx, its own MPEG
-decoders). The tables below are from the full run of 2026-10-20 (nvenc `e29f761`: T7.06 to T7.08, 300 frames at 4K); raw results are in
-`docs/bench/` (`2026-10-20-rerun.txt`; the first baseline: `2026-10-20-{enc,dec,lat-8k}.txt`). This is a living document: new measurements and findings go into the log right below, newest first, and the
+decoders). The tables below are from the full run of 2026-10-20 (nvenc `e29f761`: T7.06 to T7.08, 300 frames at 4K), with our encoder rows
+re-measured after T7.09 (nvenc `def6292`); raw results are in `docs/bench/` (`2026-10-20-rerun.txt`, `2026-10-20-ours-t709.txt`;
+the first baseline: `2026-10-20-{enc,dec,lat-8k}.txt`). This is a living document: new measurements and findings go into the log right below, newest first, and the
 tables are replaced when a full run is repeated (see "Updating this document" at the end).
 
 ## Findings log
@@ -14,7 +15,9 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
   over 900 frames for 2x (H.264) / +7 % (HEVC) engine time, off by default (`NVENCVT_TWOPASS=1`). The real gain came from
   initializing the RC process buffer as the driver does (ours was zero, so the first IDR took ~37 frames' budget): +0.6-1.0 VMAF
   at equal rate over 900 frames and the rate on target (7.21 for 7.2 Mbit/s instead of 7.44); VBR, broken by T7.08 (it ran at
-  its maximum), fixed. Lookahead: the engine ignores its hints; scene-cut IDRs lowered VMAF. Raw: `docs/bench/2026-10-20-rc-matrix.txt`.
+  its maximum), fixed. Lookahead: the engine ignores its hints; scene-cut IDRs lowered VMAF. Raw: `docs/bench/2026-10-20-rc-matrix.txt`. Our
+  benchmark rows re-measured (`docs/bench/2026-10-20-ours-t709.txt`, tables above): H.264 / HEVC with B pictures now 0.3-2.8 %
+  over the target instead of 7-9 %, at about the same VMAF.
 - **2026-10-20, full rerun** (`docs/bench/2026-10-20-rerun.txt`, nvenc `e29f761`; tables above): after the frame-rate fix
   (T7.05), the HEVC p7 controls and NVIDIA's CBR fields (T7.08), 300 frames at 4K. **HEVC caught up with x265:** 1080p crowd_run /
   park_joy 62.1 / 65.1 VMAF (baseline 56.8 / 59.2 at 8-10 % under the target; x265 fast 61.6 / 65.7), 4K 72.2 / 72.7 (baseline
@@ -73,14 +76,14 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 308 | 6.01 | 26.61 | 51.0 |
-| ours H.264 (2 B, quality) | 284 | 6.47 | 27.36 | 59.7 |
-| ours HEVC, real time | 217 | 6.00 | 27.14 | 58.7 |
-| ours HEVC (2 B) | 130 | 6.48 | 27.69 | 62.1 |
-| ours HEVC Main 10 (2 B) | 128 | 6.47 | 27.67 | 63.0 |
-| ours AV1, real time | 240 | 5.88 | 27.37 | 60.6 |
-| ours AV1 (2 B, quality) | 258 | 6.11 | 28.09 | 65.2 |
-| ours AV1 10-bit (2 B, quality) | 231 | 6.11 | 28.10 | 65.2 |
+| ours H.264, real time (P only) | 306 | 5.99 | 26.62 | 51.1 |
+| ours H.264 (2 B, quality) | 269 | 6.01 | 27.35 | 59.5 |
+| ours HEVC, real time | 218 | 5.99 | 27.15 | 58.8 |
+| ours HEVC (2 B) | 129 | 6.02 | 27.74 | 62.3 |
+| ours HEVC Main 10 (2 B) | 114 | 6.03 | 27.72 | 63.2 |
+| ours AV1, real time | 230 | 5.88 | 27.37 | 60.6 |
+| ours AV1 (2 B, quality) | 251 | 6.11 | 28.09 | 65.2 |
+| ours AV1 10-bit (2 B, quality) | 248 | 6.11 | 28.10 | 65.2 |
 | Apple H.264 (software, VideoToolbox) | 50 | 6.27 | 25.74 | 47.0 |
 | Apple HEVC (software, VideoToolbox) | 7 | 6.58 | 27.57 | 61.8 |
 | x264 veryfast | 183 | 6.13 | 26.27 | 50.1 |
@@ -93,14 +96,14 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 294 | 5.92 | 26.84 | 54.6 |
-| ours H.264 (2 B, quality) | 282 | 6.40 | 27.46 | 63.1 |
-| ours HEVC, real time | 205 | 5.91 | 27.22 | 60.5 |
-| ours HEVC (2 B) | 129 | 6.50 | 27.91 | 65.1 |
-| ours HEVC Main 10 (2 B) | 132 | 6.49 | 27.93 | 66.2 |
-| ours AV1, real time | 259 | 5.82 | 27.58 | 63.8 |
-| ours AV1 (2 B, quality) | 262 | 6.13 | 28.27 | 68.8 |
-| ours AV1 10-bit (2 B, quality) | 236 | 6.13 | 28.26 | 68.8 |
+| ours H.264, real time (P only) | 306 | 5.91 | 26.86 | 54.8 |
+| ours H.264 (2 B, quality) | 286 | 6.08 | 27.48 | 63.2 |
+| ours HEVC, real time | 213 | 5.90 | 27.25 | 60.7 |
+| ours HEVC (2 B) | 128 | 6.10 | 27.90 | 65.1 |
+| ours HEVC Main 10 (2 B) | 130 | 6.10 | 27.91 | 66.1 |
+| ours AV1, real time | 230 | 5.82 | 27.58 | 63.8 |
+| ours AV1 (2 B, quality) | 260 | 6.13 | 28.27 | 68.8 |
+| ours AV1 10-bit (2 B, quality) | 231 | 6.13 | 28.26 | 68.8 |
 | Apple H.264 (software, VideoToolbox) | 49 | 6.23 | 25.53 | 45.8 |
 | Apple HEVC (software, VideoToolbox) | 6 | 6.42 | 27.52 | 62.8 |
 | x264 veryfast | 181 | 6.16 | 26.93 | 57.6 |
@@ -113,14 +116,14 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 114 | 20.06 | 30.85 | 63.6 |
-| ours H.264 (2 B, quality) | 88 | 21.79 | 31.44 | 69.5 |
-| ours HEVC, real time | 98 | 20.07 | 31.54 | 71.4 |
-| ours HEVC (2 B) | 125 | 21.49 | 31.89 | 72.2 |
-| ours HEVC Main 10 (2 B) | 93 | 21.44 | 31.87 | 72.7 |
-| ours AV1, real time | 69 | 19.91 | 31.94 | 73.1 |
-| ours AV1 (2 B, quality) | 111 | 21.41 | 32.45 | 76.1 |
-| ours AV1 10-bit (2 B, quality) | 93 | 21.43 | 32.47 | 76.2 |
+| ours H.264, real time (P only) | 113 | 20.00 | 30.86 | 63.6 |
+| ours H.264 (2 B, quality) | 87 | 20.39 | 31.40 | 69.1 |
+| ours HEVC, real time | 96 | 20.01 | 31.56 | 71.6 |
+| ours HEVC (2 B) | 120 | 20.15 | 31.87 | 72.0 |
+| ours HEVC Main 10 (2 B) | 92 | 20.19 | 31.85 | 72.6 |
+| ours AV1, real time | 96 | 19.91 | 31.94 | 73.1 |
+| ours AV1 (2 B, quality) | 110 | 21.41 | 32.45 | 76.1 |
+| ours AV1 10-bit (2 B, quality) | 96 | 21.43 | 32.47 | 76.2 |
 | Apple H.264 (software, VideoToolbox) | 14 | 20.84 | 29.88 | 58.1 |
 | Apple HEVC (software, VideoToolbox) | 3 | 21.34 | 31.73 | 70.4 |
 | x264 veryfast | 49 | 20.59 | 29.20 | 52.6 |
@@ -133,14 +136,14 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 77 | 19.88 | 30.83 | 62.9 |
-| ours H.264 (2 B, quality) | 87 | 21.78 | 31.29 | 69.3 |
-| ours HEVC, real time | 97 | 19.83 | 31.57 | 71.3 |
-| ours HEVC (2 B) | 125 | 21.66 | 31.97 | 72.7 |
-| ours HEVC Main 10 (2 B) | 91 | 21.68 | 31.96 | 73.1 |
-| ours AV1, real time | 76 | 19.84 | 32.23 | 75.4 |
-| ours AV1 (2 B, quality) | 105 | 21.17 | 32.63 | 77.8 |
-| ours AV1 10-bit (2 B, quality) | 91 | 21.15 | 32.63 | 77.8 |
+| ours H.264, real time (P only) | 109 | 19.83 | 30.84 | 63.0 |
+| ours H.264 (2 B, quality) | 88 | 20.55 | 31.24 | 68.7 |
+| ours HEVC, real time | 98 | 19.79 | 31.59 | 71.4 |
+| ours HEVC (2 B) | 126 | 20.28 | 31.88 | 72.0 |
+| ours HEVC Main 10 (2 B) | 92 | 20.31 | 31.88 | 72.4 |
+| ours AV1, real time | 95 | 19.84 | 32.23 | 75.4 |
+| ours AV1 (2 B, quality) | 109 | 21.17 | 32.63 | 77.8 |
+| ours AV1 10-bit (2 B, quality) | 90 | 21.15 | 32.63 | 77.8 |
 | Apple H.264 (software, VideoToolbox) | 16 | 20.85 | 29.54 | 54.8 |
 | Apple HEVC (software, VideoToolbox) | 2 | 21.21 | 31.72 | 70.1 |
 | x264 veryfast | 45 | 20.83 | 30.08 | 59.1 |
@@ -149,21 +152,20 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 | x265 medium | 12 | 20.44 | 32.12 | 74.8 |
 | libaom AV1 realtime, cpu-used 8 | 10 | 20.00 | 31.67 | 72.7 |
 
-What this shows:
-- **Speed:** our encoders run at 130-310 fps at 1080p and 70-125 fps at 4K end to end (the engine alone: 1.1-1.2 ms per 1080p
-  frame, 3.7-4.5 ms per 4K frame in real time mode, see the latency table): 1.5-2.5x x264 veryfast at 4K and 3-12x x265,
+What this shows (our rows re-measured after T7.09's rate control changes: `docs/bench/2026-10-20-ours-t709.txt`):
+- **Speed:** our encoders run at 115-305 fps at 1080p and 87-126 fps at 4K end to end (the engine alone: 1.1-1.2 ms per 1080p
+  frame, 3.7-4.5 ms per 4K frame in real time mode, see the latency table): 1.8-2.6x x264 veryfast at 4K and 3-12x x265,
   libaom and Apple's software encoders. HEVC with B pictures at 1080p (~130 fps) runs NVIDIA's p7 controls with 8x8 coding
   units (5.6 ms per frame); at 4K 50 fps libnvencvt leaves them off because they would not keep up (22 ms per frame).
 - **AV1 (not real time) is the best quality in every row:** VMAF 65-78, 3-4 points above x265 medium and 3-5 above libaom
   realtime, at 10x their speed.
-- **HEVC** with B pictures is now level with x265 on VMAF: crowd_run 62.1 vs x265 fast 61.6 (1080p) and 72.2 vs 72.1 (4K),
-  park_joy 65.1 vs 65.7 and 72.7 vs 74.1, but with ~8 % more bits than x265 (see the rate note). Real time (P only) is on target
-  and 1.5-5 VMAF lower. Main 10 adds 0.4-1.1 VMAF over 8-bit at the same rate.
-- **H.264** with B pictures and the quality controls is at or above x264 medium at 1080p (59.7 / 63.1 vs 57.6 / 63.4) and far
-  above it at 4K (69.4 vs 59.7 / 64.7), at 3.5x its speed (1080p) and 5x (4K).
-- **Rate:** real-time encodes hit the target within 1 % (one-frame-period VBV). With B pictures (one-second VBV) ours come out 2-9 %
-  above it on these 6-second clips (AV1 2-7 %, HEVC and H.264 7-9 %); over 20 s they stay within 3 % (findings log, "rate over
-  longer runs"). x264 / x265 stay within 2-5 %.
+- **HEVC** with B pictures is level with x265 at about the same rate: crowd_run 62.3 vs x265 fast 61.6 (1080p) and 72.0 vs 72.1
+  (4K); park_joy 65.1 vs 65.7 (1080p) and 72.0 vs 74.1 (4K), the one clear gap. Real time (P only) is 1-4 VMAF lower. Main 10
+  adds 0.4-1 VMAF over 8-bit at the same rate.
+- **H.264** with B pictures and the quality controls is at or above x264 medium at 1080p (59.5 / 63.2 vs 57.6 / 63.4) and far
+  above it at 4K (69.1 / 68.7 vs 59.7 / 64.7), at 3.5x its speed (1080p) and 5x (4K).
+- **Rate:** real time within 1 % of the target; H.264 / HEVC with B pictures (one-second VBV) within 0.3-2.8 % over on these
+  6-second clips (before T7.09: 7-9 %), AV1 with B pictures 2-7 % over; x264 / x265 within 2-5 %.
 - Apple's VideoToolbox encoders run in software on this Mac (no Apple video hardware in a VM): 50 fps H.264, 6-7 fps HEVC at 1080p.
 
 ## Decode
