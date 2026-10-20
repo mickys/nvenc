@@ -450,8 +450,11 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
     CFRelease(attrs); CFRelease(ios); CFRelease(npf); CFRelease(nw); CFRelease(nh);
     CFMutableDictionaryRef col = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    const CFStringRef ck[] = { kCMFormatDescriptionExtension_ColorPrimaries, kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix };
-    for (int i = 0; i < 3; i++) { CFTypeRef x = CMFormatDescriptionGetExtension(fmt, ck[i]); if (x) CFDictionarySetValue(col, ck[i], x); }
+    // colour description and HDR metadata from the format description (the extension keys are the attachment keys), as
+    // Apple's decoders attach them
+    const CFStringRef ck[] = { kCMFormatDescriptionExtension_ColorPrimaries, kCMFormatDescriptionExtension_TransferFunction, kCMFormatDescriptionExtension_YCbCrMatrix,
+                               kCMFormatDescriptionExtension_MasteringDisplayColorVolume, kCMFormatDescriptionExtension_ContentLightLevelInfo };
+    for (int i = 0; i < 5; i++) { CFTypeRef x = CMFormatDescriptionGetExtension(fmt, ck[i]); if (x) CFDictionarySetValue(col, ck[i], x); }
     s->colour = col;
     DLOG("startSession: pixel buffer attributes -> %d (%s range)", (int)st, full ? "full" : "video");
     return noErr;

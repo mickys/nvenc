@@ -7,6 +7,7 @@
 //   VTDECODE_SW=1: with VTDECODE_REF, compare the software decoder (Apple's) instead
 //   VTDECODE_AVREAD=1: decode through AVAssetReader (alwaysCopiesSampleData NO) instead, compared with VTDECODE_REF
 //   VTDECODE_PF=x420: ask for that output format (default 420v)
+//   VTDECODE_ATT=1: print the first decoded frame's attachments (colour, HDR metadata)
 //   VTDECODE_SUPP=1: opt in to VP9 first (VTRegisterSupplementalVideoDecoderIfAvailable), as WebKit and ffmpeg do
 // Build: clang -fobjc-arc -O2 vtdecode.m -o vtdecode -framework Foundation -framework AVFoundation -framework CoreMedia
 //        -framework CoreVideo -framework VideoToolbox -framework Metal
@@ -22,6 +23,7 @@ static void cb(void *ref, void *src, OSStatus st, VTDecodeInfoFlags f, CVImageBu
 {
     Out *o = ref;
     if (st) { o->err = st; return; }
+    if (img && !o->n && getenv("VTDECODE_ATT")) { CFDictionaryRef a = CVBufferCopyAttachments(img, kCVAttachmentMode_ShouldPropagate); NSLog(@"first frame attachments: %@", a); if (a) CFRelease(a); }
     if (img) { [o->frames addObject:(__bridge id)img]; [o->pts addObject:@(CMTimeGetSeconds(pts))]; o->n++; }
 }
 
