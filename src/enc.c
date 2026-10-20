@@ -69,6 +69,16 @@ int enc_open(Enc *e, const EncConfig *cfg)
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
     if (hevc) histSz = ((size_t)(W + 31) / 32 * 768 + 0xffff) & ~(size_t)0xffff;   // HEVC: 768 bytes per CTB column (nullmoth's size, T6.06)
     e->av1SbCols = (W + 63) / 64; e->av1SbRows = (H + 63) / 64;
+    if (av1) {   // tiles (uniform spacing): the fewest the spec allows, at most 64 superblocks (4096) wide and 2304 superblocks
+        // (4096x2304) in area (A.3, 5.9.15); ENC_AV1_TILE_ROWS_LOG2 asks for more rows
+        int cl = 0, rl = 0;
+        while ((e->av1SbCols + (1 << cl) - 1) >> cl > 64) cl++;
+        while (((e->av1SbCols + (1 << cl) - 1) >> cl) * ((e->av1SbRows + (1 << rl) - 1) >> rl) > 2304) rl++;
+        if (getenv("ENC_AV1_TILE_ROWS_LOG2") && atoi(getenv("ENC_AV1_TILE_ROWS_LOG2")) > rl) rl = atoi(getenv("ENC_AV1_TILE_ROWS_LOG2"));
+        e->av1TileColsLog2 = cl; e->av1TileRowsLog2 = rl;
+        e->av1TileW = (e->av1SbCols + (1 << cl) - 1) >> cl; e->av1TileH = (e->av1SbRows + (1 << rl) - 1) >> rl;
+        e->av1TileCols = (e->av1SbCols + e->av1TileW - 1) / e->av1TileW; e->av1TileRows = (e->av1SbRows + e->av1TileH - 1) / e->av1TileH;
+    }
     if (av1)   // nvenc_drv.h: AV1_HIST_PIXEL_FRAME_SIZE + AV1_HIST_MV_SB_SIZE per superblock (generous: per superblock of the frame)
         histSz = ((size_t)AV1_HIST_PIXEL_FRAME_SIZE + (size_t)e->av1SbCols * e->av1SbRows * AV1_HIST_MV_SB_SIZE + (1 << 20) + 0xffff) & ~(size_t)0xffff;
     size_t meSz = (mbs * 64 + 0xffff) & ~(size_t)0xffff;   // ME predictor data per MB (the reference client uses 4 MB at any size)
@@ -140,7 +150,7 @@ void enc_close(Enc *e)
 
 static H264Params hdr_params(const Enc *e)
 {
-    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 || e->cfg.lossless ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = 51, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
+    return (H264Params){ .width = e->cfg.width, .height = e->cfg.height, .profile_idc = e->cfg.chroma444 || e->cfg.lossless ? 244 : e->cfg.h264_profile == 100 ? 100 : 77, .level_idc = e->wmb * e->hmb > 36864 ? 60 : 51, .chroma444 = e->cfg.chroma444, .lossless = e->cfg.lossless,
         .log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4, .poc_type = e->cfg.bframes > 0 ? 0 : 2, .log2_max_poc_lsb_minus4 = 4,
         .num_reorder = e->cfg.bframes > 0 ? 1 : 0, .num_ref_frames = e->cfg.num_refs,
         .num_ref_idx_l0_minus1 = e->cfg.num_refs - 1, .entropy_cabac = e->cfg.cabac, .transform_8x8 = e->cfg.h264_profile == 100 || e->cfg.chroma444, .pic_init_qp = 26, .vui = 1, .full_range = e->cfg.full_range };
@@ -497,10 +507,30 @@ static void setup_av1(Enc *e, RmMem *setup, RmMem *bs, bool idr, int q, int lf)
     put32(b, 0x178, 0x100 + (NvU32)av1_rc_area(e)); put32(b, 0x174, 0x100 + 2 * (NvU32)av1_rc_area(e));   // act / pass-2 in RC data
     put32(b, 0x180, 0x100u | (NvU32)e->av1SbCols << 16); put32(b, 0x184, (NvU32)e->av1SbRows);   // one strip: the whole frame
     put32(b, 0x31c, 0x80000000u | (NvU32)((size_t)e->wmb * e->hmb * 56 > 202500 ? (size_t)e->wmb * e->hmb * 56 : 202500));   // gpTimer
-    NvU8 *t = b + OFF_AV1_TILE;                                     // tile control: one tile, corners inclusive, next = this
-    put16(t, 4, (NvU16)(e->av1SbCols - 1)); put16(t, 6, (NvU16)(e->av1SbRows - 1));
-    put16(t, 0x14, (NvU16)(e->av1SbCols - 1)); put16(t, 0x16, (NvU16)(e->av1SbRows - 1));
-    t[0xa] = (NvU8)q;                                               // qp_avr
+    // tiles: one strip (the whole frame, one engine) with the uniform grid in raster order; one tile control each (corners
+    // inclusive, then the next tile's corners; the last names itself). The CDFs carried on come from tile 0. NVIDIA's driver
+    // splits frames above 4K into two strips, one per NVENC engine, with filters off at the strip edge (docs/traces/
+    // bframes-linux a8k); one strip keeps the loop filters across every tile edge, as the decoder applies them
+    const int nt = e->av1TileCols * e->av1TileRows;
+    put32(b, 0x144, (*(NvU32 *)(b + 0x144) & ~0x07fff800u) | (NvU32)(nt - 1) << 19);   // tile_idx_start 0, num_strip_tiles_minus1
+    put32(b, 0x148, (*(NvU32 *)(b + 0x148) & ~0xff0u) | (NvU32)(nt - 1) << 4);         // num_tiles_minus1
+    put32(b, 0x160, (*(NvU32 *)(b + 0x160) & ~0x7fffff80u) | (NvU32)e->av1TileCols << 7 | (NvU32)e->av1TileRows << 15);   // ctx tile 0
+    for (int i = 0; i < nt; i++) {
+        NvU8 *t = b + OFF_AV1_TILE + 0x20 * (size_t)i;
+        const int j = i + 1 < nt ? i + 1 : i;
+        if (i) memcpy(t, b + OFF_AV1_TILE, 0x20);
+        int c[2][4];
+        for (int k = 0; k < 2; k++) {
+            const int x = (k ? j : i) % e->av1TileCols, y = (k ? j : i) / e->av1TileCols;
+            c[k][0] = x * e->av1TileW; c[k][1] = y * e->av1TileH;
+            c[k][2] = (x + 1) * e->av1TileW < e->av1SbCols ? (x + 1) * e->av1TileW - 1 : e->av1SbCols - 1;
+            c[k][3] = (y + 1) * e->av1TileH < e->av1SbRows ? (y + 1) * e->av1TileH - 1 : e->av1SbRows - 1;
+        }
+        for (int k = 0; k < 4; k++) { put16(t, 2 * (size_t)k, (NvU16)c[0][k]); put16(t, 0x10 + 2 * (size_t)k, (NvU16)c[1][k]); }
+        t[0xa] = (NvU8)q;                                           // qp_avr
+        if (i) t[0xb] &= (NvU8)~0x08;                               // tile_end_update_cdf: tile 0 only
+        t[0xc] = (NvU8)i;                                           // tile_idx
+    }
     if (e->cfg.rc_mode) {   // rate control as the driver sets it up (docs/traces/av1-linux cbr / vbr; M12, T12.03)
         put32(b, 0x88, *(NvU32 *)(b + 0x88) | 0x2000);               // frame header: delta_q_present (block-level deltas)
         nvenc_av1_rc_s r; memset(&r, 0, sizeof r);
@@ -769,23 +799,30 @@ static int av1_assemble(Enc *e, int ds, EncFrame *out)
 {
     const NvU8 *sb = e->status[ds].cpu;
     const nvenc_av1_pic_stat_s *st = (const void *)sb;
-    const NvU32 *ts = (const NvU32 *)(sb + 0x100);                 // tile statistics (tile_stat_offset 0x100): offset, size
+    const NvU32 *ts = (const NvU32 *)(sb + 0x100);                 // tile statistics (tile_stat_offset 0x100): offset, size, 16 bytes each
     const bool key = e->pend[ds].idr;
     Av1SeqParams sp = av1_seq(e);
     const int lf = st->loop_filter_level;
     Av1FrameParams fp = { .frame_type = key ? 0 : 1, .order_hint = (int)e->pend[ds].poc, .refresh_frame_flags = 1 << e->pend[ds].slot,
         .primary_ref_frame = key ? 7 : 0, .base_q_idx = st->av1_start_QP, .lf_level = { lf, lf, lf, lf },
         .cdef_damping = (int)st->cdef_damping_minus_3 + 3, .cdef_bits = 1, .cdef_y = { 0, 16 }, .cdef_uv = { 0, 0 },
-        .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4, .delta_q_present = e->cfg.rc_mode != 0 };
+        .tx_mode_select = true, .reference_select = !key, .interp_filter = 4, .tile_size_bytes = 4,
+        .tile_cols_log2 = e->av1TileColsLog2, .tile_rows_log2 = e->av1TileRowsLog2, .context_update_tile_id = 0, .delta_q_present = e->cfg.rc_mode != 0 };
     for (int i = 0; i < 7; i++) { fp.ref_frame_idx[i] = e->pend[ds].nRefs ? e->pend[ds].refs[0] : 0; fp.ref_order_hint[i] = (int)e->pend[ds].poc - 1; }
-    const uint8_t *tile = (const uint8_t *)e->bs[ds].cpu + ts[0]; size_t tsz = ts[1];
+    const int nt = e->av1TileCols * e->av1TileRows;
+    const uint8_t *tile[128]; size_t tsz[128], total = 0;
     if (getenv("ENC_AV1_LOG")) fprintf(stderr, "av1: frame %u %s: %u bits, q %u, lf %u (asked %d), cdef damping %u, %u tiles, tile 0 at %u size %u\n",
                                        e->pend[ds].poc, key ? "key" : "inter", st->total_bit_count, st->av1_start_QP, lf, e->pend[ds].lf,
                                        st->cdef_damping_minus_3 + 3, st->num_tiles, ts[0], ts[1]);
-    if (st->num_tiles != 1 || !tsz || ts[0] + tsz > e->bs[ds].size || tsz + 1024 > e->av1TuCap) return -1;
+    if (st->num_tiles != nt || nt > 128) return -1;
+    for (int i = 0; i < nt; i++) {   // the engine leaves room for the tile size fields between the tiles
+        tile[i] = (const uint8_t *)e->bs[ds].cpu + ts[4 * i]; tsz[i] = ts[4 * i + 1]; total += tsz[i] + 4;
+        if (!tsz[i] || ts[4 * i] + tsz[i] > e->bs[ds].size) return -1;
+    }
+    if (total + 1024 > e->av1TuCap) return -1;
     uint8_t *o = e->av1Tu[ds]; size_t n = av1_write_temporal_delimiter(o);
     if (key) n += av1_write_sequence_header(&sp, o + n);
-    n += av1_write_frame(&sp, &fp, &tile, &tsz, 1, o + n);
+    n += av1_write_frame(&sp, &fp, tile, tsz, nt, o + n);
     out->data = o; out->size = n;
     return 0;
 }

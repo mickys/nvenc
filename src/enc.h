@@ -80,6 +80,7 @@ typedef struct {
     int av1OutIdx;                  // which of av1ProbOut / av1ProbOut2 the next frame writes
     uint8_t *av1Tu[ENC_MAX_DEPTH]; size_t av1TuCap;
     int av1SbCols, av1SbRows;
+    int av1TileColsLog2, av1TileRowsLog2, av1TileW, av1TileH, av1TileCols, av1TileRows;   // uniform tile grid (superblocks)
 } Enc;
 
 int  enc_open(Enc *e, const EncConfig *cfg);                    // 0 = ok
