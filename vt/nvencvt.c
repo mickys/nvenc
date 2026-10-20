@@ -27,6 +27,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 // ---- CMBaseObject / encoder class declarations (WebKit's CMBaseObjectSPI.h, written for C++) ----
 typedef struct CMBaseProtocolVTable CMBaseProtocolVTable;
@@ -1006,8 +1007,31 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     return st;
 }
 
+// System-wide settings for apps that do not get our environment variables (started from the Dock / Finder):
+// /usr/local/etc/nvencvt.conf, lines NAME=VALUE for NVENCVT_* / NVDEC_* names (e.g. NVENCVT_NO_DEC=1: no decoders),
+// '#' comments. Every app reads it, so it is used only when root-owned and not writable by others; a variable already
+// in the environment wins.
+static void load_conf(void)
+{
+    const char *path = getenv("NVENCVT_CONF") ? getenv("NVENCVT_CONF") : "/usr/local/etc/nvencvt.conf";
+    struct stat st;
+    if (stat(path, &st) || !S_ISREG(st.st_mode) || (!getenv("NVENCVT_CONF") && (st.st_uid != 0 || (st.st_mode & 022)))) return;
+    FILE *f = fopen(path, "r"); if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *e = strchr(line, '='), *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = 0;
+        if (line[0] == '#' || !e || (strncmp(line, "NVENCVT_", 8) && strncmp(line, "NVDEC_", 6))) continue;
+        *e = 0;
+        for (char *c = line; *c; c++) if (!((*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_')) { *line = 0; break; }
+        if (*line) setenv(line, e + 1, 0);
+    }
+    fclose(f);
+}
+
 __attribute__((constructor)) static void init(void)
 {
+    load_conf();
     // register by itself only when injected (DYLD_INSERT_LIBRARIES); loaded by the Metal plugin (NVMTL_NVENCVT),
     // the plugin calls NVEncVT_Register
     gLog = getenv("NVENCVT_LOG") != NULL;

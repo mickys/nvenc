@@ -1,71 +1,89 @@
 # nvenc
 
-A hardware H.264 encoder for macOS on NVIDIA GPUs before Blackwell (Turing, Ampere, Ada), running on
-[nullmoth's NVIDIA driver](https://github.com/nullmoth/nvidia-macos-driver) and exposed to apps through VideoToolbox.
-It drives the GPU's NVENC engine directly from user space and is written from public documentation only.
+Hardware video encoders and decoders for macOS on NVIDIA RTX 40 (Ada) GPUs, running on
+[NullMoth's NVIDIA driver](https://github.com/nullmoth/nvidia-macos-driver) and offered to apps through VideoToolbox.
+It drives the GPU's NVENC and NVDEC engines directly from user space (an RM client, GPFIFO channels and NVIDIA's
+documented picture setups), with no closed codec library in between.
 
-**Status: early.** M0 (RM client, capability probe), M1 (a channel on NVENC0/1 that runs our commands: `tools/hello`)
-M2 (one H.264 IDR frame from our own picture setup, 256x128 to 4K: `tools/encode1`) and M3 (`src/enc.c`: P-frames
-with up to 3 references, CBR/VBR, low-latency one-frame VBV, slices: `tools/encodeN`) work. M4 (`libnvencvt.dylib`: a VideoToolbox H.264 and (M6) HEVC
-encoder, loaded by nullmoth's Metal plugin (since driver 2.3.7, its own `NVMTL_NVENCVT=<process list|1>` hook in nvrm610.conf; root-owned library only) or injected with `DYLD_INSERT_LIBRARIES`) works.
-Next: M5, GPU-resident input. Milestones and design: [docs/design.md](docs/design.md); step-by-step tasks with reports:
-[docs/tasks.md](docs/tasks.md).
+| | Codecs |
+|---|---|
+| **Encode** (NVENC) | H.264 (Main / High, CABAC, 4:4:4, lossless, up to 8K), HEVC (Main, Main 10, 4:4:4, lossless), AV1 (8 / 10-bit, tiles up to 8K) |
+| **Decode** (NVDEC) | H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1 (8 / 10-bit, film grain), MPEG-1/2, MPEG-4 Part 2 through VideoToolbox; VP8 and VC-1 in the library and tools only (nothing on macOS asks VideoToolbox for them) |
 
-**Benchmarks:** every encoder and decoder against Apple's, NullMoth's and ffmpeg's, with usage examples and a findings log:
-[docs/benchmarks.md](docs/benchmarks.md).
+Encoders: B pictures (two between anchors; real-time sessions stay P-only), CBR / VBR with NVIDIA's rate-control
+settings, quality presets taken from NVIDIA's own driver where the frame rate allows, colour description and HDR10
+metadata, real-time latency of about 2 ms per 1080p and 5-6 ms per 4K frame. Decoders: bit-exact against ffmpeg on the
+conformance suites (details per codec in [docs/tasks.md](docs/tasks.md)); 4K H.264 at ~190-210 fps, HEVC / VP9 / AV1 at
+~300-380 fps.
 
-Why: the driver's own encoder library is Blackwell-only and closed. With a layout fix it runs on an RTX 4090, but a
-4K frame still costs ~9 ms in CPU copies, tiling and spin-waiting, the bitrate setting is ignored, and only one session
-per process works ([measurements](https://github.com/mickys/kvm-tahoe-nvidia/blob/main/docs/nvenc-enable-plan.md)).
+**Benchmarks** against Apple's, NullMoth's and ffmpeg's codecs, with usage examples and a findings log:
+[docs/benchmarks.md](docs/benchmarks.md). In short: our AV1 is the best quality of every encoder tested at 10x x265's
+speed, HEVC is level with x265 on VMAF, H.264 at or above x264 medium; the decoders are 4-5x NullMoth's for H.264 and
+the only hardware VP9 / AV1 decoders on an Intel Mac.
 
 ## Using it
 
-Releases ship inside the [mickys overlay](https://github.com/mickys/nvidia-macos-driver/releases) for nullmoth's driver
-(RTX 40 / Ada; H.264 High, HEVC Main and Main 10).
+Releases ship inside the [mickys overlay](https://github.com/mickys/nvidia-macos-driver/releases) for NullMoth's driver.
 
-- **Apps** (Parsec, OBS, AVFoundation apps): nullmoth's Metal plugin (2.3.7+, `NVMTL_NVENCVT`) loads `libnvencvt.dylib`
-  into every process that uses Metal, and VideoToolbox lists "NVENC - H.264 - (NVIDIA <card>) - mickys/nvenc - <version>" and its HEVC twin.
-- **Command-line tools** (ffmpeg, HandBrakeCLI, avconvert) never use Metal, so they see the encoder only through the
-  overlay's wrapper: `nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox -b:v 20M out.mp4` (it sets
-  `DYLD_INSERT_LIBRARIES` for that one tool; the library registers itself when injected). macOS has no supported way for a
-  third party to register a video encoder for every process: VideoToolbox loads only Apple-signed encoder plug-ins, and
-  MediaExtension has decoder extensions but no encoder ones ([docs/reports/T7.00-cli-and-extensions.md](docs/reports/T7.00-cli-and-extensions.md)).
-  The wrapper relies on the boot settings nullmoth's driver needs (relaxed SIP, `amfi_get_out_of_my_way`) for hardened
-  and Apple binaries; unsigned builds (evermeet.cx, Homebrew) take it anyway.
+- **Apps** (Parsec, OBS, QuickTime and other AVFoundation apps): NullMoth's Metal plugin loads
+  `libnvencvt.dylib` into every process that uses Metal when `NVMTL_NVENCVT=1` is in `nvrm610.conf` (its own hook since
+  driver 2.3.7; the library must be root-owned). VideoToolbox then lists "NVENC - H.264 - (NVIDIA <card>) - mickys/nvenc -
+  <version>", its HEVC and AV1 twins, and our decoders, rated above Apple's and NullMoth's.
+- **Command-line tools** (ffmpeg, HandBrakeCLI, avconvert) never use Metal, so they get the codecs only through the
+  overlay's wrapper: `nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox -b:v 20M out.mp4` (it sets `DYLD_INSERT_LIBRARIES`
+  for that one tool; the library registers itself when injected). macOS has no supported way for a third party to
+  register a video encoder for every process ([docs/reports/T7.00-cli-and-extensions.md](docs/reports/T7.00-cli-and-extensions.md)).
+- **Settings:** environment variables, or system-wide in `/usr/local/etc/nvencvt.conf` (lines `NAME=VALUE`, root-owned
+  and not writable by others; the environment wins). The useful ones:
+
+  | Setting | Effect |
+  |---|---|
+  | `NVENCVT_NO_DEC=1` | no decoders (only the encoders); `NVENCVT_NO_HEVCDEC`, `_VP9DEC`, `_AV1DEC`, `_MPEG2DEC`, `_MPEG4DEC` = one of them |
+  | `NVENCVT_NO_HEVC=1`, `NVENCVT_NO_AV1=1` | no HEVC / AV1 encoder |
+  | `NVENCVT_BFRAMES=0..3` | B pictures between anchors when the app allows reordering (default 2) |
+  | `NVENCVT_FAST=1` | the fast encoder controls even when not real time |
+  | `NVENCVT_TWOPASS=1` | NVIDIA's two-pass mode (H.264 / HEVC with a bitrate; small gain for 2x / +7 % engine time) |
+  | `NVDEC_SYNC=1` | decoders always synchronous |
+  | `NVENCVT_LOG=1` | log to stderr (or create `/tmp/nvencvt.log`: one log per process in `/tmp`) |
+
+  Encoder interface and VideoToolbox properties: [docs/vt-encoder.md](docs/vt-encoder.md).
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/` | the encoder: `rm.c` (RM client, memory, GPU/CPU mappings), `channel.c` (GPFIFO channel on an engine, push buffer, doorbell, MMU fault info), `blocklinear.c` (NVENC input layout), `h264hdr.c` (SPS/PPS), `enc.c` (the encode session: IDR/P, references, rate control, slices) |
-| `tools/` | test programs, each built against `src/`: `probe` (engines and classes), `hello` (M1: semaphores from host and NVENC), `encode1` (M2: one IDR frame), `encodeN` (M3: N frames, rate control via environment), `h264check` (decode with Apple's decoder, PSNR), `rcerr` (RM's RC error log, root), `vtrandom` (one random frame through VideoToolbox), `vtprobe` (stub VT encoder that logs every call), `vtstress` / `encloop` (many sessions, leak checks) |
-| `vt/` | `nvencvt.c`: the VideoToolbox encoder (`libnvencvt.dylib`); interface in `docs/vt-encoder.md` |
-| `trace/` | `nvtrace.c`: a `DYLD_INSERT_LIBRARIES` interposer that records a process's RM escapes, NVENC channel methods and buffers |
-| `scripts/` | `prbdecode.py` (RM protobuf records), `trace2blob.py`, `mixsetup.py` (setup bisection) |
-| `docs/design.md` | sources, design, milestones, lessons per milestone |
-| `docs/tasks.md`, `docs/reports/` | the milestones split into tasks; one report per finished task |
-| `docs/benchmarks.md`, `docs/bench/` | benchmarks (living document with a findings log) and their raw results; `scripts/guest/bench-*.sh` run them |
-| `docs/traces/` | captures of a working NVENC client (picture setups, logs) |
-| `scripts/fetch-vendor.sh` | NVIDIA's open-gpu-kernel-modules (RM API, 610.57.04) and open-gpu-doc (NVENC docs) into `vendor/` |
+| `src/rm.c`, `channel.c` | RM client (memory, GPU / CPU mappings, events) and GPFIFO channels on an engine |
+| `src/enc.c`, `*hdr.c`, `*enctmpl.h`, `la.c` | the encode session for H.264 / HEVC / AV1 (references, B pictures, rate control, two-pass), parameter sets / OBUs, NVIDIA's control blocks, lookahead analysis |
+| `src/dec.c`, `hevcdec.c`, `vp9dec.c`, `av1dec.c`, `mpeg2dec.c`, `mpeg4dec.c`, `vp8dec.c`, `vc1dec.c` (+ `*parse.c`) | the decoders: bitstream parsers, DPB management, NVDEC picture setups |
+| `src/blocklinear.c` | NVENC / NVDEC surface layouts (SIMD tiling and untiling) |
+| `vt/` | `libnvencvt.dylib`: the VideoToolbox encoders (`nvencvt.c`) and decoders (`nvencvt_dec.c`) |
+| `tools/` | test programs: `encodeN`, `vtencfile` (encode), `*decodeN`, `vtdecode` (decode), `probe`, `hello`, setup dumpers, VideoToolbox probes |
+| `trace/`, `trace-linux/` | runtime tracers (RM escapes, channel methods, buffers) used to observe working clients |
+| `scripts/` | template generators, trace tools, `guest/` benchmark and conformance runners, `bench-table.py` |
+| `docs/` | `design.md` (sources, design, lessons), `tasks.md` + `reports/` (every task and what it found), `benchmarks.md` + `bench/`, `traces/` |
 
 ## Build and run
 
-Needs a macOS guest/host with nullmoth's driver and the Command Line Tools, reachable over ssh.
+Needs a macOS machine (or guest) with NullMoth's driver and the Command Line Tools, reachable over ssh.
 
 ```sh
-scripts/fetch-vendor.sh
+scripts/fetch-vendor.sh    # NVIDIA open-gpu-kernel-modules (RM API, 610.57.04) and open-gpu-doc into vendor/
 ./build.sh                 # NVENC_GUEST=<ssh host>, default "tahoe"; binaries land in the guest's ~/nvenc-dev
 ssh tahoe ~/nvenc-dev/probe
-ssh tahoe 'cd ~/nvenc-dev && ./encode1 1920 1080 26 /tmp/o.h264 /tmp/o.nv12 && ./h264check 1920 1080 /tmp/o.h264 /tmp/o.nv12'
+ssh tahoe 'cd ~/nvenc-dev && SRC=clip.nv12 RC=2 BITRATE=8000000 ./encodeN -hevc 1920 1080 300 28 30 1 /tmp/o.hevc /dev/null'
 ```
 
-## Ground rules
+## Sources
 
-Public sources only: NVIDIA's open-gpu-doc and open-gpu-kernel-modules, nullmoth's open-source code, Apple's
-published headers and SPI declarations, the H.264 standard. No disassembly or patching of closed binaries, including
-nullmoth's codec libraries; where an interface isn't documented (VideoToolbox's encoder plugin vtable), it is worked
-out black-box by observing calls into our own code.
+NVIDIA's open-gpu-doc (`nvenc_drv.h`, `nvdec_drv.h`, class headers) and open-gpu-kernel-modules, the codec standards,
+Apple's published headers and SPI declarations, and NullMoth's open-source code. Where the documents leave something
+out, it was found by experiment or by observing working clients at run time (their RM calls, pushed methods and
+buffers): NullMoth's H.264 / HEVC encoder libraries on macOS and NVIDIA's Linux driver (AV1 encode, B pictures, quality
+presets, rate control). Two open-source decoders were read for facts the headers lack: mesa-nova (MIT; AV1 decode) and
+averne's FFmpeg `nvtegra` (VP8 / VC-1 decode); no code was taken. No disassembly or patching of closed binaries, and the
+decoders were never traced from NullMoth's libraries.
 
 ## License
 
-MIT (see `LICENSE`). The headers in `vendor/` (NVIDIA open-gpu-kernel-modules, open-gpu-doc, WebKit SPI) keep their own licences.
+MIT (see `LICENSE`). The headers in `vendor/` (NVIDIA open-gpu-kernel-modules, open-gpu-doc, WebKit SPI) keep their own
+licences.
