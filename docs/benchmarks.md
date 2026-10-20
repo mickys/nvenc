@@ -10,6 +10,10 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, HEVC quality (T7.07):** with the frame-rate fix, ours vs x265 fast at 1080p / 6 Mbit/s: crowd_run 61.2 VMAF at
+  6.50 Mbit/s vs 61.6 at 5.96, park_joy 63.7 at 6.52 vs 65.7 at 6.03 (ours 2 B pictures). Mode-decision knobs, block sizes and
+  the rate control's I-frame budget give nothing; spatial AQ through the engine's delta-QP map works but lowers VMAF on these
+  clips. What is left is NVIDIA's p7 / lookahead settings (not traced yet).
 - **2026-10-20, frame rate through ffmpeg (fixed, libnvencvt):** ffmpeg sets no `ExpectedFrameRate`, so a 50 fps stream got
   the per-frame bit budget of 60 fps: our real-time encodes in the baseline came out at 5.0 Mbit/s for a 6 Mbit/s target (the
   B-mode ones ~5.5). libnvencvt now takes the rate from the first frame's duration or the first two time stamps: 6.00 Mbit/s

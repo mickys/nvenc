@@ -37,6 +37,9 @@ typedef struct {
                                     // preset's MD / ME controls, 4 CDEF strengths and luma loop restoration (T12.09); default: fast
     int bframes;                    // B pictures between anchors (H.264: POC type 0, VUI reordering; AV1: hidden ALTREF anchors);
                                     // the caller orders the pictures and marks the B ones (enc_submit_ex). num_refs >= 2
+    int aq;                         // spatial adaptive quantization, strength in tenths (10 = 1.0, x264's default); 0 = off.
+                                    // HEVC; from the luma of NV12 / P010 input (enc_load_nv12 / _p010), a QP offset per 16x16 block.
+                                    // Lowers VMAF on crowd_run / park_joy at every strength (T7.07): off by default
     bool full_range;                // input is full-range (VUI video_full_range_flag); BGRA input is converted to video range
     int colour[3];                  // colour_primaries, transfer_characteristics, matrix_coefficients (ITU-T H.273) for the VUI /
                                     // AV1 color_config; 0 = BT.709 (1). E.g. BT.2020 PQ: 9, 16, 9; HLG: 9, 18, 9; BT.601 NTSC: 6, 6, 6
@@ -88,6 +91,8 @@ typedef struct {
     // AV1 B pictures (T12.08): an anchor with B pictures before it is coded hidden; its frame OBU goes into the next shown
     // frame's temporal unit, and enc_av1_show_existing() makes the temporal unit that shows it
     uint8_t *av1Hid; size_t av1HidN; int av1HidSlot, av1HidDisp, av1LastShown;
+    size_t aqStride;                // bytes per frame of AQ offsets in the RC data (from 0x10000, one area per frame in flight)
+    bool aqValid[ENC_MAX_DEPTH];    // the frame in that input slot has AQ offsets
     uint8_t *seiBuf;                // H.264 / HEVC key frames with HDR metadata: the SEI, then the engine's NAL units
     uint8_t *av1Tu[ENC_MAX_DEPTH]; size_t av1TuCap;
     int av1SbCols, av1SbRows;

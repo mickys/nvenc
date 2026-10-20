@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "class/clc56f.h"
 #include "class/cl2080_notification.h"
@@ -67,6 +68,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
     int slots = e->cfg.num_refs + 1;
     if (e->cfg.bframes > 0) { if (e->cfg.num_refs < 2) e->cfg.num_refs = 2; slots = e->cfg.num_refs + 2; e->bSlot = slots - 1; }
     e->nSlots = slots; e->av1LastShown = -1; e->av1HidDisp = -1;
+    e->aqStride = ((size_t)e->wmb * e->hmb + 0xfff) & ~(size_t)0xfff;
     e->av1Hq = cfg->codec == ENC_AV1 && (cfg->quality || cfg->bframes > 0);
     size_t mbs = (size_t)e->wmb * e->hmb;
     size_t histSz = ((((size_t)(W - 1) + 16) / 16 + 16) * H264_HIST_BLOCK_SIZE + 0xffff) & ~(size_t)0xffff;
@@ -100,7 +102,7 @@ int enc_open(Enc *e, const EncConfig *cfg)
         rm_mem_alloc(rm, &e->mepred[0], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->mepred[1], meSz, 0x1000, false, false, true) ||
         rm_mem_alloc(rm, &e->rcproc, 0x10000, 0x1000, true, true, true) ||
-        rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000, 0x1000, true, true, true) ||
+        rm_mem_alloc(rm, &e->rcdata, av1 ? 0x100 + 3 * av1_rc_area(e) + 0x1000 : 0x10000 + (size_t)ENC_MAX_DEPTH * ((mbs + 0xfff) & ~(size_t)0xfff), 0x1000, true, true, true) ||
         rm_mem_alloc(rm, &e->sem, 0x1000, 0x1000, true, true, true)) { fprintf(stderr, "enc: allocation failed\n"); return -1; }
     memset(e->rcproc.cpu, 0, e->rcproc.size); memset(e->rcdata.cpu, 0, e->rcdata.size);
     if (!av1 && (e->cfg.has_mdcv || e->cfg.has_cll) && !(e->seiBuf = malloc(e->bs[0].size + 256))) return -1;
@@ -201,6 +203,35 @@ static void load_widened(Enc *e, uint8_t *dst, const uint8_t *src, size_t stride
     free(buf);
 }
 
+// Spatial adaptive quantization (T7.07): a QP offset per 16x16 block from its luma variance, as x264's aq-mode 2: strength x
+// (log2 variance - the frame's mean of it), so flat areas get more bits and textured ones fewer at about the same rate. The
+// engine reads them (signed bytes, 16x16 blocks in raster order) from the RC data at the picture control's act_stat_offset
+// with aqMode 3 (external delta QP map); found by experiment, the header's comments name the fields.
+static void aq_compute(Enc *e, const void *y, size_t stride, int bytes)
+{
+    const int slot = (int)(e->seq % (NvU32)e->cfg.depth);
+    e->aqValid[slot] = false;
+    if (!e->cfg.aq || e->cfg.codec != ENC_HEVC) return;
+    const int W = e->cfg.width, H = e->cfg.height, nb = e->wmb * e->hmb;
+    float *lv = malloc(sizeof *lv * (size_t)nb); if (!lv) return;
+    double sumL = 0;
+    for (int by = 0; by < e->hmb; by++) for (int bx = 0; bx < e->wmb; bx++) {
+        const int x0 = bx * 16, y0 = by * 16, w = W - x0 < 16 ? W - x0 : 16, h = H - y0 < 16 ? H - y0 : 16;
+        uint64_t s = 0, ss = 0;
+        for (int r = 0; r < h; r++) {
+            if (bytes == 1) { const uint8_t *p = (const uint8_t *)y + (size_t)(y0 + r) * stride + x0; for (int c = 0; c < w; c++) { s += p[c]; ss += (uint32_t)p[c] * p[c]; } }
+            else { const uint16_t *p = (const uint16_t *)((const uint8_t *)y + (size_t)(y0 + r) * stride) + x0; for (int c = 0; c < w; c++) { const uint32_t v = p[c] >> 8; s += v; ss += v * v; } }
+        }
+        const int n = w * h; const double var = ((double)ss - (double)s * s / n) * 256.0 / n;   // as for a full 16x16 block
+        lv[by * e->wmb + bx] = (float)log2(var + 1); sumL += lv[by * e->wmb + bx];
+    }
+    const double mean = sumL / nb, k = e->cfg.aq / 10.0;
+    signed char *a = (signed char *)e->rcdata.cpu + 0x10000 + (size_t)slot * e->aqStride;
+    for (int i = 0; i < nb; i++) { const double o = k * (lv[i] - mean); a[i] = (signed char)(o > 10 ? 10 : o < -10 ? -10 : (o < 0 ? o - 0.5 : o + 0.5)); }
+    free(lv);
+    e->aqValid[slot] = true;
+}
+
 // 16-bit samples as P010 has them (10 bits in the high bits): NVENC takes them as they are, in the 8-bit layout with
 // twice the bytes per row (low-bit alignment gives garbage, T6.14)
 static void load_16(Enc *e, uint8_t *dst, const uint16_t *src, size_t stride, size_t width, size_t rows)
@@ -211,12 +242,14 @@ static void load_16(Enc *e, uint8_t *dst, const uint16_t *src, size_t stride, si
 void enc_load_p010(Enc *e, const uint16_t *y, size_t yStride, const uint16_t *uv, size_t uvStride)
 {
     RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
+    aq_compute(e, y, yStride, 2);
     load_16(e, in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height);
     load_16(e, (uint8_t *)in->cpu + e->lumaSz, uv, uvStride, (size_t)(e->cfg.width + 1) & ~(size_t)1, (size_t)(e->cfg.height + 1) / 2);
 }
 
 void enc_load_nv12(Enc *e, const uint8_t *y, size_t yStride, const uint8_t *uv, size_t uvStride)
 {
+    aq_compute(e, y, yStride, 1);
     RmMem *in = &e->in[e->seq % (NvU32)e->cfg.depth];
     if (e->bps == 2) {
         load_widened(e, in->cpu, y, yStride, (size_t)e->cfg.width, (size_t)e->cfg.height);
@@ -344,6 +377,23 @@ static void setup_md_hevc(nvenc_h265_md_control_s *md)
     md->tusize_4x4_enable = 1; md->tusize_8x8_enable = 1; md->tusize_16x16_enable = 1; md->tusize_32x32_enable = 1;
     md->pskip_enable = 1; md->mv_cost_enable = 1; md->ip_search_mode = 7; md->tu_search_num_cu16 = 2; md->tu_search_num_cu32 = 1;
     md->intra_ssd_cnt_4x4 = 1; md->intra_ssd_cnt_8x8 = 1; md->intra_ssd_cnt_16x16 = 1; md->intra_ssd_cnt_32x32 = 1;
+    const char *x = getenv("ENC_HEVC_MD");   // experiments: name=value,... (rdo, skip, ssd, mvp, tu16, tu32, allmodes, lambda)
+    for (; x && *x; x = strchr(x, ',') ? strchr(x, ',') + 1 : NULL) {
+        char k[16] = ""; int v = 0;
+        if (sscanf(x, "%15[a-z0-9]=%d", k, &v) != 2) break;
+        if (!strcmp(k, "rdo")) md->rdo_level = v;
+        else if (!strcmp(k, "skip")) md->skip_evaluate_enable_cu8 = md->skip_evaluate_enable_cu16 = md->skip_evaluate_enable_cu32 = v;
+        else if (!strcmp(k, "ssd")) md->intra_ssd_cnt_4x4 = md->intra_ssd_cnt_8x8 = md->intra_ssd_cnt_16x16 = md->intra_ssd_cnt_32x32 = v;
+        else if (!strcmp(k, "mvp")) md->mv_cost_predictor_control = v;
+        else if (!strcmp(k, "tu16")) md->tu_search_num_cu16 = v;
+        else if (!strcmp(k, "tu32")) md->tu_search_num_cu32 = v;
+        else if (!strcmp(k, "allmodes") && v) {
+            md->h265_intra_luma4x4_mode_enable = md->h265_intra_luma8x8_mode_enable = 0xffffffffu;
+            md->h265_intra_luma16x16_mode_enable = md->h265_intra_luma32x32_mode_enable = 0xffffffffu;
+            md->h265_intra_luma_mode_enable_leftbits = 0x3fffffff;
+        }
+        else if (!strcmp(k, "lambda")) md->num_1div8_lambda_ssd = v;
+    }
 }
 
 static void setup_q_hevc(nvenc_h265_quant_control_s *q)
@@ -391,6 +441,8 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
         ((NvU8 *)ps)[0x314] = 0x22; ((NvU8 *)ps)[0x315] = 0x02;
     }
     nvenc_h265_rc_s *r = &ps->rate_control;
+    { const int slot = (int)(e->seq % (NvU32)e->cfg.depth);   // spatial AQ (aq_compute)
+      if (e->cfg.aq && e->aqValid[slot]) { r->aqMode = 3; ps->pic_control.act_stat_offset = 0x10000 + (NvU32)(slot * e->aqStride); } }
     const int qp_b = e->cfg.qp_p + 2 > 51 ? 51 : e->cfg.qp_p + 2;   // B pictures (not references) 2 above P
     r->QP[0] = (unsigned char)e->cfg.qp_p; r->QP[1] = (unsigned char)qp_b; r->QP[2] = (unsigned char)e->cfg.qp_i;
     // 10-bit extends the QP range down by 6 * (bit_depth - 8): nullmoth's sets minQP -12

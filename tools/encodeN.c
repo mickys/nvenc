@@ -53,7 +53,7 @@ int main(int argc, char **argv)
                       .rc_mode = getenv("RC") ? atoi(getenv("RC")) : 0, .bitrate = getenv("BITRATE") ? atoi(getenv("BITRATE")) : 0,
                       .max_bitrate = getenv("MAXRATE") ? atoi(getenv("MAXRATE")) : 0, .vbv_bits = getenv("VBV") ? atoi(getenv("VBV")) : 0,
                       .slices = getenv("SLICES") ? atoi(getenv("SLICES")) : 1, .bit_depth = getenv("BITDEPTH") ? atoi(getenv("BITDEPTH")) : 8,
-                      .chroma444 = getenv("CHROMA444") != NULL, .lossless = getenv("LOSSLESS") != NULL, .bframes = getenv("BFRAMES") ? atoi(getenv("BFRAMES")) : 0, .quality = getenv("QUALITY") != NULL, .cabac = getenv("CABAC") != NULL, .h264_profile = getenv("HIGH") ? 100 : 77 };
+                      .chroma444 = getenv("CHROMA444") != NULL, .lossless = getenv("LOSSLESS") != NULL, .bframes = getenv("BFRAMES") ? atoi(getenv("BFRAMES")) : 0, .quality = getenv("QUALITY") != NULL, .aq = getenv("AQ") ? atoi(getenv("AQ")) : 0, .cabac = getenv("CABAC") != NULL, .h264_profile = getenv("HIGH") ? 100 : 77 };
     if (getenv("COLOUR")) sscanf(getenv("COLOUR"), "%d,%d,%d", &cfg.colour[0], &cfg.colour[1], &cfg.colour[2]);   // COLOUR=9,16,9 (H.273 codes)
     if (getenv("HDR")) {   // HDR=1: P3-D65 mastering display, 1000 / 0.005 cd/m2, MaxCLL 1000, MaxFALL 400 (SEI byte layout)
         static const uint8_t m[24] = { 0x33, 0xc2, 0x86, 0xc4, 0x1d, 0x4c, 0x0b, 0xb8, 0x84, 0xd0, 0x3e, 0x80, 0x3d, 0x13, 0x40, 0x42,

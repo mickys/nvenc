@@ -976,7 +976,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     }
     // "NVENC - H.264 - (NVIDIA RTX 4090) - mickys/nvenc - 0.7.0": codec, the card, this project and its version (git describe)
     char nameAvc[160], nameHevc[160], nameAv1[160];
-    const char *ver = NVENC_VERSION[0] == 'v' ? NVENC_VERSION + 1 : NVENC_VERSION;
+    const char *ver = NVENC_VERSION[0] == 'v' ? &NVENC_VERSION[1] : NVENC_VERSION;
     snprintf(nameAvc, sizeof nameAvc, "NVENC - H.264 - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
     snprintf(nameHevc, sizeof nameHevc, "NVENC - HEVC - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
     snprintf(nameAv1, sizeof nameAv1, "NVENC - AV1 - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
