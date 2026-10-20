@@ -620,7 +620,9 @@ static void submit(State *s, VTEncoderFrameRef frame, CVPixelBufferRef img, CMTi
     // decode time stamps with reordering: the presentation time one picture earlier in display order (num_reorder_frames
     // 1: a B picture decodes when it is shown, an anchor one picture before the first B picture that waits for it)
     CMTime d = CMTIME_IS_NUMERIC(dur) ? dur : CMTimeMake(1, s->fps > 0 ? s->fps : 60);
-    s->q[i].dts = disp < 0 || s->av1 ? kCMTimeInvalid : s->coded == 0 ? CMTimeSubtract(pts, d) : s->ptsRing[(s->coded - 1) % 64];
+    // without reordering the decode time is the presentation time: clients that asked for B pictures (ffmpeg -bf 2) need one
+    // on every sample ("DTS is invalid"), also when this encoder gives them none (HEVC on the GTX 1650, H.264 Baseline)
+    s->q[i].dts = s->av1 ? kCMTimeInvalid : disp < 0 ? pts : s->coded == 0 ? CMTimeSubtract(pts, d) : s->ptsRing[(s->coded - 1) % 64];
     s->q[i].tEntry = tEntry; s->q[i].tTile = now_ms() - tTile0;
     s->q[i].ok = (disp < 0 ? enc_submit(&s->enc, idr, &s->q[i].ticket) : enc_submit_ex(&s->enc, idr, b, disp, &s->q[i].ticket)) == 0;
     s->q[i].tCall = now_ms() - tEntry;
