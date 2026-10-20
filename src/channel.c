@@ -18,9 +18,9 @@ NV_STATUS chan_create(Rm *rm, Chan *c, NvU32 engineType, NvU32 objClass, void *o
 {
     memset(c, 0, sizeof *c); c->rm = rm; c->entries = 0x8000;
     c->usermodeMap.fd = -1;
-    // doorbell page (Ampere usermode class): writing a channel's work-submit token there makes the host fetch GPPut
+    // doorbell page (usermode class): writing a channel's work-submit token there makes the host fetch GPPut
     c->hUsermode = rm_handle(rm);
-    CHK(rm_alloc(rm, rm->subdevice, c->hUsermode, AMPERE_USERMODE_A, NULL));
+    CHK(rm_alloc(rm, rm->subdevice, c->hUsermode, rm_class(rm, RM_CLS_USERMODE), NULL));   // Turing / Ampere / Ada: same page layout
     void *um; CHK(rm_map_cpu(rm, rm->subdevice, c->hUsermode, 4096, false, &c->usermodeMap, &um));
     c->doorbell = (volatile NvU32 *)((NvU8 *)um + NVC361_NOTIFY_CHANNEL_PENDING);
 
@@ -39,7 +39,7 @@ NV_STATUS chan_create(Rm *rm, Chan *c, NvU32 engineType, NvU32 objClass, void *o
                                    .hVASpace = rm->vaspace, .hUserdMemory = { c->userd.hPhys }, .userdOffset = { 0 },
                                    .engineType = engineType };
     c->hChannel = rm_handle(rm);
-    CHK(rm_alloc(rm, rm->device, c->hChannel, AMPERE_CHANNEL_GPFIFO_A, &cp));
+    CHK(rm_alloc(rm, rm->device, c->hChannel, rm_class(rm, RM_CLS_CHANNEL), &cp));   // same GPFIFO / method format since Volta
     NVA06F_CTRL_BIND_PARAMS bp = { .engineType = engineType };
     CHK(rm_ctrl(rm, c->hChannel, NVA06F_CTRL_CMD_BIND, &bp, sizeof bp));
     c->hObject = rm_handle(rm);

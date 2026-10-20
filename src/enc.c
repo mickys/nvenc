@@ -36,6 +36,10 @@ static int rc_np(const Enc *e)
     return gop > 0 ? (gop + bf - 1) / (bf + 1) : 0x7fffffff;
 }
 
+// The picture setup's magic: the NVENC class in bits 31..16, version 0, revision 6 (nvenc_drv.h: 0xC9B70006 for Ada's
+// NVENC 8.2, 0xB4B70006 for NVENC 6.6 = the GTX 1650's TU117); the setup layout is the same for every version
+static NvU32 enc_magic(Enc *e) { const NvU32 c = rm_class(&e->rm, RM_CLS_NVENC); return c ? (c << 16) | 0x0006u : NV_NVENC_DRV_MAGIC_VALUE; }
+
 int enc_open(Enc *e, const EncConfig *cfg)
 {
     memset(e, 0, sizeof *e);
@@ -165,8 +169,8 @@ int enc_open(Enc *e, const EncConfig *cfg)
     }
 
     NV_NVENC_ALLOCATION_PARAMETERS ep = { .size = sizeof ep, .engineInstance = (NvU32)cfg->engine };
-    if (chan_create(rm, &e->chan, cfg->engine ? NV2080_ENGINE_TYPE_NVENC1 : NV2080_ENGINE_TYPE_NVENC0, NVC9B7_VIDEO_ENCODER, &ep)) return -1;
-    chan_mthd(&e->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B7_VIDEO_ENCODER);
+    if (chan_create(rm, &e->chan, cfg->engine ? NV2080_ENGINE_TYPE_NVENC1 : NV2080_ENGINE_TYPE_NVENC0, rm_class(rm, RM_CLS_NVENC), &ep)) return -1;
+    chan_mthd(&e->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVENC));
     // completion event (see enc_encode)
     if (!cfg->spin && rm_event_open(rm, &e->ev, cfg->engine ? NV2080_NOTIFIERS_NVENC1 : NV2080_NOTIFIERS_NVENC0)) {
         if (cfg->verbose) fprintf(stderr, "enc: no NVENC event - spinning\n");
@@ -438,7 +442,7 @@ static void setup_hevc(Enc *e, RmMem *setup, RmMem *bs, bool idr, int nRefs, boo
 {
     int W = e->cfg.width, H = e->cfg.height;
     nvenc_h265_drv_pic_setup_s *ps = setup->cpu;
-    ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
+    ps->magic = enc_magic(e);
     nvenc_h265_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
         .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
     // reference/output pictures: the coded (CTB-aligned) size; the input keeps the display size and the engine pads it
@@ -785,7 +789,7 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
     if (hevc) { setup_hevc(e, setup, bs, idr, nRefs, b, poc / 2); goto methods; }   // HEVC POCs: one per picture
     {
     nvenc_h264_drv_pic_setup_s *ps = setup->cpu;
-    ps->magic = NV_NVENC_DRV_MAGIC_VALUE;
+    ps->magic = enc_magic(e);
     nvenc_h264_surface_cfg_s ic = { .frame_width_minus1 = (unsigned short)(W - 1), .frame_height_minus1 = (unsigned short)(H - 1),
         .sfc_pitch = (unsigned short)e->pitch, .sfc_pitch_chroma = (unsigned short)e->pitch, .block_height = 2 };
     nvenc_h264_surface_cfg_s rc = ic; rc.sfc_pitch = rc.sfc_pitch_chroma = (unsigned short)e->rPitch;

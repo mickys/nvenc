@@ -23,7 +23,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     for (int i = 0; i < 8; i++) d->ref[i] = -1;
     vp9_init(&d->st);
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
-    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "vp9dec: channel failed\n"); return -1; }
+    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "vp9dec: channel failed\n"); return -1; }
     const size_t sbs = (size_t)(d->maxW / 64) * (d->maxH / 64);
     // sizes measured (T10.02): column MVs 1024 bytes per superblock, the intra top line ~4 bytes per pixel of width
     // (15 352 at 3840; 8 per pixel allocated for 10-bit), the filter "above" area ~57 bytes per row at 4K
@@ -47,7 +47,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     for (int i = 0; i < VP9_SURFACES; i++)
         if (rm_mem_alloc(rm, &d->luma[i], (luma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true) ||
             rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "vp9dec: surface alloc failed\n"); return -1; }
-    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
+    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
     return 0;
 }
 

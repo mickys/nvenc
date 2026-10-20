@@ -22,13 +22,13 @@ int main(int argc, char **argv)
 
     Chan c; NV_NVENC_ALLOCATION_PARAMETERS ep = { .size = sizeof ep, .prohibitMultipleInstances = 0, .engineInstance = (NvU32)eng };
     NvU32 engineType = eng ? NV2080_ENGINE_TYPE_NVENC1 : NV2080_ENGINE_TYPE_NVENC0;
-    if (chan_create(&rm, &c, engineType, NVC9B7_VIDEO_ENCODER, &ep)) { fprintf(stderr, "channel failed\n"); return 1; }
+    if (chan_create(&rm, &c, engineType, rm_class(&rm, RM_CLS_NVENC), &ep)) { fprintf(stderr, "channel failed\n"); return 1; }
     printf("channel 0x%08x on engine 0x%x, object 0x%x (NVC9B7), token 0x%x\n", c.hChannel, engineType, c.hObject, c.token);
     printf("gpu: push 0x%llx gpfifo 0x%llx userd 0x%llx sem 0x%llx\n", (unsigned long long)c.push.gpu,
            (unsigned long long)c.gpfifo.gpu, (unsigned long long)c.userd.gpu, (unsigned long long)sem.gpu);
 
     // bind the encoder object to subchannel 0
-    chan_mthd(&c, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B7_VIDEO_ENCODER);
+    chan_mthd(&c, 0, NVC56F_SET_OBJECT, 1, rm_class(&rm, RM_CLS_NVENC));
     // host semaphore release: value 0x11110001 at sem+0
     chan_mthd(&c, 0, NVC56F_SEM_ADDR_LO, 5, (NvU32)sem.gpu, (NvU32)(sem.gpu >> 32), 0x11110001u, 0u,
               DRF_DEF(C56F, _SEM_EXECUTE, _OPERATION, _RELEASE) | DRF_DEF(C56F, _SEM_EXECUTE, _RELEASE_WFI, _EN) |

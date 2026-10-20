@@ -28,7 +28,7 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     d->first_pic = true; d->after_eos = true;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
-    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "hevcdec: channel failed\n"); return -1; }
+    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "hevcdec: channel failed\n"); return -1; }
     const size_t b16 = (size_t)(d->maxW / 16) * (d->maxH / 16);
     // co-located MVs: 128 bytes per 16x16 block per picture (generous; the headers give no size)
     d->colmv_size = NVDEC_ALIGN(b16 * 128);
@@ -56,7 +56,7 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     for (int i = 0; i < HEVC_SURFACES; i++)
         if (rm_mem_alloc(rm, &d->luma[i], (luma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true) ||
             rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "hevcdec: surface alloc failed\n"); return -1; }
-    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
+    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
     return 0;
 }
 

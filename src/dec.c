@@ -19,7 +19,7 @@ int h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
     d->rm = rm; d->maxW = (maxW + 15) & ~15u; d->maxH = (maxH + 15) & ~15u; d->max_long_term_frame_idx = -1; d->prev_ref_frame_num = -1; d->last_ref_surf = -1;
     d->pitch = ((size_t)d->maxW + 63) & ~(size_t)63;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
-    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "dec: channel failed\n"); return -1; }
+    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "dec: channel failed\n"); return -1; }
     const size_t mbs = (size_t)(d->maxW / 16) * (d->maxH / 16);
     d->auCap = (size_t)d->maxW * d->maxH * 2 > (4u << 20) ? (size_t)d->maxW * d->maxH * 2 : (4u << 20);
     if (!(d->au = malloc(d->auCap))) return -1;
@@ -33,7 +33,7 @@ int h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
         if (rm_mem_alloc(rm, &d->luma[i], (luma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true) ||
             rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "dec: surface alloc failed\n"); return -1; }
     memset(d->coloc.cpu, 0, d->coloc.size); memset(d->hist.cpu, 0, d->hist.size); memset(d->mbhist.cpu, 0, d->mbhist.size);
-    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
+    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
     d->auN = 0; d->auSlices = 0;
     return 0;
 }

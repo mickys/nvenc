@@ -32,7 +32,7 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     d->cdf_size = AV1_PROBS_B;
     for (int q = 0; q < 4; q++) { if (!(d->cdf_tab[q] = malloc(AV1_PROBS_B))) return -1; av1_default_probs(q, d->cdf_tab[q]); }
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
-    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "av1dec: channel failed\n"); return -1; }
+    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "av1dec: channel failed\n"); return -1; }
     // filter buffer: the six neighbour areas nvdec_drv.h sizes, one after the other
     const size_t W = d->maxW, H = d->maxH;
     d->flt_top = 0;
@@ -57,7 +57,7 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
             alloc(rm, &d->tmv[i], AV1_TEMPORAL_MV_BUF_SIZE(W, H)) || alloc(rm, &d->seg[i], AV1_SEGMENT_ID_BUF_SIZE(W, H))) {
             fprintf(stderr, "av1dec: surface alloc failed\n"); return -1;
         }
-    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
+    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
     return 0;
 }
 

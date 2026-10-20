@@ -49,7 +49,7 @@ int mpeg2dec_open(Mpeg2Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
     d->rm = rm; d->maxW = (maxW + 15) & ~15u; d->maxH = (maxH + 31) & ~31u; d->fwd = d->bwd = -1; d->fieldSurf = -1;
     d->pitch = ((size_t)d->maxW + 63) & ~(size_t)63;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
-    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "mpeg2dec: channel failed\n"); return -1; }
+    if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "mpeg2dec: channel failed\n"); return -1; }
     d->auCap = (size_t)d->maxW * d->maxH * 2 > (4u << 20) ? (size_t)d->maxW * d->maxH * 2 : (4u << 20);
     if (!(d->au = malloc(d->auCap))) return -1;
     const size_t luma = nvenc_in_plane_size(d->pitch, d->maxH) + 65536, chroma = nvenc_in_plane_size(d->pitch, d->maxH / 2) + 65536;
@@ -62,7 +62,7 @@ int mpeg2dec_open(Mpeg2Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
         if (rm_mem_alloc(rm, &d->luma[i], (luma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true) ||
             rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "mpeg2dec: surface alloc failed\n"); return -1; }
     memset(d->hist.cpu, 0, d->hist.size);
-    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
+    chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
     return 0;
 }
 

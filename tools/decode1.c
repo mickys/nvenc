@@ -64,7 +64,7 @@ int main(int argc, char **argv)
     // ---- RM, channel ----
     Rm rm = { 0 }; if (rm_open(&rm) || rm_va_init(&rm)) { fprintf(stderr, "RM failed\n"); return 1; }
     Chan c; NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
-    if (chan_create(&rm, &c, NV2080_ENGINE_TYPE_NVDEC0, NVC9B0_VIDEO_DECODER, &dp)) { fprintf(stderr, "channel failed\n"); return 1; }
+    if (chan_create(&rm, &c, NV2080_ENGINE_TYPE_NVDEC0, rm_class(&rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "channel failed\n"); return 1; }
 
     // ---- buffers (system memory, CPU- and GPU-mapped, so everything can be inspected) ----
     const size_t pitch = (W + 63) & ~(size_t)63, bh = gob + 1;            // GOB_2 = blocks of 2 GOBs = block_height_log2 1
@@ -150,7 +150,7 @@ int main(int argc, char **argv)
            sizeof *ps, top, bot, tileFormat, gob, pitch, histSize >> 10, colocSize >> 10);
 
     // ---- methods ----
-    chan_mthd(&c, 0, NVC56F_SET_OBJECT, 1, (NvU32)NVC9B0_VIDEO_DECODER);
+    chan_mthd(&c, 0, NVC56F_SET_OBJECT, 1, rm_class(&rm, RM_CLS_NVDEC));
     chan_mthd(&c, 0, NVC9B0_SET_APPLICATION_ID, 1, (NvU32)NVC9B0_SET_APPLICATION_ID_ID_H264);
     chan_mthd(&c, 0, NVC9B0_SET_CONTROL_PARAMS, 1, DRF_NUM(C9B0, _SET_CONTROL_PARAMS, _CODEC_TYPE, NVDEC_CODEC_H264) |
               DRF_NUM(C9B0, _SET_CONTROL_PARAMS, _GPTIMER_ON, 1));
