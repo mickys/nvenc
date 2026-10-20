@@ -8,6 +8,7 @@
 //   VTDECODE_AVREAD=1: decode through AVAssetReader (alwaysCopiesSampleData NO) instead, compared with VTDECODE_REF
 //   VTDECODE_PF=x420: ask for that output format (default 420v)
 //   VTDECODE_ATT=1: print the first decoded frame's attachments (colour, HDR metadata)
+//   VTDECODE_SPEED=hw|sw: only the decode speed of the hardware / software decoder (frames released at once)
 //   VTDECODE_SUPP=1: opt in to VP9 first (VTRegisterSupplementalVideoDecoderIfAvailable), as WebKit and ffmpeg do
 // Build: clang -fobjc-arc -O2 vtdecode.m -o vtdecode -framework Foundation -framework AVFoundation -framework CoreMedia
 //        -framework CoreVideo -framework VideoToolbox -framework Metal
@@ -19,11 +20,13 @@
 
 typedef struct { int n; NSMutableArray *frames, *pts; double ms; OSStatus err; } Out;
 
+static bool gNoKeep;
 static void cb(void *ref, void *src, OSStatus st, VTDecodeInfoFlags f, CVImageBufferRef img, CMTime pts, CMTime dur)
 {
     Out *o = ref;
     if (st) { o->err = st; return; }
     if (img && !o->n && getenv("VTDECODE_ATT")) { CFDictionaryRef a = CVBufferCopyAttachments(img, kCVAttachmentMode_ShouldPropagate); NSLog(@"first frame attachments: %@", a); if (a) CFRelease(a); }
+    if (img && gNoKeep) { o->n++; return; }   // VTDECODE_SPEED: count only
     if (img) { [o->frames addObject:(__bridge id)img]; [o->pts addObject:@(CMTimeGetSeconds(pts))]; o->n++; }
 }
 
@@ -127,6 +130,12 @@ int main(int argc, char **argv)
             const double ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6;
             printf("RESULT avread frames=%d/%lu in %.1f ms (%.0f fps), %d bit-exact vs reference, reader status %ld %s\n", n, (unsigned long)samples.count, ms,
                    n * 1000.0 / ms, exact, (long)r2.status, r2.error ? r2.error.localizedDescription.UTF8String : "");
+            return 0;
+        }
+        if (getenv("VTDECODE_SPEED")) {   // decode speed only: VTDECODE_SPEED=hw|sw, frames released at once (no comparison)
+            gNoKeep = true; Out h = {0}; bool hwH = false; const bool wantHw = strcmp(getenv("VTDECODE_SPEED"), "sw") != 0;
+            if (decode(samples, fd, wantHw, &h, &hwH)) { printf("RESULT speed %s: no decoder\n", wantHw ? "hw" : "sw"); return 1; }
+            printf("RESULT speed %s frames=%d in %.1f ms (%.1f fps), hardware %d, error %d\n", wantHw ? "hw" : "sw", h.n, h.ms, h.n * 1000.0 / h.ms, hwH, (int)h.err);
             return 0;
         }
         const char *refPath = getenv("VTDECODE_REF");

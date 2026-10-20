@@ -33,8 +33,14 @@ static void fill(CVPixelBufferRef pb, int f, FILE *src)
     if (gSrcIn) {   // VT_SRC: the next NV12 frame of the file (from the start again at its end); copied to src as it is
         uint8_t *buf = malloc((size_t)W * H * 3 / 2);
         if (fread(buf, 1, (size_t)W * H * 3 / 2, gSrcIn) != (size_t)W * H * 3 / 2) { rewind(gSrcIn); if (fread(buf, 1, (size_t)W * H * 3 / 2, gSrcIn)) {} }
-        for (int r = 0; r < H; r++) memcpy(y + r * ys, buf + (size_t)r * W, (size_t)W);
-        for (int r = 0; r < H / 2; r++) memcpy(uv + r * uvs, buf + (size_t)W * H + (size_t)r * W, (size_t)W);
+        for (int r = 0; r < H; r++) {   // 10-bit buffers (x420): 8-bit samples widened, value << 8
+            if (gTen) for (int c = 0; c < W; c++) ((uint16_t *)(y + r * ys))[c] = (uint16_t)(buf[(size_t)r * W + c] << 8);
+            else memcpy(y + r * ys, buf + (size_t)r * W, (size_t)W);
+        }
+        for (int r = 0; r < H / 2; r++) {
+            if (gTen) for (int c = 0; c < W; c++) ((uint16_t *)(uv + r * uvs))[c] = (uint16_t)(buf[(size_t)W * H + (size_t)r * W + c] << 8);
+            else memcpy(uv + r * uvs, buf + (size_t)W * H + (size_t)r * W, (size_t)W);
+        }
         fwrite(buf, 1, (size_t)W * H * 3 / 2, src); free(buf);
         CVPixelBufferUnlockBaseAddress(pb, 0); return;
     }

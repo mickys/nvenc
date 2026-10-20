@@ -43,7 +43,7 @@ for e in $ENCS; do
     x264-medium)  args=(-c:v libx264 -preset medium -threads 16) ;;
     x265-fast)    args=(-c:v libx265 -preset fast -x265-params log-level=error:pools=16) ;;
     x265-medium)  args=(-c:v libx265 -preset medium -x265-params log-level=error:pools=16) ;;
-    aom-rt)       args=(-c:v libaom-av1 -usage realtime -cpu-used 10 -row-mt 1 -threads 16) ;;
+    aom-rt)       args=(-c:v libaom-av1 -usage realtime -cpu-used 8 -row-mt 1 -threads 16) ;;
     ours-av1*)    out=$T/$e.ivf ;;
     *) echo "unknown encoder $e"; continue ;;
   esac
