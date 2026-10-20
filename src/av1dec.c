@@ -25,6 +25,9 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
 {
     memset(d, 0, sizeof *d);
     d->rm = rm; d->maxW = (maxW + 127) & ~127u; d->maxH = (maxH + 127) & ~127u;
+    // AV1 decoding came with Ampere's NVDEC (GA10x 0xc7b0, Ada 0xc9b0); Turing (0xc4b0) and GA100 (0xc6b0) have none
+    const NvU32 cls = rm_class(rm, RM_CLS_NVDEC);
+    if (cls != 0xc7b0 && cls != 0xc9b0) { fprintf(stderr, "av1dec: this GPU's NVDEC (class 0x%x) has no AV1\n", cls); return -1; }
     d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1;
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     for (int i = 0; i < 8; i++) d->ref[i] = -1;

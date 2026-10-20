@@ -61,6 +61,8 @@ int enc_open(Enc *e, const EncConfig *cfg)
     // input: NVENC's input layout (block_height 2); the engine reads 8-12 KB past the chroma plane, hence the slack.
     // HEVC: planes cover whole 32-row CTBs (the engine pads the source to the CTB grid itself, but reads that far)
     bool hevc = cfg->codec == ENC_HEVC, av1 = cfg->codec == ENC_AV1;
+    // AV1 encoding came with Ada's NVENC (0xc9b7); NVENC 6.6 (Turing, 0xb4b7) and Ampere's have none
+    if (av1 && rm_class(rm, RM_CLS_NVENC) != 0xc9b7) { fprintf(stderr, "enc: this GPU's NVENC (class 0x%x) has no AV1\n", rm_class(rm, RM_CLS_NVENC)); return -1; }
     // 10-bit (HEVC Main 10): input and reconstructed samples are 16 bits; the surface configs keep the pitch in samples,
     // the planes and field offsets double (nullmoth's libnvenc_hevc, docs/reports/T6.14.md)
     if ((!hevc && !av1) || e->cfg.bit_depth != 10) e->cfg.bit_depth = 8;
