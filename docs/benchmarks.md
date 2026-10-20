@@ -10,6 +10,14 @@ tables are replaced when a full run is repeated (see "Updating this document" at
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-20, frame rate through ffmpeg (fixed, libnvencvt):** ffmpeg sets no `ExpectedFrameRate`, so a 50 fps stream got
+  the per-frame bit budget of 60 fps: our real-time encodes in the baseline came out at 5.0 Mbit/s for a 6 Mbit/s target (the
+  B-mode ones ~5.5). libnvencvt now takes the rate from the first frame's duration or the first two time stamps: 6.00 Mbit/s
+  (real time) / 6.23-6.25 (2 B, one-second buffer) over 12 s. The baseline's H.264 / HEVC rows through ffmpeg are therefore at
+  ~8-17 % below the target rate; the next full run fixes that.
+- **2026-10-20, rate over longer runs:** the 4K "overshoot" (AV1 +10 %) and "undershoot" (HEVC -10 %) of the baseline are the
+  120-frame clips (2.4 s against a one-second buffer). Over 20 s (`vtencfile`, crowd_run): all codecs within -2.5 / +2.6 % of
+  the target at 1080p and 4K, real time or not. The next full run uses 300 frames at 4K too.
 - **2026-10-20, baseline run** (`docs/bench/2026-10-20-{enc,dec,lat-8k}.txt`): every encoder and decoder on crowd_run / park_joy
   at 1080p and 4K, real-time latency, 8K. Summary: our AV1 is the best quality at every size (VMAF 3-6 above x265 medium) at
   6-16x x265's speed; H.264 between x264 veryfast and medium (1080p), at or above medium (4K); HEVC 5-8 VMAF behind x265.

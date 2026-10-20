@@ -83,6 +83,8 @@ typedef struct {
     CMVideoFormatDescriptionRef fmt;
     // properties
     int bitrate, maxKeyInterval, fps, quality;
+    bool fpsKnown;                  // fps from ExpectedFrameRate or the first frame's duration; else taken from the first two
+    CMTime firstPts;                // time stamps (ffmpeg sets neither: a 50 fps stream got the bit budget of 60 fps)
     int refs;                       // reference frames (ReferenceBufferCount; 0 = default)
     int maxRate, maxVbv;            // DataRateLimits: the first limit as bit/s and its window in bits (0 = none): VBR up to it
     bool cbr, speed;                // ConstantBitRate set (bitrate = it); PrioritizeEncodingSpeedOverQuality
@@ -263,7 +265,7 @@ static OSStatus b_setProperty(CMBaseObjectRef o, CFStringRef key, CFTypeRef v)
     if (CFEqual(key, kVTCompressionPropertyKey_AverageBitRate)) s->bitrate = num(v, 0);
     else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameInterval)) s->maxKeyInterval = num(v, 0);
     else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration)) { if (!s->maxKeyInterval && num(v, 0) > 0) s->maxKeyInterval = num(v, 0) * (s->fps ? s->fps : 60); }
-    else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) s->fps = num(v, 0);
+    else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) { s->fps = num(v, 0); s->fpsKnown = s->fps > 0; }
     else if (CFEqual(key, kVTCompressionPropertyKey_ReferenceBufferCount)) s->refs = num(v, 0);
     else if (CFEqual(key, kVTCompressionPropertyKey_Quality)) { double q = 0; if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(v, kCFNumberDoubleType, &q); s->quality = (int)(q * 100); }
     else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) s->realTime = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
@@ -641,6 +643,22 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         static const CFStringRef *keys[3] = { &kCVImageBufferColorPrimariesKey, &kCVImageBufferTransferFunctionKey, &kCVImageBufferYCbCrMatrixKey };
         for (int k = 0; k < 3; k++) if (!s->colour[k]) { CFTypeRef a = CVBufferCopyAttachment(img, *keys[k], NULL); s->colour[k] = colour_code(k, a); if (a) CFRelease(a); }
         s->lastPf = CVPixelBufferGetPixelFormatType(img);
+    }
+    if (!s->opened && !s->fpsKnown) {   // the frame rate from the first frame's duration, if it has one
+        if (CMTIME_IS_NUMERIC(dur) && CMTimeGetSeconds(dur) > 0.0005 && CMTimeGetSeconds(dur) < 1.5) { s->fps = (int)(1 / CMTimeGetSeconds(dur) + 0.5); s->fpsKnown = true; }
+        s->firstPts = pts;
+    } else if (s->opened && !s->fpsKnown && s->frames == 1 && CMTIME_IS_NUMERIC(pts) && CMTIME_IS_NUMERIC(s->firstPts)) {
+        // else from the first two time stamps; the rate control reads the frame rate for every picture (the streams carry none)
+        const double dt = CMTimeGetSeconds(CMTimeSubtract(pts, s->firstPts));
+        if (dt > 0.0005 && dt < 1.5) {
+            const int f = (int)(1 / dt + 0.5);
+            if (f != s->enc.cfg.fps) {
+                LOG("frame rate %d from the time stamps (was %d)", f, s->enc.cfg.fps);
+                if (s->realTime && s->bitrate > 0 && s->enc.cfg.vbv_bits == s->bitrate / s->enc.cfg.fps * 2) s->enc.cfg.vbv_bits = s->bitrate / f * 2;
+                s->enc.cfg.fps = s->fps = f;
+            }
+        }
+        s->fpsKnown = true;
     }
     if (!s->opened && !s->failed && (st = open_encoder(s))) s->failed = true;
     if (s->failed) { pthread_mutex_unlock(&s->lock); VTEncoderSessionEmitEncodedFrame(s->session, frame, kVTVideoEncoderMalfunctionErr, 0, NULL); return kVTVideoEncoderMalfunctionErr; }
