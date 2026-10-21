@@ -46,7 +46,13 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     const size_t dimA = (size_t)(d->maxW > d->maxH ? d->maxW : d->maxH);
     d->flt_sao_above = d->flt_above + NVDEC_ALIGN(dimA * GIP_ASIC_VERT_FILTER_RAM_SIZE * 24);
     d->flt_edge = d->flt_sao_above + NVDEC_ALIGN(dimA * GIP_ASIC_VERT_SAO_RAM_SIZE * 24);
-    const size_t flt = d->flt_edge + NVDEC_ALIGN((size_t)d->maxW * 64);
+    size_t flt = d->flt_edge + NVDEC_ALIGN((size_t)d->maxW * 64);
+    // Turing's NVDEC writes one stretch from the filter-above area on, through the SAO-above and edge areas, that grows with the
+    // picture area: 0.375 bytes per pixel at 8-bit 4:2:0, 0.5 at 10-bit or 8-bit 4:4:4, 0.68 at 12-bit 4:4:4 (T15.11; pictures
+    // over ~9 Mpixel, e.g. 4096x2304 or 8K, overran the buffer: no completion); give it half a byte per pixel and sample byte,
+    // twice that for 4:4:4
+    const size_t turingA = (size_t)d->maxW * d->maxH * d->bps * (chroma_format == 3 ? 2 : 1) / 2;
+    if (d->turing && flt < d->flt_above + turingA) flt = d->flt_above + NVDEC_ALIGN(turingA);
     d->auCap = (size_t)d->maxW * d->maxH * 2 > (4u << 20) ? (size_t)d->maxW * d->maxH * 2 : (4u << 20);
     if (!(d->au = malloc(d->auCap))) return -1;
     struct { RmMem *m; size_t size; } b[] = {

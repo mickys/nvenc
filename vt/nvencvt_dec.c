@@ -365,7 +365,10 @@ static OSStatus start_mpeg2(DState *s, VTVideoDecoderSession session, CMVideoFor
 static OSStatus start_mpeg4(DState *s, VTVideoDecoderSession session, CMVideoFormatDescriptionRef fmt)
 {
     const CMVideoDimensions dm = CMVideoFormatDescriptionGetDimensions(fmt);
-    if (dm.width <= 0 || dm.height <= 0 || dm.width > 4080 || dm.height > 4080) return kVTVideoDecoderUnsupportedDataFormatErr;
+    // NVDEC's MPEG-4 limit is 8192 macroblocks (1080p: 8160); larger pictures (2064x1088, 2048x2048) come back with every
+    // macroblock flagged as an error and take 10-20 times as long (GTX 1650, T15.11)
+    if (dm.width <= 0 || dm.height <= 0 || dm.width > 2048 || dm.height > 2048 || ((dm.width + 15) / 16) * ((dm.height + 15) / 16) > 8192)
+        return kVTVideoDecoderUnsupportedDataFormatErr;
     s->w = dm.width; s->h = dm.height;
     if (!(s->m4 = calloc(1, sizeof *s->m4)) || rm_open(&s->rm) || rm_va_init(&s->rm) || mpeg4dec_open(s->m4, &s->rm, (unsigned)dm.width, (unsigned)dm.height)) {
         DLOG("startSession: NVDEC session failed"); free(s->m4); s->m4 = NULL; return kVTVideoDecoderMalfunctionErr;

@@ -384,6 +384,11 @@ static OSStatus e_startSession(VTVideoEncoderRef e, VTEncoderSessionRef session,
 {
     State *s = state(e);
     s->session = session; s->width = dims.width; s->height = dims.height;
+    // NVENC 6.6 (GTX 1650) encodes H.264 up to 4096x4096 (larger: a microcode error on every frame, T15.11); HEVC goes to 8192x8192
+    if (gNvencvtGpu == GPU_TU117 && !s->hevc && !s->av1 && (s->width > 4096 || s->height > 4096)) {
+        LOG("startSession %dx%d: H.264 on the GTX 1650 stops at 4096x4096", s->width, s->height);
+        return kVTCouldNotFindVideoEncoderErr;
+    }
     OSStatus st = set_pixel_attrs(s);
     LOG("startSession %dx%d (pixel buffer attributes -> %d)", s->width, s->height, (int)st);
     return noErr;

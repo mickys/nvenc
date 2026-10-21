@@ -16,6 +16,9 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, picture-size limits on the GTX 1650 (T15.11):** HEVC decoding above ~9 Mpixel failed (filter buffer too small
+  on Turing); fixed, 8K HEVC decodes at 15.7 ms per picture (8192x8192 bit-exact). H.264 encoding stops at 4096x4096 on this
+  card (libnvencvt hands larger sessions to Apple's encoder); HEVC encodes up to 8192x8192 (8K: ~55 ms per frame).
 - **2026-10-21, H.264 with B pictures at 4K60 on the GTX 1650 (T15.10):** B-picture mode costs ~21 ms per 4K frame on NVENC 6.6
   (5.4 at 1080p), so a 4K60 recording or export ran at ~40 fps. libnvencvt now drops B pictures and quality controls on the 1650
   where they would not keep up: 4K60 at 13.6 ms per frame (P only, the card's real-time controls); 4K30 and 1080p unchanged.
