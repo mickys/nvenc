@@ -888,6 +888,16 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
             nvenc_h264_md_control_s *md = (void *)(base + OFF_MD); md->intra_luma8x8_mode_enable = 0x1ff;
         }
     }
+    if (!(e->cfg.quality || b)) {   // real time: the quant control (dead zones, QP post-processing) was left empty before T15.09,
+        NvU8 *base = setup->cpu;       // which cost ~8 VMAF at the same rate on the GTX 1650 (encodeN; +3-4 through VideoToolbox)
+        if (rm_class(&e->rm, RM_CLS_NVENC) == 0xb4b7) {   // GTX 1650: NVIDIA's own p4 controls for that card, also 30 % faster
+            memcpy(base + OFF_ME, idr ? h264_nv66_me_idr : h264_nv66_me_p, 0x100);
+            memcpy(base + OFF_MD, idr ? h264_nv66_md_idr : h264_nv66_md_p, 0x100);
+            memcpy(base + OFF_Q, h264_nv66_q, 0x100);
+            if (e->cfg.h264_profile == 100 || e->cfg.chroma444) { nvenc_h264_md_control_s *md = (void *)(base + OFF_MD); md->intra_luma8x8_mode_enable = 0x1ff; }
+        } else if (getenv("ENC_H264_RT_QTABLE")) memcpy(base + OFF_Q, h264_tmpl_q, 0x100);   // Ada: NVIDIA's p4 table (as quality
+        // mode); off until measured on an RTX 40 card (the 4090 was out of the machine when this was found)
+    }
     if (e->cfg.la_pass) {   // lookahead pictures (la.c): NVIDIA's controls for them (docs/traces/quality-linux vla, T7.09)
         NvU8 *base = setup->cpu;
         memcpy(base + OFF_ME, idr ? h264_la_me_idr : h264_la_me_p, 0x100); memcpy(base + OFF_MD, idr ? h264_la_md_idr : h264_la_md_p, 0x100);

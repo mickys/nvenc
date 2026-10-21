@@ -16,6 +16,11 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, real-time H.264 had an empty quant control (T15.09):** the real-time path (Parsec, streaming) never set the
+  engine's dead-zone tables and QP post-processing; quality mode did. On the GTX 1650 real-time H.264 now uses NVIDIA's own p4
+  controls for that card: through VideoToolbox +3.2 / +3.7 VMAF at 1080p at the same rate, 4K 13 % faster (encodeN: +8 VMAF).
+  On Ada the same table (NVIDIA's, already used in quality mode) is behind `ENC_H264_RT_QTABLE=1` until measured on the 4090.
+  `docs/bench/2026-10-21-gtx1650-h264rt.txt`.
 - **2026-10-21, OBS and Parsec on the GTX 1650:** OBS records H.264 / HEVC (B-frames on or off) at a steady 1080p60 with no
   decode errors; Parsec 4K: H.265 8-bit L 13.3-14.5 ms, 10-bit 21-24 ms, H.264 23.5 ms, about 10 fps in every mode (the screen
   capture's limit on this card, not the encoder). Section "GTX 1650 (TU117)" > "Apps"; `docs/bench/2026-10-21-gtx1650-apps.txt`.
@@ -288,7 +293,7 @@ docs/tasks.md M15). NullMoth has no encoder for it, so the encode tables compare
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 161 | 5.99 | 26.57 | 49.7 |
+| ours H.264, real time (P only) | 174 | 5.98 | 26.68 | 52.9 |
 | ours H.264 (2 B, quality) | 151 | 6.03 | 27.20 | 58.5 |
 | ours HEVC, real time | 147 | 5.99 | 27.15 | 58.7 |
 | ours HEVC (quality; P only on this card) | 172 | 6.01 | 27.09 | 59.1 |
@@ -304,7 +309,7 @@ docs/tasks.md M15). NullMoth has no encoder for it, so the encode tables compare
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 175 | 5.91 | 26.75 | 53.1 |
+| ours H.264, real time (P only) | 176 | 5.85 | 26.80 | 56.8 |
 | ours H.264 (2 B, quality) | 162 | 6.09 | 27.36 | 62.8 |
 | ours HEVC, real time | 165 | 5.90 | 27.23 | 60.5 |
 | ours HEVC (quality; P only on this card) | 199 | 6.06 | 27.24 | 60.5 |
@@ -320,7 +325,7 @@ docs/tasks.md M15). NullMoth has no encoder for it, so the encode tables compare
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 59 | 20.02 | 30.69 | 62.0 |
+| ours H.264, real time (P only) | 67 | 20.02 | 30.54 | 61.9 |
 | ours H.264 (2 B, quality) | 46 | 20.56 | 31.20 | 68.1 |
 | ours HEVC, real time | 62 | 20.01 | 31.55 | 71.5 |
 | ours HEVC (quality; P only on this card) | 84 | 20.14 | 31.64 | 72.2 |
@@ -336,7 +341,7 @@ docs/tasks.md M15). NullMoth has no encoder for it, so the encode tables compare
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 61 | 19.82 | 30.68 | 61.8 |
+| ours H.264, real time (P only) | 68 | 19.59 | 30.60 | 63.4 |
 | ours H.264 (2 B, quality) | 40 | 20.57 | 31.00 | 67.8 |
 | ours HEVC, real time | 63 | 19.77 | 31.56 | 71.2 |
 | ours HEVC (quality; P only on this card) | 86 | 20.55 | 31.67 | 71.8 |
@@ -348,7 +353,8 @@ docs/tasks.md M15). NullMoth has no encoder for it, so the encode tables compare
 | x265 fast | 16 | 20.42 | 32.13 | 74.1 |
 | x265 medium | 12 | 20.44 | 32.12 | 74.8 |
 
-Raw: `docs/bench/2026-10-21-gtx1650-enc-lat.txt` (nvenc 0.9.0 + 3fd516d; the 1080p HEVC quality rows re-run after that fix). The
+Raw: `docs/bench/2026-10-21-gtx1650-enc-lat.txt` (nvenc 0.9.0 + 3fd516d; the 1080p HEVC quality rows re-run after that fix;
+the real-time H.264 rows and latency re-measured after T15.09, `docs/bench/2026-10-21-gtx1650-h264rt.txt`). The
 software rows are the same encoders on the same CPU as in the RTX 4090 section and agree with them within run-to-run noise.
 
 What this shows:
@@ -356,6 +362,8 @@ What this shows:
   of it at 4K (one older NVENC; the 4090's 4K quality tier is slower). H.264 runs at 1.8-3.2x x264 medium's speed, HEVC at 3.6-8x
   x265's and 25-30x Apple's software HEVC.
   The quality rows run faster than real time because real time hands back every frame before taking the next one.
+- **Real-time H.264** (since T15.09: NVIDIA's own p4 controls for this card, and the quant control it had been missing): 52.9 /
+  56.8 VMAF at 1080p, up 3.2-3.7 at the same rate, and 13 % faster at 4K (the H.264 latency 15.4 ms at 4K instead of 17.3).
 - **H.264** with B pictures and the quality controls: level with x264 medium at 1080p (58.5 / 62.8 vs 57.6 / 63.4 VMAF) and well
   above it at 4K (68.1 / 67.8 vs 59.7 / 64.7), about what the RTX 4090 gives (59.5 / 63.2, 69.1 / 68.7).
 - **HEVC** is P only on this card (no HEVC B pictures on NVENC 6.6), so quality mode adds only 0.0-0.7 VMAF over real time: 1080p
@@ -397,9 +405,9 @@ TU117 has no AV1 decoder. NullMoth's H.264 / HEVC decoders work on it; its encod
 
 | codec | size | latency ms | engine ms |
 |---|---|---:|---:|
-| H.264 | 1920x1080 | 4.47 | 3.91 |
+| H.264 | 1920x1080 | 4.07 | 3.50 |
 | HEVC | 1920x1080 | 4.17 | 3.64 |
-| H.264 | 3840x2160 | 17.30 | 15.54 |
+| H.264 | 3840x2160 | 15.42 | 13.77 |
 | HEVC | 3840x2160 | 15.30 | 13.79 |
 
 The same measurement as on the RTX 4090 (2-frame VBV, P only, the frame back in the app's callback): 4.2-4.5 ms per 1080p
