@@ -67,6 +67,7 @@ static FILE *gLogF;   // NVENCVT_LOG: stderr; flag file /tmp/nvencvt.log (apps s
 
 enum { VT_MAX_B = 3 };
 enum { GPU_NONE = 0, GPU_ADA = 1, GPU_TU117 = 2 };   // the GPUs the codecs register on
+extern int gNvencvtGpu;                               // which of them (set by NVEncVT_Register)
 
 typedef struct {
     pthread_mutex_t lock;
@@ -441,6 +442,13 @@ static OSStatus open_encoder(State *s)
         const double msMid = 2.5 * s->width * s->height / (1920.0 * 1080.0);
         if (c.quality && ms * fps > 800 && s->hevc && msMid * fps <= 800 && !getenv("NVENCVT_QUALITY")) { c.no_cu8 = true; LOG("quality controls without 8x8 CUs: %.1f ms per frame at %.0f fps", msMid, fps); }
         else if (c.quality && ms * fps > 800 && !getenv("NVENCVT_QUALITY")) { c.quality = false; LOG("quality controls off: %.1f ms per frame at %.0f fps", ms, fps); }
+        // GTX 1650 (NVENC 6.6): H.264 with B pictures (they always get NVIDIA's p4 controls) costs ~5.4 ms per 1080p frame, 21 at
+        // 4K (T15.10), twice the RTX 4090's; where that does not keep up, P only with the card's real-time controls (14 ms at 4K)
+        const double msB = 5.4 * s->width * s->height / (1920.0 * 1080.0);
+        if (gNvencvtGpu == GPU_TU117 && !s->hevc && !s->av1 && (s->bf > 0 || c.quality) && msB * fps > 800 && !getenv("NVENCVT_QUALITY")) {
+            LOG("GTX 1650: B pictures and quality controls off (H.264 %.1f ms per frame at %.0f fps)", msB, fps);
+            s->bf = 0; c.bframes = 0; c.quality = false;
+        }
     }
     // constant QP from Quality (0..1) when there is no bitrate; else CBR (MB-row), one-frame VBV in real time mode
     int qp = s->quality ? 40 - s->quality * 22 / 100 : 23;

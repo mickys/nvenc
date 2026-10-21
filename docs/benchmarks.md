@@ -16,6 +16,9 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, H.264 with B pictures at 4K60 on the GTX 1650 (T15.10):** B-picture mode costs ~21 ms per 4K frame on NVENC 6.6
+  (5.4 at 1080p), so a 4K60 recording or export ran at ~40 fps. libnvencvt now drops B pictures and quality controls on the 1650
+  where they would not keep up: 4K60 at 13.6 ms per frame (P only, the card's real-time controls); 4K30 and 1080p unchanged.
 - **2026-10-21, real-time H.264 had an empty quant control (T15.09):** the real-time path (Parsec, streaming) never set the
   engine's dead-zone tables and QP post-processing; quality mode did. On the GTX 1650 real-time H.264 now uses NVIDIA's own p4
   controls for that card: through VideoToolbox +3.2 / +3.7 VMAF at 1080p at the same rate, 4K 13 % faster (encodeN: +8 VMAF).
