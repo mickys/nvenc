@@ -400,3 +400,17 @@ Same benchmark on a GTX 1650 (TU117, 4 GB, BAR1 256 MB) on NullMoth 2.4.3: the s
   between logins (18.7 then 14.3), the patch did not. WindowServer's own CPU time drops by about two thirds (user 47 % /
   32 % → 16-18 %).
 - **On both cards** the patch lowers WindowServer's CPU and raises the update rate where the CPU copy is the limit.
+
+### Parsec on the GTX 1650 with and without the patch (2026-10-21)
+
+Parsec streams the 4K HiDPI desktop to the user's Mac (H.265 8-bit), Safari shows motion.html, and the frame rate comes from
+Parsec's host log over 35 s each. The patch raises Parsec's capture rate:
+
+| Safari | stock 2.4.3 plugin | patch (`--desktop`) |
+|---|---:|---:|
+| window | 7.9 fps | 11.4 fps (+44 %) |
+| full screen | 10.0 fps | 13.1 fps (+31 %) |
+| idle desktop | ~10 fps | ~29 fps |
+
+The encode latency is the same (13-14 ms), so the capture is what improves: it waits on WindowServer, and the patch takes the
+per-frame window upload off WindowServer's CPU.

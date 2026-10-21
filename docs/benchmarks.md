@@ -438,6 +438,10 @@ dragged around; Parsec's encode latency `L` from its host log and libnvencvt's s
 - **About 10 frames per second in every mode, also while dragging a window:** Parsec's screen capture of the 4K HiDPI
   desktop delivers no more on this card (WindowServer itself manages ~19 screen updates per second at full-screen 4K here, see
   research-vram-input.md). The encoder is not the limit: at 12 ms per frame it has room for ~80 fps.
+- **With the overlay's `--desktop` plugin Parsec captures more** (H.265 8-bit, Safari's animation from the desktop
+  benchmark, 2026-10-21): a window 7.9 -> 11.4 fps (+44 %), full screen 10.0 -> 13.1 fps (+31 %), the encode latency unchanged
+  (13-14 ms); the idle desktop went from ~10 to ~29 fps. The screen capture waits for WindowServer, whose per-frame upload
+  the patch moves to the GPU.
 
 ## Examples
 
