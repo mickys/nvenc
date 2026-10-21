@@ -16,6 +16,9 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, OBS and Parsec on the GTX 1650:** OBS records H.264 / HEVC (B-frames on or off) at a steady 1080p60 with no
+  decode errors; Parsec 4K: H.265 8-bit L 13.3-14.5 ms, 10-bit 21-24 ms, H.264 23.5 ms, about 10 fps in every mode (the screen
+  capture's limit on this card, not the encoder). Section "GTX 1650 (TU117)" > "Apps"; `docs/bench/2026-10-21-gtx1650-apps.txt`.
 - **2026-10-21, HEVC Main 10 on the GTX 1650 is NVENC 6.6, not us:** NVIDIA's own `hevc_nvenc` on the card (Linux VM) loses the
   same in Main 10: 62.7 -> 59.5 VMAF (p4) and 62.9 -> 59.7 (p7) at the same rate, 0.46-0.47 dB PSNR; at the same fixed QP fewer
   bits, as ours. `docs/bench/2026-10-21-gtx1650-nvidia-main10.txt`.
@@ -402,6 +405,39 @@ TU117 has no AV1 decoder. NullMoth's H.264 / HEVC decoders work on it; its encod
 The same measurement as on the RTX 4090 (2-frame VBV, P only, the frame back in the app's callback): 4.2-4.5 ms per 1080p
 frame and 15-17 ms per 4K frame (RTX 4090: 1.9 / 5.7). 1080p real time has plenty of headroom; 4K real time manages about
 60 fps.
+
+### Apps (OBS Studio, Parsec)
+
+OBS Studio 32.2.2 recording through our encoders on the GTX 1650 (`vm/tahoe/obs-rec.sh`: Advanced output, 1920x1080 at 60 fps,
+NV12 BT.709 partial range, CBR 20 Mbit/s, 2 s key interval; scene = a looping testsrc2 clip; 10 s each; libnvencvt's
+statistics, 2026-10-21):
+
+| encoder in OBS | rate | engine ms / frame | frame in to encoded frame out | frames | decode errors |
+|---|---:|---:|---:|---:|---:|
+| H.264 | 6.6 Mbit/s | 7.4 | 10 ms | 60 fps | 0 |
+| H.264, B-frames on | 7.9 Mbit/s | 9.5 | 29-32 ms (the B pictures wait for their anchor) | 60 fps | 0 |
+| HEVC | 7.0 Mbit/s | 4.5 | 6 ms | 60 fps | 0 |
+| HEVC, B-frames on (P only on this card) | 7.1 Mbit/s | 4.6 | 6.3 ms | 60 fps | 0 |
+
+The rate stays below the CBR target on this easy test pattern because we write no filler data (the RTX 4090 behaves the
+same). Recording is not real time, so H.264 gets the quality controls (7.4 ms instead of 4.5 per frame); both keep 60 fps
+with room to spare.
+
+Parsec (the host app in the guest, the user's Mac as client, 2026-10-21), desktop 3840x2160 HiDPI at 60 Hz, a window
+dragged around; Parsec's encode latency `L` from its host log and libnvencvt's statistics:
+
+| Parsec codec | frames Parsec sends | Parsec L (encode latency) | our engine ms / frame | frames per second |
+|---|---|---:|---:|---:|
+| H.265, "prefer 10-bit" on | 10-bit RGB (`l10r`) -> HEVC Main 10 | 21-24 ms | 16-19 (+3 ms conversion) | ~10 |
+| H.265, 8-bit | NV12 full range (`420f`) | **13.3-14.5 ms** | 11-12 | ~10 |
+| H.264 | NV12 full range (`420f`) | 23.5 ms | 19-23 | ~10 |
+
+- **Use H.265 with 10-bit off on this card:** the lowest latency (on the RTX 4090: 4.4-5.3 ms 8-bit, 7.0-7.3 ms 10-bit), and
+  Main 10 also costs quality on NVENC 6.6. With 10-bit on, the user's client also fell back to software H.265 decoding.
+- **H.264 is slower than HEVC here** at 4K (19-23 ms per frame against 11-12), as in the latency table above.
+- **About 10 frames per second in every mode, also while dragging a window:** Parsec's screen capture of the 4K HiDPI
+  desktop delivers no more on this card (WindowServer itself manages ~19 screen updates per second at full-screen 4K here, see
+  research-vram-input.md). The encoder is not the limit: at 12 ms per frame it has room for ~80 fps.
 
 ## Examples
 
