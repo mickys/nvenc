@@ -79,6 +79,7 @@ typedef struct {
     Mpeg4Dec *m4;                   // MPEG-4 Part 2 (with rm)
     int nalLen, w, h;
     OSType pf;                      // output pixel format (VP9: depends on the bit depth)
+    CVPixelBufferPoolRef ownPool;   // our own pool, made with the client's destination attributes (see set_output)
     CFDictionaryRef colour;         // colour attachments for the output (from the format description)
     unsigned frames, errors;
     double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
@@ -190,6 +191,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
         s->opened = false;
     }
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }
+    if (s->ownPool) { CVPixelBufferPoolRelease(s->ownPool); s->ownPool = NULL; }
     if (s->colour) { CFRelease(s->colour); s->colour = NULL; }
     if (s->frames) DLOG("per frame: decodeFrame %.2f ms (engine %.2f, pool %.2f, copy %.2f, emit %.2f), outside %.2f ms",
          s->tIn / s->frames, s->tEngine / s->frames, s->tPool / s->frames, s->tCopy / s->frames, s->tEmit / s->frames, s->tOut / s->frames);
@@ -241,10 +243,11 @@ static OSStatus start_vp9(DState *s, VTVideoDecoderSession session, CMVideoForma
         depth = b[6] >> 4; chroma = (b[6] >> 1) & 7; full = b[6] & 1;
     }
     // 4:2:0 (chromaSubsampling 0 or 1), 8 or 10 bits (12-bit decodes, but CoreVideo has no 12-bit 4:2:0 biplanar format)
-    // TU117 (GTX 1650): no frames of 64 or less (vp9dec.c), so another decoder takes those
+    // TU117 (GTX 1650): no frames of 64 or less (vp9dec.c), so another decoder takes those; GA10x is not tried with
+    // those sizes either (NVIDIA lists 128x128 as VP9's minimum), so they are refused there as well: only Ada takes them.
     extern int gNvencvtGpu;
     const bool ok = chroma <= 1 && (depth == 8 || depth == 10) && dim.width <= 8192 && dim.height <= 8192 &&
-                    (gNvencvtGpu != 2 || (dim.width > 64 && dim.height > 64));
+                    (gNvencvtGpu == 1 || (dim.width > 64 && dim.height > 64));
     DLOG("startSession: VP9 %dx%d, %d-bit, chroma %d, %s range%s", dim.width, dim.height, depth, chroma, full ? "full" : "video",
          vpcc ? "" : " (no vpcC: assumed)");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
@@ -466,6 +469,25 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     }
     st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
     CFRelease(attrs); CFRelease(ios); CFRelease(npf); CFRelease(nw); CFRelease(nh);
+    // Our own pool, made with the client's destination attributes verbatim. A client that asks for an
+    // OpenGL-compatible buffer (ffmpeg, mpv: kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey) cannot have one on
+    // this system: CVPixelBufferIsCompatibleWithAttributes answers 0 for every buffer, even one made with those very
+    // attributes. VideoToolbox then transfers every decoded picture into a buffer of its own (about 14 ms per 4K frame
+    // through the GPU driver's Metal path), instead of handing the decoder's buffer over (0.05 ms). The picture is
+    // copied into the buffer we hand out, so if that buffer carries the destination's own attributes VideoToolbox has
+    // nothing to transfer. (T8.07 measured the transfer; the fix is here.)
+    if (s->ownPool) { CVPixelBufferPoolRelease(s->ownPool); s->ownPool = NULL; }
+    CFDictionaryRef dpattr = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
+    if (dpattr) {
+        CVPixelBufferPoolRef pool = NULL;
+        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, dpattr, &pool) == kCVReturnSuccess && pool) s->ownPool = pool;
+        else if (pool) CVPixelBufferPoolRelease(pool);
+        if (gDLog) { CFStringRef ds = CFCopyDescription(dpattr); char buf[1024] = "(none)";
+            if (ds) { CFStringGetCString(ds, buf, sizeof buf, kCFStringEncodingUTF8); CFRelease(ds); }
+            for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';
+            DLOG("  destination attributes: %s", buf);
+            DLOG("  our own pool: %s", s->ownPool ? "yes" : "no (the session's pool is used)"); }
+    }
     CFMutableDictionaryRef col = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     // colour description and HDR metadata from the format description (the extension keys are the attachment keys), as
     // Apple's decoders attach them
@@ -477,8 +499,10 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     return noErr;
 }
 
-// A buffer for the picture: from the session's pool, or for a frame of another size (VP9 / AV1 resizing) one made with
-// the pool's attributes but its own size (the pool's Width / Height keys would win over CVPixelBufferCreate's arguments)
+// A buffer for the picture: from our own pool (made with the client's destination attributes, so that VideoToolbox
+// hands the picture over instead of transferring it) or the session's pool, or for a frame of another size (VP9 / AV1
+// resizing) one made with the pool's attributes but its own size (the pool's Width / Height keys would win over
+// CVPixelBufferCreate's arguments)
 static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRef *pb)
 {
     if (!getenv("NVDEC_KEEPSIZE") && ((int)w != s->w || (int)h != s->h)) {
@@ -488,7 +512,7 @@ static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRe
         s->w = (int)w; s->h = (int)h;
         set_output(s, s->session, s->fmt, s->pf, s->pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || s->pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
     }
-    CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(s->session);
+    CVPixelBufferPoolRef pool = s->ownPool ? s->ownPool : VTDecoderSessionGetPixelBufferPool(s->session);
     if (pool && (int)w == s->w && (int)h == s->h) return CVPixelBufferPoolCreatePixelBuffer(NULL, pool, pb);
     CFDictionaryRef pa = pool ? CVPixelBufferPoolGetPixelBufferAttributes(pool) : NULL;
     CFMutableDictionaryRef a = pa ? CFDictionaryCreateMutableCopy(NULL, 0, pa)
@@ -874,13 +898,34 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     return noErr;
 }
 
-// Called by NVEncVT_Register once the GPU checked out (Ada, or TU117 without AV1). Rated above NullMoth's own H.264 / HEVC decoders (1000). HEVC,
+// The NVDEC class of this GPU (0 = none): the decoders ask RM for it once per process, when they register. GA10x (0xc7b0,
+// RTX 30) and Ada (0xc9b0) have AV1; Turing (0xc4b0) and GA100 (0xc6b0) have none.
+static int gNvdecClass = -1;
+static NvU32 nvdec_class(void)
+{
+    if (gNvdecClass < 0) {
+        Rm rm = { 0 };
+        if (rm_open(&rm)) gNvdecClass = 0;
+        else { gNvdecClass = (int)rm_class(&rm, RM_CLS_NVDEC); rm_close(&rm); }
+    }
+    return (NvU32)gNvdecClass;
+}
+
+// Called by NVEncVT_Register once the GPU checked out (Ada, GA10x or TU117). Rated above NullMoth's own H.264 / HEVC decoders (1000). HEVC,
 // VP9 and AV1 too (NVENCVT_NO_HEVCDEC / _VP9DEC / _AV1DEC=1 leave one out).
+// On GA10x (RTX 30) the VP9 and AV1 decoders register: their method IDs are the same as Ada's (clc7b0.h and clc9b0.h
+// agree on every one of them) and GA10x's NVDEC has both. The H.264 / HEVC / MPEG decoders were written for Ada's NVDEC
+// (0xc9b0) and Turing's (0xc4b0) and were not tried on 0xc7b0, and a decoder that registers and then fails is worse than
+// none (VideoToolbox does not fall back to another decoder once it picked ours). NVENCVT_AMPERE_ALL_DEC=1 registers
+// them all anyway.
 OSStatus NVDecVT_Register(int rating)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL;
     if (!gDLog && access("/tmp/nvencvt.log", F_OK) == 0) { char p[64]; snprintf(p, sizeof p, "/tmp/nvencvt-%d.log", (int)getpid()); if ((gDLogF = fopen(p, "a"))) gDLog = true; }
     if (getenv("NVENCVT_NO_DEC")) return kVTCouldNotFindVideoDecoderErr;
+    extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
+    const bool ampere = gNvencvtGpu == 3;
+    const bool av1Vp9Only = ampere && !getenv("NVENCVT_AMPERE_ALL_DEC");
     typedef OSStatus (*RegFn)(FourCharCode, CFDictionaryRef, void *);
     RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
     if (!reg) { DLOG("VTRegisterVideoDecoderWithInfo not found"); return kVTCouldNotFindVideoDecoderErr; }
@@ -888,13 +933,13 @@ OSStatus NVDecVT_Register(int rating)
     const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("CMClassImplementationName"), CFSTR("VTRating"), CFSTR("VTIsHardwareAccelerated") };
     const void *v[] = { CFSTR(DECODER_ID), CFSTR("NVDEC - H.264 - mickys/nvenc"), nr, kCFBooleanTrue };
     CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    OSStatus st = reg(kCMVideoCodecType_H264, info, (void *)NVDecVT_CreateInstance);
+    OSStatus st = av1Vp9Only ? kVTCouldNotFindVideoDecoderErr : reg(kCMVideoCodecType_H264, info, (void *)NVDecVT_CreateInstance);
     // 'avc3' / 'hev1' sample entries (ffmpeg writes hev1 for HEVC in MP4 by default): VideoToolbox has no decoder for them
     // at all (-12906, Apple's included); ours decodes them like avc1 / hvc1 (NVENCVT_NO_HEV1=1 leaves both out)
-    if (!getenv("NVENCVT_NO_HEV1")) { OSStatus s3 = reg(CODEC_AVC3, info, (void *)NVDecVT_CreateInstance); DLOG("registered %s for avc3 -> %d", DECODER_ID, (int)s3); }
+    if (!av1Vp9Only && !getenv("NVENCVT_NO_HEV1")) { OSStatus s3 = reg(CODEC_AVC3, info, (void *)NVDecVT_CreateInstance); DLOG("registered %s for avc3 -> %d", DECODER_ID, (int)s3); }
     CFRelease(info);
     DLOG("registered %s -> %d (rating %d)", DECODER_ID, (int)st, rating);
-    if (!getenv("NVENCVT_NO_HEVCDEC")) {   // HEVC (NVENCVT_NO_HEVCDEC=1 leaves it out): above NullMoth's own HEVC decoder too
+    if (!av1Vp9Only && !getenv("NVENCVT_NO_HEVCDEC")) {   // HEVC (NVENCVT_NO_HEVCDEC=1 leaves it out): above NullMoth's own HEVC decoder too
         const void *vh[] = { CFSTR(DECODER_ID_HEVC), CFSTR("NVDEC - HEVC - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ih = CFDictionaryCreate(NULL, k, vh, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus sh = reg(kCMVideoCodecType_HEVC, ih, (void *)NVDecVT_CreateInstance);
@@ -915,8 +960,14 @@ OSStatus NVDecVT_Register(int rating)
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_VP9); DLOG("opted in to VP9 decoding for this process"); }
     }
-    extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1)
-    if (!getenv("NVENCVT_NO_AV1DEC") && gNvencvtGpu == 1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
+    // AV1: the NVDEC classes that have it (GA10x 0xc7b0 = RTX 30, Ada 0xc9b0). The class is the truth, not the card's name:
+    // a decoder that registers on a card without AV1 would take the session away from Apple's own decoder and then fail.
+    // Ada's and Turing's class is known from the card (the PCI device ID), so RM is asked only for GA10x and for cards the
+    // registry does not name - and RM answering 0 (no driver) means no AV1 decoder at all.
+    const NvU32 nvcls = gNvencvtGpu == 1 ? 0xc9b0 : gNvencvtGpu == 2 ? 0xc4b0 : nvdec_class();
+    const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0;
+    DLOG("NVDEC class 0x%x%s", nvcls, hasAv1 ? " (AV1)" : " (no AV1)");
+    if (!getenv("NVENCVT_NO_AV1DEC") && hasAv1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
         const void *va[] = { CFSTR(DECODER_ID_AV1), CFSTR("NVDEC - AV1 - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ia = CFDictionaryCreate(NULL, k, va, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus sa = reg(CODEC_AV1, ia, (void *)NVDecVT_CreateInstance);
@@ -926,7 +977,7 @@ OSStatus NVDecVT_Register(int rating)
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_AV1); DLOG("opted in to AV1 decoding for this process"); }
     }
-    if (!getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 and MPEG-4 Part 2 (M14): above Apple's software decoders
+    if (!av1Vp9Only && !getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 and MPEG-4 Part 2 (M14): above Apple's software decoders
         const struct { FourCharCode c; const char *id, *name; } m[] = {
             { kCMVideoCodecType_MPEG2Video, DECODER_ID_MPEG2, "NVDEC - MPEG-2 - mickys/nvenc" },
             { kCMVideoCodecType_MPEG1Video, DECODER_ID_MPEG1, "NVDEC - MPEG-1 - mickys/nvenc" },

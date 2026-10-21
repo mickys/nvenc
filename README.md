@@ -9,10 +9,16 @@ documented picture setups), with no closed codec library in between.
 |---|---|
 | **Encode** (NVENC) | H.264 (Main / High, CABAC, 4:4:4, lossless, up to 8K), HEVC (Main, Main 10, 4:4:4, lossless), AV1 (8 / 10-bit, tiles up to 8K) |
 | **Decode** (NVDEC) | H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1 (8 / 10-bit, film grain), MPEG-1/2, MPEG-4 Part 2 through VideoToolbox; VP8 and VC-1 in the library and tools only (nothing on macOS asks VideoToolbox for them) |
-
-On the GTX 1650 (TU117, the only Turing card tested; other RTX 20 / 30 cards keep NullMoth's encoders): no AV1 (the
-hardware has none), HEVC encodes without B pictures (NVENC 6.6 has none), VP9 decodes from 65x65 up; details in
+On the GTX 1650 (TU117, the only Turing card tested; other RTX 20 cards keep NullMoth's encoders): no AV1 (the hardware has
+none), HEVC encodes without B pictures (NVENC 6.6 has none), VP9 decodes from 65x65 up; details in
 [docs/tasks.md](docs/tasks.md) M15.
+
+On the RTX 30 (GA10x, consumer Ampere: the RTX 3060 Ti among them) the **VP9 and AV1 decoders** register, and that is the
+point: the NVDEC there (class 0xc7b0) decodes AV1 in hardware like Ada's, with the same method IDs, while its NVENC is
+neither Ada's 8.2 nor TU117's 6.6, so our encoder setups do not apply and NullMoth's own encoders keep working for these
+cards. 4K works too: the decoder hands the pictures out of its own pool, made with the client's destination attributes,
+so VideoToolbox passes them on instead of transferring every 4K frame (15 ms -> 0.05 ms per frame). How it was ported,
+what it measures and the 4K finding: [docs/ga10x.md](docs/ga10x.md).
 
 Encoders: B pictures (two between anchors; real-time sessions stay P-only), CBR / VBR with NVIDIA's rate-control
 settings, quality presets taken from NVIDIA's own driver where the frame rate allows, colour description and HDR10
