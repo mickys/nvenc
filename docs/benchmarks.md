@@ -16,6 +16,10 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, Parsec at 1080p / high refresh on the GTX 1650:** with the overlay's `--resolution` modes Parsec streams a
+  GPU-drawn animation at 49.5 fps at 1080p@144 and 52.6 at 1080p@240 (4K HiDPI: 18.9), encode latency 3.5 ms (4K: 12-17 ms).
+  The cap is the app's present rate on this card (~20 ms per 1080p frame), not the encoder or the display copy path
+  (`docs/bench/2026-10-21-gtx1650-parsec-modes-{safari,metal}.txt`).
 - **2026-10-21, picture-size limits on the GTX 1650 (T15.11):** HEVC decoding above ~9 Mpixel failed (filter buffer too small
   on Turing); fixed, 8K HEVC decodes at 15.7 ms per picture (8192x8192 bit-exact). H.264 encoding stops at 4096x4096 on this
   card (libnvencvt hands larger sessions to Apple's encoder); HEVC encodes up to 8192x8192 (8K: ~55 ms per frame).
@@ -456,6 +460,33 @@ dragged around; Parsec's encode latency `L` from its host log and libnvencvt's s
   benchmark, 2026-10-21): a window 7.9 -> 11.4 fps (+44 %), full screen 10.0 -> 13.1 fps (+31 %), the encode latency unchanged
   (13-14 ms); the idle desktop went from ~10 to ~29 fps. The screen capture waits for WindowServer, whose per-frame upload
   the patch moves to the GPU.
+
+**Parsec at lower resolutions and higher refresh rates** (overlay `--resolution`: native 1080p / 1440p modes and an EDID
+override with 1080p up to 240 Hz on the 4K dummy plug; the user's Mac as client, H.265 8-bit, 2026-10-21;
+`vm/tahoe/bench/parsec-modes.sh`, raw results `docs/bench/2026-10-21-gtx1650-parsec-modes-{safari,metal}.txt`). Two
+workloads over the whole desktop for 30 s each: Safari's `motion.html` animation (painted by WebKit on the CPU) and
+`metal-anim` (a full-screen Metal animation drawn by the GPU at the display's rate, `vm/tahoe/bench/metal-anim.m`):
+
+| desktop mode | Parsec fps, Safari | Parsec fps, Metal app (app's own fps) | Parsec L (encode latency) |
+|---|---:|---:|---:|
+| 3840x2160 HiDPI @ 60 (before) | 6.5 | 18.9 (19.9) | 12-17 ms |
+| 1920x1080 @ 60 | 19.8 | 25.8 (26.7) | 3.6-3.8 ms |
+| 1920x1080 @ 120 | 21.3 | - | 3.8 ms |
+| 1920x1080 @ 144 | 21.7 | **49.5** (48.3) | 3.6 ms |
+| 1920x1080 @ 240 | 24.3 | **52.6** (54.2) | 3.5 ms |
+| 2560x1440 @ 60 | 9.5 | - | 6.8 ms |
+| 2560x1440 @ 144 | 7.2 | 28.1 (28.1) | 6.9 ms |
+
+- **1080p at 144-240 Hz streams 2.5-3x the frames of the 4K desktop at a quarter of the encode latency** (3.5 ms, the
+  encoder's 3.2-3.3 ms per frame plus Parsec's own share).
+- **Parsec sends every frame the app manages to put on screen** (its fps = the Metal app's own). The limit is how fast an
+  app's frames reach the display on this card: about 20 ms per 1080p frame (26 fps at 60 Hz, where each frame then takes
+  two refreshes; ~50 at 144 / 240 Hz), ~35 ms at 1440p, ~50 ms at 4K. NullMoth's zero-copy scan-out
+  (`debug.nvaccel_iop_flip=1`, live) changes nothing at 1080p@144 (49 fps, the same Parsec rate), so it is not the
+  `-nvrmnoflip` copy path but the Metal present / compositing path (NullMoth's plugin and WindowServer).
+- Safari's animation stays at 20-24 fps at 1080p (WebKit paints it on the CPU) and drops at 1440p.
+- The Parsec host here was set to `encoder_bitrate` 3 (Mbit/s): at 50 fps the stream ran at its 3 Mbit/s cap; raise it for
+  better pictures at high frame rates.
 
 ## Examples
 
