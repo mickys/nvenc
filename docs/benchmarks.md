@@ -16,6 +16,9 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-21, HEVC Main 10 on the GTX 1650 is NVENC 6.6, not us:** NVIDIA's own `hevc_nvenc` on the card (Linux VM) loses the
+  same in Main 10: 62.7 -> 59.5 VMAF (p4) and 62.9 -> 59.7 (p7) at the same rate, 0.46-0.47 dB PSNR; at the same fixed QP fewer
+  bits, as ours. `docs/bench/2026-10-21-gtx1650-nvidia-main10.txt`.
 - **2026-10-21, GTX 1650 encode benchmark and per-card layout:** the document is now split per card. On the GTX 1650: H.264 with B
   pictures level with x264 medium (1080p) and above it (4K) as on the 4090; HEVC (P only on NVENC 6.6) 59.1 / 60.5 VMAF at 1080p
   vs x265 fast 61.6 / 65.7; real-time latency 4.2-4.5 ms (1080p) / 15-17 ms (4K). Found on the way: ffmpeg `-bf 2` with HEVC on
@@ -357,8 +360,10 @@ What this shows:
   The limit is the missing B pictures (docs/tasks.md T15.06).
 - **HEVC Main 10 is 2.6-3.9 VMAF below 8-bit** here (0.4-0.55 dB PSNR, at the same rate), while on the RTX 4090 it is 0.4-1
   above. At the same fixed QP the engine spends fewer bits and loses more quality in 10-bit (QP 34: 8 % fewer bytes, 1.7 dB
-  lower), from the first picture on (not drift); our setup matches NVIDIA's own Main 10 setup on this card, so this looks like
-  NVENC 6.6. Use 8-bit HEVC on this card unless the content needs 10-bit.
+  lower), from the first picture on (not drift). **NVIDIA's own encoder does the same** on this card (Linux driver,
+  `hevc_nvenc` p4 / p7 CBR: Main 10 3.1-3.2 VMAF and 0.46-0.47 dB below Main at the same rate, and fewer bits at the same
+  fixed QP; `docs/bench/2026-10-21-gtx1650-nvidia-main10.txt`): a property of NVENC 6.6. Use 8-bit HEVC on this card unless the
+  content needs 10-bit.
 
 ### Decode
 
