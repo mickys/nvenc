@@ -115,7 +115,7 @@ typedef struct {
     // statistics (NVENCVT_STATS=<file> or the flag file /tmp/nvencvt.stats: a line every 2 s to that file /
     // /tmp/nvencvt-stats.log)
     FILE *bcFile; int bcX, bcY, bcS; long bcLast; unsigned bcN, bcBack, bcRep, bcSkip; double bcT0; unsigned bcSid, bcSeed; double bcPts;
-    struct { unsigned sid, seed; long v; double t, pts; } bcRing[16]; unsigned bcRingN; unsigned bcSeen[32], bcSeenN;   // frame-counter check (diagnostics)
+    struct { unsigned sid, seed; long v; double t, pts; } bcRing[16]; unsigned bcRingN; unsigned bcSeen[32], bcSeenN; int bcAll;   // frame-counter check (diagnostics)
     FILE *statsFile; double statsT0; unsigned sN, sIdr, sFail; double sCall, sCallMax, sTile, sEng, sEngMax, sTotal, sTotalMax, sBytes;
     OSType lastPf;
     unsigned qh, qt, depth;
@@ -732,7 +732,7 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     // counter goes backwards (an older frame reached the encoder), repeats or skips, with a summary every 2 s.
     if (!bgra && !l10r && (s->frames % 120) == 0 && !s->bcFile) {
         FILE *f = fopen("/tmp/nvencvt.barcode", "r");
-        if (f) { if (fscanf(f, "%d %d %d", &s->bcX, &s->bcY, &s->bcS) == 3 && s->bcS >= 4) { s->bcFile = fopen("/tmp/nvencvt-barcode.log", "a"); s->bcLast = -1; s->bcT0 = now_ms();
+        if (f) { if (fscanf(f, "%d %d %d %d", &s->bcX, &s->bcY, &s->bcS, &s->bcAll) >= 3 && s->bcS >= 4) { s->bcFile = fopen("/tmp/nvencvt-barcode.log", "a"); s->bcLast = -1; s->bcT0 = now_ms();
                      if (s->bcFile) fprintf(s->bcFile, "pid %d session %dx%d: checking a counter at %d,%d block %d\n", (int)getpid(), s->width, s->height, s->bcX, s->bcY, s->bcS); }
                  fclose(f); }
     }
@@ -746,24 +746,25 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
             unsigned k = 0; while (k < s->bcSeenN && s->bcSeen[k] != bsid) k++;
             if (k == s->bcSeenN && k < 32 && bs) {
                 s->bcSeen[s->bcSeenN++] = bsid; OSType bpf = IOSurfaceGetPixelFormat(bs), bbe = CFSwapInt32HostToBig(bpf);
-                fprintf(s->bcFile, "%.3f surface %u: %.4s %zux%zu planes %zu alloc %zu row %zu (frame %u)\n", now_ms() / 1000, bsid, (char *)&bbe,
+                fprintf(s->bcFile, "[%d] %.3f surface %u: %.4s %zux%zu planes %zu alloc %zu row %zu (frame %u)\n", (int)getpid(), now_ms() / 1000, bsid, (char *)&bbe,
                         IOSurfaceGetWidth(bs), IOSurfaceGetHeight(bs), IOSurfaceGetPlaneCount(bs), IOSurfaceGetAllocSize(bs), st, s->frames);
             }
         }
+        if (s->bcAll) fprintf(s->bcFile, "[%d] %.3f FRAME surface %u seed %u counter %lu pts %.3f\n", (int)getpid(), now_ms() / 1000, bsid, bseed, v, CMTimeGetSeconds(pts));
         {   unsigned r = s->bcRingN++ % 16;
             s->bcRing[r].sid = bsid; s->bcRing[r].seed = bseed; s->bcRing[r].v = (long)v; s->bcRing[r].t = now_ms(); s->bcRing[r].pts = CMTimeGetSeconds(pts); }
         if (s->bcLast >= 0 && (long)v < s->bcLast && s->bcLast - (long)v < 100) {   // the last 16 frames, oldest first
             for (unsigned i = s->bcRingN > 16 ? s->bcRingN - 16 : 0; i < s->bcRingN; i++) { unsigned r = i % 16;
-                fprintf(s->bcFile, "   surface %u seed %u counter %ld pts %.3f at %.1f ms\n", s->bcRing[r].sid, s->bcRing[r].seed, s->bcRing[r].v, s->bcRing[r].pts, s->bcRing[r].t - s->bcRing[(s->bcRingN - 1) % 16].t); }
+                fprintf(s->bcFile, "[%d]    surface %u seed %u counter %ld pts %.3f at %.1f ms\n", (int)getpid(), s->bcRing[r].sid, s->bcRing[r].seed, s->bcRing[r].v, s->bcRing[r].pts, s->bcRing[r].t - s->bcRing[(s->bcRingN - 1) % 16].t); }
         }
         if (s->bcLast >= 0) {
-            if ((long)v < s->bcLast) { s->bcBack++; fprintf(s->bcFile, "%.3f BACKWARD %lu after %ld (frame %u) surface %u seed %u pts %.3f, before: surface %u seed %u pts %.3f\n", now_ms() / 1000, v, s->bcLast, s->frames,
+            if ((long)v < s->bcLast) { s->bcBack++; fprintf(s->bcFile, "[%d] %.3f BACKWARD %lu after %ld (frame %u) surface %u seed %u pts %.3f, before: surface %u seed %u pts %.3f\n", (int)getpid(), now_ms() / 1000, v, s->bcLast, s->frames,
                                               bsid, bseed, CMTimeGetSeconds(pts), s->bcSid, s->bcSeed, s->bcPts); }
             else if ((long)v == s->bcLast) s->bcRep++;
             else if ((long)v > s->bcLast + 1) s->bcSkip += (unsigned)((long)v - s->bcLast - 1);
         }
         s->bcLast = (long)v; s->bcN++; s->bcSid = bsid; s->bcSeed = bseed; s->bcPts = CMTimeGetSeconds(pts);
-        if (now_ms() - s->bcT0 >= 2000) { fprintf(s->bcFile, "%.3f %u frames: counter %lu, %u backward, %u repeated, %u skipped\n", now_ms() / 1000, s->bcN, v, s->bcBack, s->bcRep, s->bcSkip);
+        if (now_ms() - s->bcT0 >= 2000) { fprintf(s->bcFile, "[%d] %.3f %u frames: counter %lu, %u backward, %u repeated, %u skipped\n", (int)getpid(), now_ms() / 1000, s->bcN, v, s->bcBack, s->bcRep, s->bcSkip);
                                           fflush(s->bcFile); s->bcT0 = now_ms(); s->bcN = s->bcBack = s->bcRep = s->bcSkip = 0; }
     }
     if (s->dumpYuv && s->dumpYuvLeft > 0) {   // the input as Parsec delivered it, tightly packed NV12
