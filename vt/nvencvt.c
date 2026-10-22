@@ -114,7 +114,7 @@ typedef struct {
     struct { VTEncoderFrameRef frame; CMTime pts, dur; bool valid; } hid;
     // statistics (NVENCVT_STATS=<file> or the flag file /tmp/nvencvt.stats: a line every 2 s to that file /
     // /tmp/nvencvt-stats.log)
-    FILE *bcFile; int bcX, bcY, bcS; long bcLast; unsigned bcN, bcBack, bcRep, bcSkip; double bcT0; unsigned bcSid, bcSeed; double bcPts;
+    FILE *bcFile; int bcX, bcY, bcS; long bcLast; unsigned bcN, bcBack, bcRep, bcSkip; double bcT0; unsigned bcSid, bcSeed, bcSeedPre; double bcPts;
     struct { unsigned sid, seed; long v; double t, pts; } bcRing[16]; unsigned bcRingN; unsigned bcSeen[32], bcSeenN; int bcAll;   // frame-counter check (diagnostics)
     FILE *statsFile; double statsT0; unsigned sN, sIdr, sFail; double sCall, sCallMax, sTile, sEng, sEngMax, sTotal, sTotalMax, sBytes;
     OSType lastPf;
@@ -719,6 +719,7 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
         char ms[64] = "-", ts[64] = "-"; if (m) { CFStringGetCString(m, ms, sizeof ms, kCFStringEncodingUTF8); CFRelease(m); } if (t) { CFStringGetCString(t, ts, sizeof ts, kCFStringEncodingUTF8); CFRelease(t); }
         LOG("first frame %.4s %zux%zu matrix %s transfer %s", (char *)&be, CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img), ms, ts); }
     s->lastPf = pf;
+    { IOSurfaceRef ps = CVPixelBufferGetIOSurface(img); s->bcSeedPre = ps ? IOSurfaceGetSeed(ps) : 0; }   // diagnostics: the seed before our lock
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
     if (!s->dumpEs && (s->frames % 30) == 0 && access("/tmp/nvencvt.dump", F_OK) == 0) {   // start a dump (diagnostics)
         char p[128]; snprintf(p, sizeof p, "/tmp/nvencvt-dump-%d.es", (int)getpid()); s->dumpEs = fopen(p, "wb");
@@ -750,7 +751,7 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
                         IOSurfaceGetWidth(bs), IOSurfaceGetHeight(bs), IOSurfaceGetPlaneCount(bs), IOSurfaceGetAllocSize(bs), st, s->frames);
             }
         }
-        if (s->bcAll) fprintf(s->bcFile, "[%d] %.3f FRAME surface %u seed %u counter %lu pts %.3f\n", (int)getpid(), now_ms() / 1000, bsid, bseed, v, CMTimeGetSeconds(pts));
+        if (s->bcAll) fprintf(s->bcFile, "[%d] %.3f FRAME surface %u seed %u prelock %u counter %lu pts %.3f\n", (int)getpid(), now_ms() / 1000, bsid, bseed, s->bcSeedPre, v, CMTimeGetSeconds(pts));
         {   unsigned r = s->bcRingN++ % 16;
             s->bcRing[r].sid = bsid; s->bcRing[r].seed = bseed; s->bcRing[r].v = (long)v; s->bcRing[r].t = now_ms(); s->bcRing[r].pts = CMTimeGetSeconds(pts); }
         if (s->bcLast >= 0 && (long)v < s->bcLast && s->bcLast - (long)v < 100) {   // the last 16 frames, oldest first
