@@ -16,6 +16,11 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-22, RTX 4090 on NullMoth 2.5.2 (RM 615.78.08), nvenc v0.9.4:** our encoders, decoders, latency and 8K re-measured
+  after the driver update (the 4090 was out of the machine since 2026-10-20). Everything within run-to-run noise of 2026-10-20
+  (decode 1-4 %, latency and 8K the same), except real-time H.264 quality, which gained 2-3 VMAF from NVIDIA's quant table
+  (entry below). The tables of this card now carry these numbers (ours, NullMoth's and Apple's decoders; the software encoders'
+  rows are from 2026-10-20). `docs/bench/2026-10-22-rtx4090-252.txt`.
 - **2026-10-22, real-time H.264 on the RTX 4090 gets NVIDIA's p4 quant table:** measured now that the 4090 is back (T15.09
   had it behind `ENC_H264_RT_QTABLE=1`): through VideoToolbox at the same rate 51.1 -> 54.2 VMAF (crowd_run 1080p), 54.8 -> 57.6
   (park_joy 1080p), 63.6 -> 65.7 (crowd_run 4K), same speed and the same engine time per frame (1.18 ms 1080p, 4.33 ms 4K). On
@@ -127,7 +132,7 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 ## RTX 4090 (Ada)
 
 GeForce RTX 4090 (AD102): two NVENC engines (8.2, class 0xc9b7), one NVDEC exposed (0xc9b0). Raw results: `docs/bench/2026-10-20-rerun.txt`,
-`2026-10-20-ours-t709.txt`, `2026-10-20-hevc4k-t710.txt` (encode), `2026-10-20-dec.txt` / the rerun (decode), `2026-10-20-lat-8k.txt`.
+`2026-10-20-ours-t709.txt`, `2026-10-20-hevc4k-t710.txt` (encode), `2026-10-20-dec.txt` / the rerun (decode), `2026-10-20-lat-8k.txt`. Our encoders, decoders, latency and 8K re-measured on NullMoth 2.5.2 with nvenc 0.9.4: `2026-10-22-rtx4090-252.txt`.
 
 ### Encode
 
@@ -135,14 +140,14 @@ GeForce RTX 4090 (AD102): two NVENC engines (8.2, class 0xc9b7), one NVDEC expos
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 306 | 5.99 | 26.62 | 51.1 |
-| ours H.264 (2 B, quality) | 269 | 6.01 | 27.35 | 59.5 |
+| ours H.264, real time (P only) | 306 | 5.99 | 26.68 | 54.2 |
+| ours H.264 (2 B, quality) | 267 | 6.01 | 27.35 | 59.5 |
 | ours HEVC, real time | 218 | 5.99 | 27.15 | 58.8 |
-| ours HEVC (2 B) | 129 | 6.02 | 27.74 | 62.3 |
-| ours HEVC Main 10 (2 B) | 114 | 6.03 | 27.72 | 63.2 |
-| ours AV1, real time | 230 | 5.88 | 27.37 | 60.6 |
-| ours AV1 (2 B, quality) | 251 | 6.11 | 28.09 | 65.2 |
-| ours AV1 10-bit (2 B, quality) | 248 | 6.11 | 28.10 | 65.2 |
+| ours HEVC (2 B) | 128 | 6.02 | 27.74 | 62.3 |
+| ours HEVC Main 10 (2 B) | 127 | 6.03 | 27.72 | 63.2 |
+| ours AV1, real time | 255 | 5.88 | 27.37 | 60.6 |
+| ours AV1 (2 B, quality) | 275 | 6.11 | 28.09 | 65.2 |
+| ours AV1 10-bit (2 B, quality) | 228 | 6.11 | 28.10 | 65.2 |
 | Apple H.264 (software, VideoToolbox) | 50 | 6.27 | 25.74 | 47.0 |
 | Apple HEVC (software, VideoToolbox) | 7 | 6.58 | 27.57 | 61.8 |
 | x264 veryfast | 183 | 6.13 | 26.27 | 50.1 |
@@ -155,14 +160,14 @@ GeForce RTX 4090 (AD102): two NVENC engines (8.2, class 0xc9b7), one NVDEC expos
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 306 | 5.91 | 26.86 | 54.8 |
-| ours H.264 (2 B, quality) | 286 | 6.08 | 27.48 | 63.2 |
-| ours HEVC, real time | 213 | 5.90 | 27.25 | 60.7 |
+| ours H.264, real time (P only) | 308 | 5.88 | 26.84 | 57.6 |
+| ours H.264 (2 B, quality) | 272 | 6.08 | 27.48 | 63.2 |
+| ours HEVC, real time | 224 | 5.90 | 27.25 | 60.7 |
 | ours HEVC (2 B) | 128 | 6.10 | 27.90 | 65.1 |
-| ours HEVC Main 10 (2 B) | 130 | 6.10 | 27.91 | 66.1 |
-| ours AV1, real time | 230 | 5.82 | 27.58 | 63.8 |
-| ours AV1 (2 B, quality) | 260 | 6.13 | 28.27 | 68.8 |
-| ours AV1 10-bit (2 B, quality) | 231 | 6.13 | 28.26 | 68.8 |
+| ours HEVC Main 10 (2 B) | 129 | 6.10 | 27.91 | 66.1 |
+| ours AV1, real time | 268 | 5.82 | 27.58 | 63.8 |
+| ours AV1 (2 B, quality) | 265 | 6.13 | 28.27 | 68.8 |
+| ours AV1 10-bit (2 B, quality) | 244 | 6.13 | 28.26 | 68.8 |
 | Apple H.264 (software, VideoToolbox) | 49 | 6.23 | 25.53 | 45.8 |
 | Apple HEVC (software, VideoToolbox) | 6 | 6.42 | 27.52 | 62.8 |
 | x264 veryfast | 181 | 6.16 | 26.93 | 57.6 |
@@ -175,13 +180,13 @@ GeForce RTX 4090 (AD102): two NVENC engines (8.2, class 0xc9b7), one NVDEC expos
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 113 | 20.00 | 30.86 | 63.6 |
+| ours H.264, real time (P only) | 118 | 20.02 | 30.91 | 65.7 |
 | ours H.264 (2 B, quality) | 87 | 20.39 | 31.40 | 69.1 |
-| ours HEVC, real time | 96 | 20.01 | 31.56 | 71.6 |
-| ours HEVC (2 B) | 78 | 20.22 | 31.92 | 72.6 |
-| ours HEVC Main 10 (2 B) | 74 | 20.21 | 31.92 | 73.3 |
-| ours AV1, real time | 96 | 19.91 | 31.94 | 73.1 |
-| ours AV1 (2 B, quality) | 110 | 21.41 | 32.45 | 76.1 |
+| ours HEVC, real time | 91 | 20.01 | 31.56 | 71.6 |
+| ours HEVC (2 B) | 79 | 20.22 | 31.92 | 72.6 |
+| ours HEVC Main 10 (2 B) | 76 | 20.21 | 31.92 | 73.3 |
+| ours AV1, real time | 95 | 19.91 | 31.94 | 73.1 |
+| ours AV1 (2 B, quality) | 111 | 21.41 | 32.45 | 76.1 |
 | ours AV1 10-bit (2 B, quality) | 96 | 21.43 | 32.47 | 76.2 |
 | Apple H.264 (software, VideoToolbox) | 14 | 20.84 | 29.88 | 58.1 |
 | Apple HEVC (software, VideoToolbox) | 3 | 21.34 | 31.73 | 70.4 |
@@ -195,14 +200,14 @@ GeForce RTX 4090 (AD102): two NVENC engines (8.2, class 0xc9b7), one NVDEC expos
 
 | encoder | fps | Mbit/s | PSNR-Y dB | VMAF |
 |---|---:|---:|---:|---:|
-| ours H.264, real time (P only) | 109 | 19.83 | 30.84 | 63.0 |
-| ours H.264 (2 B, quality) | 88 | 20.55 | 31.24 | 68.7 |
-| ours HEVC, real time | 98 | 19.79 | 31.59 | 71.4 |
+| ours H.264, real time (P only) | 114 | 19.73 | 30.85 | 65.4 |
+| ours H.264 (2 B, quality) | 87 | 20.55 | 31.24 | 68.7 |
+| ours HEVC, real time | 99 | 19.78 | 31.59 | 71.4 |
 | ours HEVC (2 B) | 78 | 20.16 | 31.90 | 72.7 |
-| ours HEVC Main 10 (2 B) | 74 | 20.17 | 31.90 | 73.1 |
-| ours AV1, real time | 95 | 19.84 | 32.23 | 75.4 |
-| ours AV1 (2 B, quality) | 109 | 21.17 | 32.63 | 77.8 |
-| ours AV1 10-bit (2 B, quality) | 90 | 21.15 | 32.63 | 77.8 |
+| ours HEVC Main 10 (2 B) | 75 | 20.17 | 31.90 | 73.1 |
+| ours AV1, real time | 96 | 19.84 | 32.23 | 75.4 |
+| ours AV1 (2 B, quality) | 108 | 21.17 | 32.63 | 77.8 |
+| ours AV1 10-bit (2 B, quality) | 92 | 21.15 | 32.63 | 77.8 |
 | Apple H.264 (software, VideoToolbox) | 16 | 20.85 | 29.54 | 54.8 |
 | Apple HEVC (software, VideoToolbox) | 2 | 21.21 | 31.72 | 70.1 |
 | x264 veryfast | 45 | 20.83 | 30.08 | 59.1 |
@@ -234,25 +239,25 @@ HEVC rows after T7.10, `docs/bench/2026-10-20-hevc4k-t710.txt`):
 
 | codec | ours (NVDEC, VideoToolbox) | ours (NVDEC, engine time) | NullMoth's driver | Apple software (VideoToolbox) | ffmpeg software, 16 threads |
 |---|---:|---:|---:|---:|---:|
-| H.264 | 670 | - | 159 | 85 | 649 |
-| HEVC | 950 | - | 844 | 322 | 278 |
-| HEVC Main 10 | 630 | - | 568 | 291 | 250 |
-| VP9 | 990 | - | - | - | 343 |
-| AV1 | 948 | - | - | - | 91 |
-| MPEG-2 | 728 | - | - | - | 1107 |
-| MPEG-4 Part 2 | 722 | - | - | - | 1027 |
+| H.264 | 666 | - | 160 | 94 | 649 |
+| HEVC | 933 | - | 833 | 232 | 278 |
+| HEVC Main 10 | 609 | - | 565 | 301 | 250 |
+| VP9 | 946 | - | - | - | 343 |
+| AV1 | 996 | - | - | - | 91 |
+| MPEG-2 | 741 | - | - | - | 1107 |
+| MPEG-4 Part 2 | 720 | - | - | - | 1027 |
 | VP8 | - | 1031 | - | - | 843 |
 
 #### Decode 3840x2160 (frames per second)
 
 | codec | ours (NVDEC, VideoToolbox) | ours (NVDEC, engine time) | NullMoth's driver | Apple software (VideoToolbox) | ffmpeg software, 16 threads |
 |---|---:|---:|---:|---:|---:|
-| H.264 | 188 | - | 40 | 24 | 168 |
-| HEVC | 309 | - | 291 | 190 | 156 |
-| HEVC Main 10 | 173 | - | 167 | 148 | 123 |
-| VP9 | 303 | - | - | - | 163 |
-| AV1 | 307 | - | - | - | 28 |
-| MPEG-2 | 207 | - | - | - | 505 |
+| H.264 | 190 | - | 38 | 25 | 168 |
+| HEVC | 310 | - | 305 | 190 | 156 |
+| HEVC Main 10 | 173 | - | 170 | 148 | 123 |
+| VP9 | 306 | - | - | - | 163 |
+| AV1 | 295 | - | - | - | 28 |
+| MPEG-2 | 209 | - | - | - | 505 |
 | MPEG-4 Part 2 | 25 | - | - | - | 369 |
 | VP8 | - | 251 | - | - | 361 |
 
@@ -275,12 +280,12 @@ What this shows:
 
 | codec | size | latency ms | engine ms |
 |---|---|---:|---:|
-| H.264 | 1920x1080 | 1.85 | 1.19 |
-| HEVC | 1920x1080 | 1.93 | 1.23 |
-| AV1 | 1920x1080 | 1.72 | 1.05 |
-| H.264 | 3840x2160 | 5.67 | 4.34 |
-| HEVC | 3840x2160 | 5.84 | 4.50 |
-| AV1 | 3840x2160 | 5.00 | 3.71 |
+| H.264 | 1920x1080 | 1.82 | 1.19 |
+| HEVC | 1920x1080 | 1.76 | 1.22 |
+| AV1 | 1920x1080 | 1.60 | 1.05 |
+| H.264 | 3840x2160 | 5.57 | 4.33 |
+| HEVC | 3840x2160 | 5.70 | 4.51 |
+| AV1 | 3840x2160 | 4.88 | 3.72 |
 
 From `VTCompressionSessionEncodeFrame` to the encoded frame in the app's callback, real time (2-frame VBV, P only); the engine
 part is the hardware time. AV1 is the fastest of the three on Ada.
@@ -289,8 +294,8 @@ part is the hardware time. AV1 is the fastest of the three on Ada.
 
 | codec | encode ms / frame (engine) | decode fps (VideoToolbox) |
 |---|---:|---:|
-| AV1 | 14.3 | 64 |
-| HEVC | 16.1 | 66 |
+| AV1 | 14.4 | 65 |
+| HEVC | 16.1 | 70 |
 | H.264 | 15.3 | 11 (NullMoth's: NVDEC decodes H.264 up to 4096 wide, so ours declines) |
 
 The 4K `crowd_run` frames scaled up; encoded with `tools/encodeN` (AV1 with 4 tiles), decoded through VideoToolbox.
