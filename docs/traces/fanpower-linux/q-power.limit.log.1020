@@ -1,0 +1,108 @@
+ESC 0xd2 libnvidia-ml.so.1      size 72
+      0000: 00000000 00000001 2e303835 2e353031 00003830 00000000 00000000 00000000
+      0020: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      0040: 00000000 00000000
+ESC 0xd6 libnvidia-ml.so.1      size 8
+      0000: 80000000 00000000
+ESC 0xc8 libnvidia-ml.so.1      size 2304
+      0000: 00000001 00000000 00000007 268410de 00000700 00000042 fa000000 00000000
+      0020: 01000000 00000000 00000000 00000e0e 00000000 00000001 00000000 00000000
+      0040: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      0060: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+ALLOC libnvidia-ml.so.1        client 0x00000000 parent 0x00000000 new 0xc1d00036 class 0x0041 size 0 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000214 size 384 -> 0x0
+      0000: 00000700 ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0020: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0040: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0060: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0080: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      00a0: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      00c0: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      00e0: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x0000021b size 12 -> 0x0
+      0000: 00000700 00000000 00000007
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000279 size 12 -> 0x0
+      0000: 00000700 00000000 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000289 size 4 -> 0x0
+      0000: 00000700
+ESC 0xda libnvidia-ml.so.1      size 8
+      0000: 00000000 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000214 size 384 -> 0x0
+      0000: 00000700 ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0020: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0040: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0060: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0080: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      00a0: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      00c0: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      00e0: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+ALLOC libnvidia-ml.so.1        client 0xc1d00036 parent 0xc1d00036 new 0xa55a0000 class 0xc639 size 0 -> 0x0
+ALLOC libnvidia-ml.so.1        client 0xc1d00036 parent 0xc1d00036 new 0xa55a0010 class 0xc640 size 0 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000215 size 132 -> 0x0
+      0000: 00000700 ffffffff 00000000 00000000 00000000 00000000 00000000 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000202 size 40 -> 0x0
+      0000: 00000700 00000000 00000000 00000000 00000000 00000000 00000041 00000700
+      0020: 00000000 ffffffff
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000201 size 128 -> 0x0
+      0000: 00000700 ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0020: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0040: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0060: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000202 size 40 -> 0x0
+      0000: 00000700 00000000 00000000 00000000 00000000 00000000 00000041 00000700
+      0020: 00000000 ffffffff
+ESC 0xc9 libnvidia-ml.so.1      size 4
+      0000: 00000009
+ESC 0xd7 libnvidia-ml.so.1      size 560
+      0000: ffffffff 00000000 80000000 00000000 00000000 00000000 00000000 00000000
+      0020: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      0040: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      0060: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+ALLOC libnvidia-ml.so.1        client 0xc1d00036 parent 0xc1d00036 new 0xa55a0020 class 0x0080 size 0 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0020 cmd 0x00800289 size 8 -> 0x0
+      0000: 00000001 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000202 size 40 -> 0x0
+      0000: 00000700 00000001 00000000 00000000 00000000 00000000 00000041 00000700
+      0020: 00000000 ffffffff
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000201 size 128 -> 0x0
+      0000: 00000700 ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0020: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0040: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+      0060: ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000202 size 40 -> 0x0
+      0000: 00000700 00000001 00000000 00000000 00000000 00000000 00000041 00000700
+      0020: 00000000 ffffffff
+ESC 0xc9 libnvidia-ml.so.1      size 4
+      0000: 00000009
+ALLOC libnvidia-ml.so.1        client 0xc1d00036 parent 0xa55a0020 new 0xa55a0030 class 0x2080 size 0 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x20800406 size 264 -> 0x0
+      0000: 00000501 00000000 8dfc0612 00065e6b a0781400 18e0d422 8dfc0617 00065e6b
+      0020: a0781e40 18e0d422 8dfc0619 00065e6b a0782820 18e0d422 8dfc061c 00065e6b
+      0040: a0783220 18e0d422 8dfc061e 00065e6b a0783c00 18e0d422 00000000 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x20800406 size 264 -> 0x0
+      0000: 00000501 00000000 8dfc1a4b 00065e6b a0c70d60 18e0d422 8dfc1a4e 00065e6b
+      0020: a0c71740 18e0d422 8dfc1a51 00065e6b a0c72120 18e0d422 8dfc1a53 00065e6b
+      0040: a0c72b00 18e0d422 8dfc1a56 00065e6b a0c734e0 18e0d422 00000000 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x20801701 size 16 -> 0x0
+      0000: 00000190 00000002 000000a1 00000002
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x2080014a size 268 -> 0x0
+      0000: 00000000 00000002 00000010 xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x20800102 size 564 -> 0x0
+      0000: 00000001 00000011 00000000 00000000 00000000 00000000 00000000 00000000
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0020 cmd 0x0080028e size 1 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0020 cmd 0x00800294 size 4 -> 0x0
+      0000: 00000000
+ALLOC libnvidia-ml.so.1        client 0xc1d00036 parent 0xa55a0030 new 0xa55a0040 class 0x2081 size 0 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0040 cmd 0x20810108 size 992 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x20801801 size 16 -> 0x0
+      0000: 268410de 41041458 000000a1 00002684
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xa55a0030 cmd 0x2080a61d size 12 -> 0x0
+      0000: 0000fe01 0006ddd0 00000000
+FREE  libnvidia-ml.so.1        client 0xc1d00036 parent 0xa55a0020 obj 0xa55a0030 -> 0x0
+FREE  libnvidia-ml.so.1        client 0xc1d00036 parent 0xc1d00036 obj 0xa55a0020 -> 0x0
+CTRL  libnvidia-ml.so.1        client 0xc1d00036 obj 0xc1d00036 cmd 0x00000216 size 128 -> 0x0
+      0000: 0000ffff ffffffff 00000000 00000000 00000000 00000000 00000000 00000000
+      0020: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      0040: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      0060: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+FREE  libnvidia-ml.so.1        client 0xc1d00036 parent 0xc1d00036 obj 0xc1d00036 -> 0x0

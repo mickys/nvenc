@@ -390,7 +390,9 @@ static void esc_after(NvU32 cmd, void *d, size_t sz, void *ra)
     case NV_ESC_RM_CONTROL: {
         NVOS54_PARAMETERS *p = d;
         L("CTRL  %-24s client 0x%08x obj 0x%08x cmd 0x%08x size %u -> 0x%x\n", who, p->hClient, p->hObject, p->cmd, p->paramsSize, p->status);
-        if (p->params && p->paramsSize) hexi("      ", (void *)(uintptr_t)p->params, p->paramsSize > 128 ? 128 : p->paramsSize);
+        // NVTRACE_CTRLMAX=N: dump up to N bytes of each control's parameters (default 128; RM-sensor structs are larger)
+        static unsigned cmax; if (!cmax) { const char *e = getenv("NVTRACE_CTRLMAX"); cmax = e && atoi(e) > 0 ? (unsigned)atoi(e) : 128; }
+        if (p->params && p->paramsSize) hexi("      ", (void *)(uintptr_t)p->params, p->paramsSize > cmax ? cmax : p->paramsSize);
         break; }
     case NV_ESC_RM_FREE: {
         NVOS00_PARAMETERS *p = d;
