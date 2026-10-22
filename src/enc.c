@@ -895,8 +895,11 @@ int enc_submit_ex(Enc *e, bool force_idr, bool isB, int disp, NvU32 *ticket)
             memcpy(base + OFF_MD, idr ? h264_nv66_md_idr : h264_nv66_md_p, 0x100);
             memcpy(base + OFF_Q, h264_nv66_q, 0x100);
             if (e->cfg.h264_profile == 100 || e->cfg.chroma444) { nvenc_h264_md_control_s *md = (void *)(base + OFF_MD); md->intra_luma8x8_mode_enable = 0x1ff; }
-        } else if (getenv("ENC_H264_RT_QTABLE")) memcpy(base + OFF_Q, h264_tmpl_q, 0x100);   // Ada: NVIDIA's p4 table (as quality
-        // mode); off until measured on an RTX 40 card (the 4090 was out of the machine when this was found)
+        } else {   // Ada: NVIDIA's p4 quant table (as quality mode). RTX 4090, VideoToolbox at the same rate: +3.1 / +2.7 VMAF
+            // (crowd / park 1080p), +2.1 (crowd 4K), same speed. ENC_H264_RT_QTABLE=0 leaves the control empty as before.
+            const char *q = getenv("ENC_H264_RT_QTABLE");
+            if (!q || q[0] != '0') memcpy(base + OFF_Q, h264_tmpl_q, 0x100);
+        }
     }
     if (e->cfg.la_pass) {   // lookahead pictures (la.c): NVIDIA's controls for them (docs/traces/quality-linux vla, T7.09)
         NvU8 *base = setup->cpu;

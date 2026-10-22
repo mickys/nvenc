@@ -16,6 +16,10 @@ tables are replaced when its full run is repeated (see "Updating this document" 
 
 Newest first. One entry per finding or measurement: date, what changed or was found, numbers, and the raw result file.
 
+- **2026-10-22, real-time H.264 on the RTX 4090 gets NVIDIA's p4 quant table:** measured now that the 4090 is back (T15.09
+  had it behind `ENC_H264_RT_QTABLE=1`): through VideoToolbox at the same rate 51.1 -> 54.2 VMAF (crowd_run 1080p), 54.8 -> 57.6
+  (park_joy 1080p), 63.6 -> 65.7 (crowd_run 4K), same speed and the same engine time per frame (1.18 ms 1080p, 4.33 ms 4K). On
+  by default on Ada; `ENC_H264_RT_QTABLE=0` turns it off. `docs/bench/2026-10-22-rtx4090-h264rt-qtable.txt`.
 - **2026-10-21, Parsec at 1080p / high refresh on the GTX 1650:** with the overlay's `--resolution` modes Parsec streams a
   GPU-drawn animation at 49.5 fps at 1080p@144 and 52.6 at 1080p@240 (4K HiDPI: 18.9), encode latency 3.5 ms (4K: 12-17 ms).
   The cap is the app's present rate on this card (~20 ms per 1080p frame), not the encoder or the display copy path
@@ -29,7 +33,7 @@ Newest first. One entry per finding or measurement: date, what changed or was fo
 - **2026-10-21, real-time H.264 had an empty quant control (T15.09):** the real-time path (Parsec, streaming) never set the
   engine's dead-zone tables and QP post-processing; quality mode did. On the GTX 1650 real-time H.264 now uses NVIDIA's own p4
   controls for that card: through VideoToolbox +3.2 / +3.7 VMAF at 1080p at the same rate, 4K 13 % faster (encodeN: +8 VMAF).
-  On Ada the same table (NVIDIA's, already used in quality mode) is behind `ENC_H264_RT_QTABLE=1` until measured on the 4090.
+  On Ada the same table (NVIDIA's, already used in quality mode) was behind `ENC_H264_RT_QTABLE=1` until measured on the 4090 (2026-10-22: on by default, +2-3 VMAF).
   `docs/bench/2026-10-21-gtx1650-h264rt.txt`.
 - **2026-10-21, OBS and Parsec on the GTX 1650:** OBS records H.264 / HEVC (B-frames on or off) at a steady 1080p60 with no
   decode errors; Parsec 4K: H.265 8-bit L 13.3-14.5 ms, 10-bit 21-24 ms, H.264 23.5 ms, about 10 fps in every mode (the screen
