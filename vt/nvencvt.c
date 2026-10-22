@@ -731,18 +731,23 @@ static OSStatus e_encodeFrame(VTVideoEncoderRef e, VTEncoderFrameRef frame, CVIm
     // Diagnostics: /tmp/nvencvt.barcode = "x y block": frames carry a 32-bit counter as 32 black / white blocks of `block`
     // pixels from (x, y) in the luma plane (vm/tahoe/bench/metal-anim.m draws one). Logs to /tmp/nvencvt-barcode.log when the
     // counter goes backwards (an older frame reached the encoder), repeats or skips, with a summary every 2 s.
-    if (!bgra && !l10r && (s->frames % 120) == 0 && !s->bcFile) {
+    if ((s->frames % 120) == 0 && !s->bcFile) {
         FILE *f = fopen("/tmp/nvencvt.barcode", "r");
         if (f) { if (fscanf(f, "%d %d %d %d", &s->bcX, &s->bcY, &s->bcS, &s->bcAll) >= 3 && s->bcS >= 4) { s->bcFile = fopen("/tmp/nvencvt-barcode.log", "a"); s->bcLast = -1; s->bcT0 = now_ms();
                      if (s->bcFile) fprintf(s->bcFile, "pid %d session %dx%d: checking a counter at %d,%d block %d\n", (int)getpid(), s->width, s->height, s->bcX, s->bcY, s->bcS); }
                  fclose(f); }
     }
     if (s->bcFile && s->bcX + 32 * s->bcS <= s->width && s->bcY + s->bcS <= s->height) {
-        const uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(img, 0); const size_t st = CVPixelBufferGetBytesPerRowOfPlane(img, 0);
+        // BGRA and l10r (packed 10-bit RGB, which Parsec hands over in some modes): the blocks are black / white, so byte 1
+        // stands in for luma (BGRA: green; l10r: green bits 0-5 sit in bits 2-7 of byte 1)
+        const bool rgb = bgra || l10r;
+        const uint8_t *y = rgb ? CVPixelBufferGetBaseAddress(img) : CVPixelBufferGetBaseAddressOfPlane(img, 0);
+        const size_t st = rgb ? CVPixelBufferGetBytesPerRow(img) : CVPixelBufferGetBytesPerRowOfPlane(img, 0);
+        const size_t bpx = rgb ? 4 : (p010 || x444 ? 2 : 1), bof = rgb || p010 || x444 ? 1 : 0;
         IOSurfaceRef bs = CVPixelBufferGetIOSurface(img);
         const unsigned bsid = bs ? IOSurfaceGetID(bs) : 0, bseed = bs ? IOSurfaceGetSeed(bs) : 0;
         unsigned long v = 0; const size_t row = (size_t)(s->bcY + s->bcS / 2) * st;
-        for (int i = 0; i < 32; i++) if (y[row + (size_t)(s->bcX + i * s->bcS + s->bcS / 2) * (p010 || x444 ? 2 : 1) + (p010 || x444 ? 1 : 0)] > 128) v |= 1ul << i;
+        for (int i = 0; i < 32; i++) if (y[row + (size_t)(s->bcX + i * s->bcS + s->bcS / 2) * bpx + bof] > 128) v |= 1ul << i;
         {   // first sight of each surface: what it is
             unsigned k = 0; while (k < s->bcSeenN && s->bcSeen[k] != bsid) k++;
             if (k == s->bcSeenN && k < 32 && bs) {
