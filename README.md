@@ -33,7 +33,17 @@ the only hardware VP9 / AV1 decoders on an Intel Mac.
 
 ## Using it
 
-Releases ship inside the [mickys overlay](https://github.com/mickys/nvidia-macos-driver/releases) for NullMoth's driver.
+Releases: [github.com/mickys/nvenc/releases](https://github.com/mickys/nvenc/releases) (since 0.9.5: `libnvencvt.dylib` built
+from the tag, unsigned, with LICENSE, this README and SHA256SUMS). The easy way to install it is the
+[mickys overlay](https://github.com/mickys/nvidia-macos-driver/releases) for NullMoth's driver, which ships the same library
+and sets everything below up. By hand, with NullMoth's driver 2.3.7 or later:
+
+```sh
+sudo install -o root -g wheel -m 755 libnvencvt.dylib /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/
+sudo codesign -f -s - /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib
+echo NVMTL_NVENCVT=1 | sudo tee -a /Library/GPUBundles/nvmtl/nvrm610.conf   # NullMoth's plugin then loads it in every app
+DYLD_INSERT_LIBRARIES=/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib ffmpeg ...   # command-line tools
+```
 
 - **Apps** (Parsec, OBS, QuickTime and other AVFoundation apps): NullMoth's Metal plugin loads
   `libnvencvt.dylib` into every process that uses Metal when `NVMTL_NVENCVT=1` is in `nvrm610.conf` (its own hook since
@@ -87,6 +97,10 @@ scripts/fetch-vendor.sh    # NVIDIA open-gpu-kernel-modules (RM API, 610.57.04) 
 ssh tahoe ~/nvenc-dev/probe
 ssh tahoe 'cd ~/nvenc-dev && SRC=clip.nv12 RC=2 BITRATE=8000000 ./encodeN -hevc 1920 1080 300 28 30 1 /tmp/o.hevc /dev/null'
 ```
+
+Releases: `scripts/release-package.sh <tag> <out>` (clean tree, annotated tag on HEAD made locally, pushed only when the
+release is published) builds the library in the guest and packs it; the release goes up as draft -> upload -> digest check ->
+publish (GitHub releases here are immutable: a published tag stays).
 
 ## Sources
 
