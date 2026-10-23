@@ -265,6 +265,20 @@ static void superres_steps(int fw, int uw, int sub, unsigned short *step, unsign
 static int decode_frame(Av1Dec *d)
 {
     Av1Frame *f = &d->f; const Av1Seq *s = &d->st.seq;
+    // an inter frame whose references were never decoded: the stream was joined after its key frame (ffmpeg drops the
+    // first sample when its first VideoToolbox session finds no decoder: libnvencvt registers while that session looks
+    // for one). Such a frame and the slots it refreshes are left out until a key frame or an intra-only frame refills
+    // them, as dav1d does; decoding it would show the frame's residuals on whatever the surface held.
+    if (!f->frame_is_intra) {
+        bool miss = false;
+        for (int i = 0; i < 7; i++) if (d->ref[f->ref_frame_idx[i]] < 0) miss = true;
+        if (miss) {
+            for (int i = 0; i < 8; i++) if (f->refresh_frame_flags & (1 << i)) d->ref[i] = -1;
+            av1_end_frame(&d->st, f);
+            d->dec_surf = -1; d->skipped = true; d->nskipped++;
+            return 0;
+        }
+    }
     if ((unsigned)f->upscaled_width > d->maxW || (unsigned)f->frame_height > d->maxH) { fprintf(stderr, "av1dec: frame larger than the session\n"); return -1; }
     // what the engine decodes (T9.03): 4:2:0 or monochrome (written as 4:2:0 with neutral chroma), 8/10-bit, 128x128 up
     // (NVIDIA's minimum; smaller frames came out grey with status 0xb), 256 tiles
@@ -565,6 +579,7 @@ static int decode_frame(Av1Dec *d)
 int av1dec_tu(Av1Dec *d, const uint8_t *buf, size_t n)
 {
     int shown = 0;
+    d->skipped = false;
     for (size_t pos = 0; pos < n;) {
         Av1Obu o; if (av1_obu(buf + pos, n - pos, &o)) { fprintf(stderr, "av1dec: bad OBU\n"); return -1; }
         const uint8_t *pl = buf + pos + o.header_len;
@@ -589,7 +604,12 @@ int av1dec_tu(Av1Dec *d, const uint8_t *buf, size_t n)
             if (av1_parse_frame_header(&d->st, pl, o.payload_len, &d->f, &hb)) { fprintf(stderr, "av1dec: frame header error\n"); return -1; }
             if (d->f.show_existing_frame) {
                 const int sfc = d->ref[d->f.frame_to_show_map_idx];
-                if (sfc < 0) return -1;
+                if (sfc < 0) {   // a frame left out above (references never decoded): nothing to show
+                    if (d->f.frame_type == AV1_KEY_FRAME) for (int i = 0; i < 8; i++) d->ref[i] = -1;
+                    av1_end_frame(&d->st, &d->f);
+                    d->dec_surf = -1; d->skipped = true; d->nskipped++;
+                    pos += o.header_len + o.payload_len; continue;
+                }
                 if (d->f.frame_type == AV1_KEY_FRAME)   // a shown key frame refreshes every slot (7.21, 7.20)
                     for (int i = 0; i < 8; i++) { if (i != d->f.frame_to_show_map_idx) memcpy(d->cdf[i].cpu, d->cdf[d->f.frame_to_show_map_idx].cpu, d->cdf_size); d->ref[i] = sfc; }
                 av1_end_frame(&d->st, &d->f);

@@ -35,6 +35,7 @@ typedef struct {
     size_t bsN; int ntiles; struct { size_t start, end; int row, col; } tile[AV1_MAX_TILES];
     int cur_surf, cur_w, cur_h;
     int dec_surf;                   // the surface the last coded frame went to (hidden ones too; -1 after show_existing_frame)
+    bool skipped; unsigned nskipped;   // the last temporal unit had a frame left out for references never decoded; how many so far
     unsigned err_status, ok_blocks;
     double engine_ms;
 } Av1Dec;

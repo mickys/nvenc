@@ -675,6 +675,9 @@ static OSStatus decode_av1(DState *s, VTVideoDecoderFrame frame, const uint8_t *
             s->av1->busy[shown] = true;
         }
     }
+    // a frame left out for references never decoded (src/av1dec.c): reported as such, which ffmpeg counts as a decode
+    // error; an empty picture with noErr would make it restart the session (videotoolbox_decoder_callback)
+    if (!res && shown < 0 && s->av1->skipped) res = kVTVideoDecoderReferenceMissingErr;
     OutJob j = { .frame = frame, .surf = -1, .rel = -1 };
     if (!res && shown >= 0) {
         j.w = s->av1->w[shown]; j.h = s->av1->h[shown]; j.rel = shown;
