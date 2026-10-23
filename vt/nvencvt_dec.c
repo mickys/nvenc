@@ -455,6 +455,7 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     // VideoToolbox copies every frame into a compatible one inside EmitDecodedFrame (ffmpeg asks for OpenGL-compatible
     // IOSurfaces: 18.7 ms per 4K frame).
     CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
+    if (dst) CFRetain(dst);   // also for our own pool below (released at its end)
     CFNumberRef dpf = dst ? CFDictionaryGetValue(dst, kCVPixelBufferPixelFormatTypeKey) : NULL; OSType want = 0;
     if (!getenv("NVDEC_OWNATTRS") && dpf && CFGetTypeID(dpf) == CFNumberGetTypeID() && CFNumberGetValue(dpf, kCFNumberSInt32Type, &want) && want == pf) {
         CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, dst);
@@ -469,25 +470,35 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
     }
     st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
     CFRelease(attrs); CFRelease(ios); CFRelease(npf); CFRelease(nw); CFRelease(nh);
-    // Our own pool, made with the client's destination attributes verbatim. A client that asks for an
+    // Our own pool, made with the client's destination attributes verbatim (PR #1). A client that asks for an
     // OpenGL-compatible buffer (ffmpeg, mpv: kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey) cannot have one on
     // this system: CVPixelBufferIsCompatibleWithAttributes answers 0 for every buffer, even one made with those very
-    // attributes. VideoToolbox then transfers every decoded picture into a buffer of its own (about 14 ms per 4K frame
-    // through the GPU driver's Metal path), instead of handing the decoder's buffer over (0.05 ms). The picture is
-    // copied into the buffer we hand out, so if that buffer carries the destination's own attributes VideoToolbox has
-    // nothing to transfer. (T8.07 measured the transfer; the fix is here.)
+    // attributes. VideoToolbox then transfers every decoded picture into a buffer of its own (14-32 ms per 4K frame
+    // through the GPU driver's Metal path, RTX 3060 Ti and RTX 4090), instead of handing the decoder's buffer over. The picture is copied into the
+    // buffer we hand out, so if that buffer carries the destination's own attributes VideoToolbox has nothing to transfer.
+    // Only when such a buffer holds our picture as it is: the client's pixel format is ours (one format, not a list) and
+    // its size, if it names one, is the picture's; anything else (BGRA, 8-bit for a 10-bit stream, a scaled size) keeps
+    // the session's pool and VideoToolbox's conversion. NVDEC_NOOWNPOOL=1 leaves it out. (T8.07 measured the transfer.)
     if (s->ownPool) { CVPixelBufferPoolRelease(s->ownPool); s->ownPool = NULL; }
-    CFDictionaryRef dpattr = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
-    if (dpattr) {
-        CVPixelBufferPoolRef pool = NULL;
-        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, dpattr, &pool) == kCVReturnSuccess && pool) s->ownPool = pool;
-        else if (pool) CVPixelBufferPoolRelease(pool);
-        if (gDLog) { CFStringRef ds = CFCopyDescription(dpattr); char buf[1024] = "(none)";
-            if (ds) { CFStringGetCString(ds, buf, sizeof buf, kCFStringEncodingUTF8); CFRelease(ds); }
-            for (char *c = buf; *c; c++) if (*c == '\n') *c = ' ';
-            DLOG("  destination attributes: %s", buf);
-            DLOG("  our own pool: %s", s->ownPool ? "yes" : "no (the session's pool is used)"); }
+    if (dst && !getenv("NVDEC_NOOWNPOOL")) {
+        int dw = s->w, dh = s->h; CFNumberRef x;
+        if ((x = CFDictionaryGetValue(dst, kCVPixelBufferWidthKey)) && CFGetTypeID(x) == CFNumberGetTypeID()) CFNumberGetValue(x, kCFNumberIntType, &dw);
+        if ((x = CFDictionaryGetValue(dst, kCVPixelBufferHeightKey)) && CFGetTypeID(x) == CFNumberGetTypeID()) CFNumberGetValue(x, kCFNumberIntType, &dh);
+        const bool fits = want == pf && dw == s->w && dh == s->h;
+        if (fits) {
+            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, dst);   // the size made explicit (a pool needs one)
+            CFNumberRef w2 = CFNumberCreate(NULL, kCFNumberIntType, &s->w), h2 = CFNumberCreate(NULL, kCFNumberIntType, &s->h);
+            CFDictionarySetValue(m, kCVPixelBufferWidthKey, w2); CFDictionarySetValue(m, kCVPixelBufferHeightKey, h2);
+            CFRelease(w2); CFRelease(h2);
+            CVPixelBufferPoolRef pool = NULL;
+            if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, m, &pool) == kCVReturnSuccess && pool) s->ownPool = pool;
+            else if (pool) CVPixelBufferPoolRelease(pool);
+            CFRelease(m);
+        }
+        DLOG("  our own pool: %s", s->ownPool ? "yes (the client's destination attributes)" : fits ? "no (CVPixelBufferPoolCreate failed)"
+                                    : "no (the client's format or size is not the picture's: the session's pool, VideoToolbox converts)");
     }
+    if (dst) CFRelease(dst);
     CFMutableDictionaryRef col = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     // colour description and HDR metadata from the format description (the extension keys are the attachment keys), as
     // Apple's decoders attach them

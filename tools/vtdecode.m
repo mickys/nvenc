@@ -7,6 +7,7 @@
 //   VTDECODE_SW=1: with VTDECODE_REF, compare the software decoder (Apple's) instead
 //   VTDECODE_AVREAD=1: decode through AVAssetReader (alwaysCopiesSampleData NO) instead, compared with VTDECODE_REF
 //   VTDECODE_PF=x420: ask for that output format (default 420v)
+//   VTDECODE_WH=1 (or WxH): ask for the picture size too (or another size); VTDECODE_GL=1: OpenGL-compatible IOSurfaces (ffmpeg)
 //   VTDECODE_ATT=1: print the first decoded frame's attachments (colour, HDR metadata)
 //   VTDECODE_SPEED=hw|sw: only the decode speed of the hardware / software decoder (frames released at once)
 //   VTDECODE_ASYNC=1: allow asynchronous decompression (as AVFoundation does)
@@ -37,7 +38,16 @@ static int decode(NSArray *samples, CMFormatDescriptionRef fd, bool hw, Out *o, 
                             : @{ (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO };
     const char *pfs = getenv("VTDECODE_PF");   // the output format to ask for (four characters, e.g. x420); default NV12 420v
     const OSType pf = pfs && strlen(pfs) == 4 ? (OSType)pfs[0] << 24 | (OSType)pfs[1] << 16 | (OSType)pfs[2] << 8 | (OSType)pfs[3] : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    NSDictionary *attrs = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(pf) };
+    NSMutableDictionary *attrs = [@{ (id)kCVPixelBufferPixelFormatTypeKey: @(pf) } mutableCopy];
+    if (getenv("VTDECODE_WH")) {   // also the picture size, as ffmpeg and AVFoundation ask (VTDECODE_WH=WxH: another size)
+        CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions(fd); int w = d.width, h = d.height;
+        if (strchr(getenv("VTDECODE_WH"), 'x')) sscanf(getenv("VTDECODE_WH"), "%dx%d", &w, &h);
+        attrs[(id)kCVPixelBufferWidthKey] = @(w); attrs[(id)kCVPixelBufferHeightKey] = @(h);
+    }
+    if (getenv("VTDECODE_GL")) {   // OpenGL-compatible IOSurfaces, as ffmpeg's videotoolbox hwaccel asks
+        attrs[(id)kCVPixelBufferIOSurfacePropertiesKey] = @{};
+        attrs[(id)kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey] = @YES;
+    }
     VTDecompressionOutputCallbackRecord rec = { cb, o };
     VTDecompressionSessionRef s = NULL;
     OSStatus st = VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attrs, &rec, &s);
