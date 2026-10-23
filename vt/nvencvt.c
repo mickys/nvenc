@@ -66,7 +66,7 @@ static FILE *gLogF;   // NVENCVT_LOG: stderr; flag file /tmp/nvencvt.log (apps s
 #define LOG(...) do { if (gLog) { FILE *lf_ = gLogF ? gLogF : stderr; fprintf(lf_, "nvencvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
 
 enum { VT_MAX_B = 3 };
-enum { GPU_NONE = 0, GPU_ADA = 1, GPU_TU117 = 2 };   // the GPUs the codecs register on
+enum { GPU_NONE = 0, GPU_ADA = 1, GPU_TU117 = 2, GPU_AMPERE = 3 };   // the GPUs the codecs register on
 extern int gNvencvtGpu;                               // which of them (set by NVEncVT_Register)
 
 typedef struct {
@@ -879,13 +879,15 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_CreateInstance(FourCharC
 
 // The encoder drives Ada's NVENC class (NVC9B7_VIDEO_ENCODER, RTX 40) and NVENC 6.6 (0xb4b7, TU117: GTX 1650). Registering
 // on a GPU without either would make VideoToolbox pick an encoder that cannot start, so look at the GPU's class list.
+// GA10x (0xc7b7, RTX 30) is listed too: its NVDEC decodes AV1, so the decoders register there, but its NVENC is not Ada's,
+// so the encoders stay away (NVENCVT_AMPERE_ENC=1 tries them anyway).
 static int gpu_nvenc_kind(void)
 {
     Rm rm = { 0 };
     if (rm_open(&rm)) { LOG("no NVIDIA RM device"); return GPU_NONE; }
     const NvU32 cls = rm_class(&rm, RM_CLS_NVENC);
     rm_close(&rm);
-    return cls == 0xc9b7 ? GPU_ADA : cls == 0xb4b7 ? GPU_TU117 : GPU_NONE;
+    return cls == 0xc9b7 ? GPU_ADA : cls == 0xb4b7 ? GPU_TU117 : cls == 0xc7b7 ? GPU_AMPERE : GPU_NONE;
 }
 
 static OSStatus register_one(FourCharCode codec, CFStringRef id, CFStringRef name, int rating)
@@ -906,7 +908,10 @@ static OSStatus register_one(FourCharCode codec, CFStringRef id, CFStringRef nam
 // The plugin calls NVEncVT_Register in every process it is enabled for, while the Metal device is created, so the
 // check must be cheap: the GPU's PCI device ID from the IORegistry (~0.1 ms) instead of an RM client and the class list
 // (6-9 ms). Ada (AD102-AD107: RTX 40, RTX Ada, L4/L40) is device IDs 0x2600-0x28ff; TU117 (GTX 1650, T400 / T600 / T1000:
-// NVENC 6.6, for which NullMoth has no encoder) 0x1f80-0x1fff. Other Turing and Ampere cards keep NullMoth's encoders.
+// NVENC 6.6, for which NullMoth has no encoder) 0x1f80-0x1fff. GA10x (consumer Ampere: RTX 30, the 3060 Ti among them) is
+// 0x2200-0x25ff; its NVDEC (0xc7b0) decodes AV1 (NVIDIA's Video Codec SDK 11.0 added GA10x and AV1 Main profile decoding),
+// its NVENC (0xc7b7) is not Ada's, so only the decoders register there. Other Turing and Ampere cards keep NullMoth's
+// encoders.
 // -1: no NVIDIA GPU in the registry.
 // the card's name for the encoder names, from the GPU's IORegistry "model" ("NVIDIA GeForce RTX 4090" -> "RTX 4090")
 static char gCardName[64] = "GPU";
@@ -924,7 +929,7 @@ static void card_name_from(io_object_t d)
     if (m) CFRelease(m);
 }
 
-int gNvencvtGpu = GPU_NONE;   // what NVEncVT_Register found (vt/nvencvt_dec.c: AV1 only on Ada)
+int gNvencvtGpu = GPU_NONE;   // what NVEncVT_Register found (vt/nvencvt_dec.c: AV1 on Ada and on GA10x)
 
 static int pci_gpu_kind(void)
 {
@@ -938,7 +943,8 @@ static int pci_gpu_kind(void)
         if (ven) CFRelease(ven);
         if (dev) CFRelease(dev);
         if (v == 0x10de && found < 1) {
-            found = id >= 0x2600 && id <= 0x28ff ? GPU_ADA : id >= 0x1f80 && id <= 0x1fff ? GPU_TU117 : GPU_NONE;
+            found = id >= 0x2600 && id <= 0x28ff ? GPU_ADA : id >= 0x1f80 && id <= 0x1fff ? GPU_TU117
+                  : id >= 0x2200 && id <= 0x25ff ? GPU_AMPERE : GPU_NONE;
             if (found > 0) card_name_from(d);
         }
         IOObjectRelease(d);
@@ -1001,7 +1007,7 @@ static void *find_vt_encoder_registry(void)
 
 static void rename_encoders(const char *const ids[], const char *const names[], const char *const codecs[], int n)
 {
-    if (getenv("NVENCVT_NO_RENAME")) return;
+    if (!n || getenv("NVENCVT_NO_RENAME")) return;
     FigRegistryCopyFilteredItemListFn list = (FigRegistryCopyFilteredItemListFn)dlsym(RTLD_DEFAULT, "FigRegistryCopyFilteredItemList");
     FigRegistryItemCopyDescriptionFn desc = (FigRegistryItemCopyDescriptionFn)dlsym(RTLD_DEFAULT, "FigRegistryItemCopyDescription");
     if (!list || !desc) { LOG("rename: registry functions missing"); return; }
@@ -1038,7 +1044,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     int gpu = getenv("NVENCVT_ANY_GPU") ? GPU_ADA : pci_gpu_kind();
     if (gpu < 0) gpu = gpu_nvenc_kind();   // no PCI match (unusual): ask RM for the class list
     if (gpu <= 0) {
-        LOG("GPU is neither Ada nor TU117 (NVENC class c9b7 / b4b7): not registering");
+        LOG("GPU is neither Ada, TU117 nor GA10x (NVENC class c9b7 / b4b7 / c7b7): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
     gNvencvtGpu = gpu;
@@ -1070,15 +1076,21 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     snprintf(nameHevc, sizeof nameHevc, "NVENC - HEVC - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
     snprintf(nameAv1, sizeof nameAv1, "NVENC - AV1 - (NVIDIA %s) - mickys/nvenc - %s", gCardName, ver);
     CFStringRef na = CFStringCreateWithCString(NULL, nameAvc, kCFStringEncodingUTF8), nh = CFStringCreateWithCString(NULL, nameHevc, kCFStringEncodingUTF8);
-    OSStatus st = register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), na, rating);
-    OSStatus sh = getenv("NVENCVT_NO_HEVC") ? kVTCouldNotFindVideoEncoderErr
+    // GA10x (RTX 30): the NVENC there is not Ada's, and our encoder setups are written for NVENC 8.2 (Ada) and 6.6
+    // (TU117). Registering them anyway would make VideoToolbox pick an encoder that cannot start (NullMoth's own
+    // encoders stay for these cards), so only the decoders register on GA10x. NVENCVT_AMPERE_ENC=1 tries them anyway.
+    const bool encoders = gpu != GPU_AMPERE || getenv("NVENCVT_AMPERE_ENC");
+    if (!encoders) LOG("GA10x (RTX 30): the decoders only (NVENCVT_AMPERE_ENC=1 registers the encoders too)");
+    OSStatus st = encoders ? register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), na, rating) : kVTCouldNotFindVideoEncoderErr;
+    OSStatus sh = !encoders || getenv("NVENCVT_NO_HEVC") ? kVTCouldNotFindVideoEncoderErr
                 : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), nh, rating);
     CFStringRef n1 = CFStringCreateWithCString(NULL, nameAv1, kCFStringEncodingUTF8);
     // AV1: Ada only (NVENC 6.6 has none)
-    OSStatus s1 = getenv("NVENCVT_NO_AV1") || gpu != GPU_ADA ? kVTCouldNotFindVideoEncoderErr : register_one(CODEC_AV1, CFSTR(ENCODER_ID_AV1), n1, rating);
+    OSStatus s1 = !encoders || getenv("NVENCVT_NO_AV1") || gpu != GPU_ADA ? kVTCouldNotFindVideoEncoderErr : register_one(CODEC_AV1, CFSTR(ENCODER_ID_AV1), n1, rating);
     CFRelease(na); CFRelease(nh); CFRelease(n1);
     LOG("registered %s -> %d, %s -> %d, %s -> %d (rating %d) in %s", ENCODER_ID, (int)st, ENCODER_ID_HEVC, (int)sh, ENCODER_ID_AV1, (int)s1, rating, getprogname());
-    const char *ids[3] = { ENCODER_ID }, *names[3] = { nameAvc }, *codecs[3] = { "H.264" }; int nreg = 1;
+    const char *ids[3], *names[3], *codecs[3]; int nreg = 0;
+    if (!st) { ids[nreg] = ENCODER_ID; names[nreg] = nameAvc; codecs[nreg++] = "H.264"; }
     if (!sh) { ids[nreg] = ENCODER_ID_HEVC; names[nreg] = nameHevc; codecs[nreg++] = "HEVC"; }
     if (!s1) { ids[nreg] = ENCODER_ID_AV1; names[nreg] = nameAv1; codecs[nreg++] = "AV1"; }
     rename_encoders(ids, names, codecs, nreg);
