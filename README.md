@@ -43,6 +43,11 @@ Releases ship inside the [mickys overlay](https://github.com/mickys/nvidia-macos
   overlay's wrapper: `nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox -b:v 20M out.mp4` (it sets `DYLD_INSERT_LIBRARIES`
   for that one tool; the library registers itself when injected). macOS has no supported way for a third party to
   register a video encoder for every process ([docs/reports/T7.00-cli-and-extensions.md](docs/reports/T7.00-cli-and-extensions.md)).
+  Decoding needs it too: a plain `ffmpeg -hwaccel videotoolbox` gets our decoders only from its second VideoToolbox session
+  (the first copies the decoder list before it starts the GPU, which is what loads the plugin and registers ours) and drops
+  the first packet with it: for AV1 everything up to the next key frame is missing (dropped as "reference missing").
+  `nvenc-run` registers them before the first session. The overlay's `--cli-wrappers` puts wrappers named `ffmpeg`,
+  `ffprobe`, `ffplay`, `HandBrakeCLI` and `avconvert` first in `PATH` so that plain commands and scripts go through it.
 - **Settings:** environment variables, or system-wide in `/usr/local/etc/nvencvt.conf` (lines `NAME=VALUE`, root-owned
   and not writable by others; the environment wins). The useful ones:
 

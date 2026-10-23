@@ -555,6 +555,14 @@ NVDEC decoders for H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1, M
 nvenc-run ffmpeg -hwaccel videotoolbox -i in.mkv -f null -      # ffmpeg through VideoToolbox (our decoders)
 ```
 
+Without `nvenc-run` (or the overlay's `--cli-wrappers`) ffmpeg's first VideoToolbox session finds none of our decoders: it
+copies VideoToolbox's decoder list (`FigRegistryCopyFilteredItemList`) and only then starts the GPU
+(`VTCopyRenderIDArrayForIORegistryKey` -> `MTLCopyAllDevices`), which loads the Metal plugin and registers ours. ffmpeg drops
+that packet, the key frame, and its next session gets ours. For AV1 the frames up to the next key frame have no references:
+since 0.9.5 they are dropped as `kVTVideoDecoderReferenceMissingErr` (4K crowd clip: 50 of 300 frames out, all identical to
+libdav1d; 0.9.4 showed 249 grey pictures); through `nvenc-run` all 300 are bit-exact. A decoder bundle in
+`/Library/Video/Plug-Ins` is passed over (only Apple-signed bundles count, T7.00).
+
 ## Updating this document
 
 - **A new finding or a single measurement:** add a dated entry at the top of the findings log (what, numbers, how measured); put
