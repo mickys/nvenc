@@ -547,19 +547,18 @@ B-frames on for recordings (off for streaming keeps the latency at one frame).
 
 ### Decode
 
-Nothing to set up in a process that has loaded NullMoth's Metal plugin (one that uses Metal, or ffmpeg through `nvenc-run`):
-AVFoundation (AVAssetReader, AVPlayer) and VTDecompressionSession pick the NVDEC decoders for H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1, MPEG-1/2 and MPEG-4 Part 2. That includes
+Nothing to set up: AVFoundation (QuickTime Player, AVAssetReader) and VTDecompressionSession pick the
+NVDEC decoders for H.264, HEVC (8-12 bit, 4:2:0 / 4:4:4), VP9 (8-12 bit), AV1, MPEG-1/2 and MPEG-4 Part 2. That includes
 `hev1` / `avc3` MP4 files (ffmpeg writes `hev1` for HEVC by default), which macOS cannot decode at all on its own.
 
-**Not QuickTime Player or Safari (macOS 26.7.1, 2026-10-24).** Neither loads the Metal plugin before it plays a video, so our
-decoders (and NullMoth's) are never registered there. QuickTime Player and Safari's GPU process (`com.apple.WebKit.GPU`,
-which cannot load the plugin at all: its sandbox forbids mapping code from `/Library/GPUBundles`) decode H.264 in-process
-with Apple's `AppleH264SW` and HEVC with Apple's `VCPHEVC` in their own sandboxed `VTDecoderXPCService` instance, all on
-the CPU (1080p30 HEVC ~15-23 % of a core). The client picks the decoder from its own registry and the service only runs
-it, so a decoder registered inside the service is not chosen. No third-party route exists: `/Library/Video/Plug-Ins` and
-the professional-workflow folder QuickTime reads (`VTRegisterProfessionalVideoWorkflowVideoDecoders`) take only
-Apple-signed bundles (T7.00), and MediaExtension decoders need an Apple provisioning profile and are meant for formats
-the system cannot decode. Details: `notes/safari-quicktime-video-decode.md` in the development repository.
+**Not Safari (macOS 26.7.1, rechecked 2026-10-24).** QuickTime Player loads the Metal plugin and decodes HEVC in its own
+process with ours. Safari's GPU process (`com.apple.WebKit.GPU`) cannot load the plugin (its sandbox forbids mapping code
+from `/Library/GPUBundles`), so it decodes H.264 in-process with Apple's `AppleH264SW` and HEVC with Apple's `VCPHEVC` in its
+sandboxed `VTDecoderXPCService`, on the CPU. That service does load the plugin and registers NullMoth's decoders and ours,
+but the client picks the decoder from its own registry and the service only runs it, so they are not used. No third-party
+route exists: `/Library/Video/Plug-Ins` and the professional-workflow folder take only Apple-signed bundles (T7.00), and
+MediaExtension decoders need an Apple provisioning profile. Details: `notes/safari-quicktime-video-decode.md` in the
+development repository.
 
 ```sh
 nvenc-run ffmpeg -hwaccel videotoolbox -i in.mkv -f null -      # ffmpeg through VideoToolbox (our decoders)
